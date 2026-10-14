@@ -99,9 +99,9 @@ test("groups: @mentions pick responders, bots can @mention each other, and loops
     t = texts(h, g.id);
     assert.match(t.at(-1)!, /^@beta: /);
 
-    // Alpha pings Beta, whose default reply greets @alpha, and so on: the hop limit stops it.
+    // Alpha and Beta keep @mentioning each other: the hop limit stops it.
     const before = h.store.messages(g.id).length;
-    await h.postUserMessage(g.id, { text: "@alpha [[reply ping @beta]]" });
+    await h.postUserMessage(g.id, { text: "@alpha [[bounce beta]]" });
     await settle(h, 10000);
     const after = h.store.messages(g.id).slice(before);
     const botPosts = after.filter((m) => m.author.kind === "bot");

@@ -31,9 +31,8 @@ export interface CursorRuntimeOptions {
   storeDir: string;
   /** Scratch directory for one-shot routing prompts (kept empty on purpose). */
   scratchDir: string;
-  defaultModel: ModelChoice;
-  autoReview?: boolean;
-  sandbox?: boolean;
+  /** Read live so settings changes apply to the next session that opens. */
+  settings: () => { defaultModel: ModelChoice; autoReview: boolean; sandbox: boolean };
 }
 
 /**
@@ -80,15 +79,15 @@ export class CursorRuntime implements AgentRuntime {
       store,
       // "project" loads the workspace's .cursor/ (skills, rules, hooks, mcp.json) and AGENTS.md.
       settingSources: ["project" as const],
-      autoReview: this.opts.autoReview ?? false,
-      sandboxOptions: { enabled: this.opts.sandbox ?? false },
+      autoReview: this.opts.settings().autoReview,
+      sandboxOptions: { enabled: this.opts.settings().sandbox },
     };
   }
 
   async open(spec: SessionSpec): Promise<RuntimeSession> {
     const { sdk, store } = await this.load();
     const apiKey = this.apiKey();
-    const model = spec.model ?? this.opts.defaultModel;
+    const model = spec.model ?? this.opts.settings().defaultModel;
     let agent: SDKAgent | undefined;
     if (spec.agentId) {
       try {
@@ -116,7 +115,7 @@ export class CursorRuntime implements AgentRuntime {
     const agent = await sdk.Agent.create({
       apiKey: this.apiKey(),
       name: "cursor-bots-router",
-      model: opts?.model ?? this.opts.defaultModel,
+      model: opts?.model ?? this.opts.settings().defaultModel,
       tools: [],
       local: { cwd: this.opts.scratchDir, store: scratchStore, settingSources: [] },
     });

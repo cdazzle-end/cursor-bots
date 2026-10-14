@@ -5,32 +5,39 @@ import type { HomePaths } from "./paths.ts";
 import { readJson, writeFileAtomic, writeJson } from "./util.ts";
 
 const GATE_SCRIPT = `#!/usr/bin/env node
-// Installed by Cursor Bots. Cursor runs this before every shell command a bot
-// makes (beforeShellExecution hook). It asks the Cursor Bots gateway whether
-// the command needs your approval. If the gateway isn't running (e.g. you
-// opened this folder in the Cursor IDE yourself) it allows the command.
+// Installed by Cursor Bots. Cursor runs this hook in two places:
+//   prompt: before each prompt a bot submits, to tell the gateway which bot
+//           owns this Cursor conversation (it sends only the prompt's first line).
+//   shell:  before every shell command a bot runs, to ask the gateway whether the
+//           command needs your approval.
+// If the gateway isn't running (e.g. you opened this folder in the Cursor IDE
+// yourself) it lets everything through, so it never gets in your way.
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+const mode = process.argv[2] === "prompt" ? "prompt" : "shell";
+const pass = mode === "prompt" ? { continue: true } : { permission: "allow" };
 const here = path.dirname(fileURLToPath(import.meta.url));
 let input = {};
 try { input = JSON.parse(fs.readFileSync(0, "utf8") || "{}"); } catch {}
 let cfg;
 try { cfg = JSON.parse(fs.readFileSync(path.join(here, "cursor-bots-gate.json"), "utf8")); } catch {}
-const allow = () => process.stdout.write(JSON.stringify({ permission: "allow" }));
-if (!cfg) { allow(); process.exit(0); }
+const done = (out) => { process.stdout.write(JSON.stringify(out)); process.exit(0); };
+if (!cfg) done(pass);
+const body = mode === "prompt"
+  ? { conversation_id: input.conversation_id, prompt: String(input.prompt ?? "").slice(0, 400) }
+  : input;
 try {
-  const res = await fetch(cfg.url + "/api/gate/shell", {
+  const res = await fetch(cfg.url + "/api/gate/" + mode, {
     method: "POST",
     headers: { "content-type": "application/json", "x-gate-token": cfg.token },
-    body: JSON.stringify(input),
-    signal: AbortSignal.timeout(cfg.timeoutMs ?? 60000),
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(mode === "prompt" ? 5000 : (cfg.timeoutMs ?? 60000)),
   });
-  if (!res.ok) { allow(); process.exit(0); }
-  process.stdout.write(JSON.stringify(await res.json()));
+  done(res.ok ? await res.json() : pass);
 } catch {
-  allow();
+  done(pass);
 }
 `;
 
@@ -55,10 +62,13 @@ export function prepareWorkspace(paths: HomePaths, gate: { url: string; token: s
   const cfg = readJson<{ version?: number; hooks?: Record<string, Array<Record<string, unknown>>> }>(paths.hooksJson, {});
   cfg.version = cfg.version ?? 1;
   cfg.hooks = cfg.hooks ?? {};
-  const command = `node .cursor/hooks/cursor-bots-gate.mjs`;
-  const list = (cfg.hooks.beforeShellExecution ?? []).filter((h) => h.command !== command);
-  list.unshift({ command, timeout: Math.ceil(gate.timeoutMs / 1000) + 10 });
-  cfg.hooks.beforeShellExecution = list;
+  const ours = (h: Record<string, unknown>) => String(h.command ?? "").includes("cursor-bots-gate.mjs");
+  const shell = (cfg.hooks.beforeShellExecution ?? []).filter((h) => !ours(h));
+  shell.unshift({ command: "node .cursor/hooks/cursor-bots-gate.mjs shell", timeout: Math.ceil(gate.timeoutMs / 1000) + 10 });
+  cfg.hooks.beforeShellExecution = shell;
+  const prompt = (cfg.hooks.beforeSubmitPrompt ?? []).filter((h) => !ours(h));
+  prompt.unshift({ command: "node .cursor/hooks/cursor-bots-gate.mjs prompt", timeout: 10 });
+  cfg.hooks.beforeSubmitPrompt = prompt;
   writeJson(paths.hooksJson, cfg);
 }
 

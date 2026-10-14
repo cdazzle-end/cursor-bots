@@ -22,6 +22,7 @@ import type {
   Routine,
   RoutineRun,
   SecretRequest,
+  Settings,
   WakeEvent,
 } from "./types.ts";
 import { colorFor, hostTimezone, mimeFor, newId, oneLine, readJson, resolveInside, slugify, writeJson } from "./util.ts";
@@ -151,6 +152,74 @@ export class Harness {
     if (!s || s.state === "idle") return s?.queued ? `idle, ${s.queued} queued` : "idle";
     if (s.state === "error") return "idle (last run failed)";
     return s.queued ? `working, ${s.queued} queued` : "working";
+  }
+
+  async resetAllSessions(): Promise<void> {
+    for (const r of this.runners.values()) await r.resetSession();
+  }
+
+  updateSettings(patch: Record<string, any>): Settings {
+    const s = this.store.settings;
+    const sessionAffecting = ["cursorAutoReview", "cursorSandbox", "runtime"].some((k) => k in patch && patch[k] !== (s as any)[k]);
+    if (patch.user) {
+      s.user = {
+        name: String(patch.user.name ?? s.user.name).trim() || s.user.name,
+        label: String(patch.user.label ?? s.user.label).trim(),
+        avatar: { ...s.user.avatar, ...(patch.user.avatar ?? {}) },
+      };
+    }
+    if (typeof patch.timezone === "string") {
+      if (patch.timezone !== "auto") {
+        try {
+          new Intl.DateTimeFormat("en-US", { timeZone: patch.timezone });
+        } catch {
+          throw new Error(`Unknown time zone: ${patch.timezone}`);
+        }
+      }
+      s.timezone = patch.timezone;
+    }
+    if (typeof patch.runtime === "string") {
+      if (!this.runtimes.has(patch.runtime)) throw new Error(`Unknown runtime: ${patch.runtime}`);
+      s.runtime = patch.runtime;
+    }
+    if (patch.defaultModel?.id) s.defaultModel = { id: String(patch.defaultModel.id), params: patch.defaultModel.params };
+    if (patch.routerModel !== undefined) s.routerModel = patch.routerModel?.id ? { id: String(patch.routerModel.id), params: patch.routerModel.params } : undefined;
+    if (["llm", "lead", "heuristic"].includes(patch.groupRouting)) s.groupRouting = patch.groupRouting;
+    if (patch.approvals) {
+      const a = patch.approvals;
+      if (["auto", "ask", "off"].includes(a.mode)) s.approvals.mode = a.mode;
+      if (Array.isArray(a.rules)) {
+        for (const r of a.rules) {
+          try {
+            new RegExp(String(r.pattern), "i");
+          } catch {
+            throw new Error(`Invalid rule pattern: ${r.pattern}`);
+          }
+        }
+        s.approvals.rules = a.rules.map((r: any) => ({
+          id: String(r.id || newId("rule")),
+          effect: r.effect === "allow" ? "allow" : "ask",
+          target: r.target === "action" ? "action" : "shell",
+          pattern: String(r.pattern),
+          note: r.note ? String(r.note) : undefined,
+          createdAt: Number(r.createdAt) || Date.now(),
+        }));
+      }
+      if (Number.isFinite(a.inlineWaitSeconds)) s.approvals.inlineWaitSeconds = Math.min(120, Math.max(0, Number(a.inlineWaitSeconds)));
+      if (Number.isFinite(a.backgroundExpiryMinutes)) s.approvals.backgroundExpiryMinutes = Math.min(1440, Math.max(1, Number(a.backgroundExpiryMinutes)));
+    }
+    if (patch.limits) {
+      for (const k of Object.keys(s.limits) as Array<keyof Settings["limits"]>) {
+        if (Number.isFinite(patch.limits[k]) && Number(patch.limits[k]) > 0) s.limits[k] = Number(patch.limits[k]);
+      }
+    }
+    if (Number.isFinite(patch.absencePauseDays)) s.absencePauseDays = Math.max(0, Number(patch.absencePauseDays));
+    if (typeof patch.cursorAutoReview === "boolean") s.cursorAutoReview = patch.cursorAutoReview;
+    if (typeof patch.cursorSandbox === "boolean") s.cursorSandbox = patch.cursorSandbox;
+    this.store.saveSettings();
+    if (sessionAffecting) void this.resetAllSessions();
+    this.bus.emit({ type: "settings.updated", settings: s });
+    return s;
   }
 
   // ------------------------------------------------------------------ queue persistence
@@ -762,7 +831,8 @@ export class Harness {
         messageId: msg.id,
         text: msg.text,
         attachments: msg.attachments,
-        allowSilence: false,
+        // A teammate's mention may be a thank-you; let the bot stay quiet if nothing is needed.
+        allowSilence: true,
         kind: "group_message",
         addressed: "you",
         chain: { id: state.wake.chain.id, depth, runs: state.wake.chain.runs },
@@ -1011,6 +1081,14 @@ export class Harness {
     if (!busy.length) return undefined;
     if (busy.length === 1 && conversationId) this.hookSessions.set(conversationId, busy[0]!.botId);
     return busy[0]!.botId;
+  }
+
+  /** beforeSubmitPrompt hook: learn which bot owns a Cursor conversation from the prompt's <you> tag. */
+  learnHookSession(conversationId: unknown, promptHead: unknown): { continue: true } {
+    const m = /<you name="[^"]*" handle="@([a-z0-9][a-z0-9-]*)"/.exec(String(promptHead ?? ""));
+    const bot = m ? this.store.botByHandle(m[1]!) : undefined;
+    if (bot && typeof conversationId === "string" && conversationId) this.hookSessions.set(conversationId, bot.id);
+    return { continue: true };
   }
 
   /** Handler for the beforeShellExecution hook installed in the workspace. */

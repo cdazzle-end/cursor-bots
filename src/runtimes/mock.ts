@@ -158,6 +158,10 @@ class MockRun implements RuntimeRun {
         toolResults.push(await this.callTool(name, args));
       } else if (op === "reply") {
         reply = arg;
+      } else if (op === "bounce") {
+        // Mention the given teammate and ask them to bounce back to us (loop tests).
+        const me = /<you name="[^"]*" handle="@([^"]+)"/.exec(prompt)?.[1] ?? "me";
+        reply = `[[bounce ${me}]] over to @${arg.trim()}`;
       } else if (op === "silent") {
         reply = "NO_REPLY";
       } else if (op === "sleep") {
@@ -185,7 +189,7 @@ class MockRun implements RuntimeRun {
         reply = "NO_REPLY";
       } else {
         reply =
-          `Hi ${from}! I'm ${this.session.name}, running on the demo brain (no CURSOR_API_KEY yet), so I can't really think. ` +
+          `Hi ${from.replace(/^@/, "")}! I'm ${this.session.name}, running on the demo brain (no CURSOR_API_KEY yet), so I can't really think. ` +
           `I received: “${oneLine(plain, 160)}”.`;
       }
     }
