@@ -1,9 +1,9 @@
 {
   "name": "cursor-bots",
   "version": "0.1.0",
+  "private": true,
   "description": "A self-hosted, Grok-Bot-style multi-agent harness powered by the Cursor SDK: persistent named bots with memory, skills, routines, approvals, group chats and bot-to-bot handoffs.",
   "type": "module",
-  "license": "MIT",
   "bin": {
     "cursor-bots": "./bin/cursor-bots.mjs"
   },

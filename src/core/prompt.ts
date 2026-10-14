@@ -1,7 +1,7 @@
 import { memoryForPrompt } from "./memory.ts";
 import type { Store } from "./store.ts";
 import type { Attachment, Bot, Conversation, Id, Message, WakeEvent } from "./types.ts";
-import { formatLocalTime, slugify, truncate } from "./util.ts";
+import { formatLocalTime, shortTime, slugify, truncate } from "./util.ts";
 
 /**
  * Every turn a bot takes starts from one message the harness composes:
@@ -32,8 +32,7 @@ function attachmentLine(a: Attachment, inlined: boolean): string {
 }
 
 export function renderMessage(store: Store, m: Message, timezone: string, max = 1200): string {
-  const time = formatLocalTime(m.ts, timezone).replace(/^\w+, /, "");
-  const lines = [`[${time}] ${authorName(store, m)}: ${truncate(m.text, max)}`];
+  const lines = [`[${shortTime(m.ts, timezone)}] ${authorName(store, m)}: ${truncate(m.text, max)}`];
   for (const a of m.attachments ?? []) lines.push("  " + attachmentLine(a, false));
   return lines.join("\n");
 }

@@ -29,6 +29,13 @@ import { colorFor, hostTimezone, mimeFor, newId, oneLine, readJson, resolveInsid
 import { ensureBotFolder, prepareWorkspace } from "./workspace.ts";
 import type { AgentRuntime, McpServerSpec, RunOutcome } from "../runtimes/types.ts";
 
+/** Handoff replies are capped (like Hermes' 16k) so one long answer can't flood the requester's context. */
+const MAX_REPLY_CHARS = 16_000;
+function capReply(text: string): string {
+  if (text.length <= MAX_REPLY_CHARS) return text;
+  return `${text.slice(0, MAX_REPLY_CHARS)}\n\n[…${text.length - MAX_REPLY_CHARS} more characters cut; use read_conversation to read the full reply]`;
+}
+
 export const AVATAR_SHAPES = ["classic", "wink", "bean", "drop", "ghost", "cube", "star", "cloud"];
 const RESERVED_HANDLES = new Set(["user", "me", "everyone", "all", "here", "boss", "system"]);
 
@@ -861,7 +868,7 @@ export class Harness {
       convId: route.convId,
       text: reply.failed
         ? `@${state.bot.handle} couldn't finish your handoff: ${reply.text}`
-        : `@${state.bot.handle} replied to your handoff:\n\n${reply.text || "(no text)"}`,
+        : `@${state.bot.handle} replied to your handoff:\n\n${capReply(reply.text) || "(no text)"}`,
       attachments: reply.attachments,
       allowSilence: conv.kind === "group",
       kind: "handoff_reply",

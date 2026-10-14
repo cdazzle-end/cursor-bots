@@ -72,6 +72,16 @@ export function formatLocalTime(ts: number, timezone: string): string {
   }).format(new Date(ts));
 }
 
+/** Compact timestamp for transcripts: "7:33 AM" today, "Oct 13 7:33 AM" otherwise. */
+export function shortTime(ts: number, timezone: string): string {
+  const tz = timezone === "auto" ? hostTimezone() : timezone;
+  const day = (t: number) => new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(t));
+  const time = new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "numeric", minute: "2-digit" }).format(new Date(ts));
+  if (day(ts) === day(Date.now())) return time;
+  const date = new Intl.DateTimeFormat("en-US", { timeZone: tz, month: "short", day: "numeric" }).format(new Date(ts));
+  return `${date} ${time}`;
+}
+
 /** Resolve a user-supplied relative path inside root, refusing anything that escapes it. */
 export function resolveInside(root: string, rel: string): string {
   const cleaned = rel.replace(/^\/+/, "").replace(/^workspace\//, "");
