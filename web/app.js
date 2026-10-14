@@ -306,15 +306,22 @@ async function openConv(id, opts = {}) {
   }
   if (location.hash !== `#/c/${id}`) history.replaceState(null, "", `#/c/${id}`);
   $("#app").classList.add("chat-open");
+  S.highlight = opts.highlight ?? null;
+  // Switch the composer right away so nothing typed meanwhile goes to the previous chat.
+  if (changed || !$("#c-input")) renderMain();
+  renderSidebar();
+  if (S.details) renderDetails();
   if (!S.messages[id]) {
     const res = await attempt(() => api("GET", `/api/conversations/${id}/messages?limit=150`));
-    S.messages[id] = res?.messages ?? [];
+    const loaded = res?.messages ?? [];
+    // Keep anything that arrived over SSE while the history was loading.
+    const live = (S.messages[id] ?? []).filter((m) => !loaded.some((x) => x.id === m.id));
+    S.messages[id] = [...loaded, ...live];
     S.more[id] = res?.more ?? false;
+    if (S.current === id) renderTranscript(true);
+  } else if (!changed) {
+    renderTranscript(Boolean(S.highlight));
   }
-  S.highlight = opts.highlight ?? null;
-  renderSidebar();
-  renderMain();
-  if (S.details) renderDetails();
   markRead(id);
 }
 
@@ -412,7 +419,11 @@ function renderTranscript(forceBottom = false) {
   const c = conv(S.current);
   if (!tx || !c) return;
   const stick = forceBottom || shouldStick();
-  const list = S.messages[c.id] ?? [];
+  if (!S.messages[c.id]) {
+    tx.innerHTML = '<div class="notice">Loading…</div><div id="live"></div>';
+    return;
+  }
+  const list = S.messages[c.id];
   const parts = [];
   if (S.more[c.id]) parts.push('<button class="btn small load-more" id="load-more">Load earlier messages</button>');
   let lastDay = "";
@@ -853,7 +864,12 @@ function updateSuggest(c) {
 }
 
 function addMessage(m) {
-  const list = (S.messages[m.convId] ??= []);
+  if (!S.messages[m.convId]) {
+    // Not loaded yet: remember it only if this chat is loading right now.
+    if (m.convId !== S.current) return;
+    S.messages[m.convId] = [];
+  }
+  const list = S.messages[m.convId];
   if (list.some((x) => x.id === m.id)) return;
   list.push(m);
   if (m.convId === S.current) {
