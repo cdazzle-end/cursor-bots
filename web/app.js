@@ -328,7 +328,7 @@ function renderEmpty() {
     ${avatarHtml({ shape: "classic", color: "#ff3b3b" }, 84)}
     <h2>${hasBots ? "Pick a bot or a group" : "Build your team"}</h2>
     <p>Bots are persistent AI teammates with a name, a job, memory and their own chat. They share one computer (the workspace), message each other, and run routines while you're away.</p>
-    ${rt && !rt.ok ? `<div class="banner">${esc(rt.reason)} Until then bots use the demo brain if you switch the runtime to “mock” in Settings.</div>` : ""}
+    ${rt && !rt.ok ? `<div class="banner">${esc(rt.reason)} Restart with the key set, or switch the brain to the demo (“mock”) in Settings → Brain & models to click around first.</div>` : ""}
     <div class="row">
       <button class="btn primary" id="e-new">Create a bot</button>
       ${hasBots ? "" : '<button class="btn" id="e-starter">Add a starter team</button>'}

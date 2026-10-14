@@ -22,7 +22,8 @@ export function defaultSettings(): Settings {
   return {
     user: { name: "Boss", label: "Team lead", avatar: { shape: "classic", color: "#f2f2f2" } },
     timezone: "auto",
-    runtime: process.env.CURSOR_API_KEY ? "cursor" : "mock",
+    // Real Cursor agents by default; the scripted demo brain only when asked for (--runtime mock).
+    runtime: "cursor",
     defaultModel: { id: "composer-2.5" },
     routerModel: { id: "composer-2.5", params: [{ id: "fast", value: "true" }] },
     groupRouting: "llm",
