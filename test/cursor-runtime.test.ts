@@ -14,7 +14,7 @@ import { settle } from "./helpers.ts";
  * recovery) without network access or an API key.
  */
 function fakeSdk(opts: { failSendOnce?: string } = {}) {
-  const calls = { create: [] as any[], resume: [] as any[], sends: [] as any[] };
+  const calls = { create: [] as any[], resume: [] as any[], sends: [] as any[], stores: [] as any[], disposed: 0 };
   class AgentNotFoundError extends Error {}
   let failNext = opts.failSendOnce;
 
@@ -31,6 +31,8 @@ function fakeSdk(opts: { failSendOnce?: string } = {}) {
     async *stream() {
       yield { type: "tool_call", agent_id: "a", run_id: this.id, call_id: "c1", name: "shell", status: "running", args: { command: "ls -la" } };
       yield { type: "tool_call", agent_id: "a", run_id: this.id, call_id: "c1", name: "shell", status: "completed", result: "ok" };
+      // The real SDK reports compaction only here: the summary arrives as a "task" message.
+      yield { type: "task", agent_id: "a", run_id: this.id, text: "Summary of the conversation so far" };
     }
     async steer(text: string) {
       this.steered.push(text);
@@ -63,7 +65,6 @@ function fakeSdk(opts: { failSendOnce?: string } = {}) {
       }
       await sendOpts.onDelta({ update: { type: "text-delta", text: "Hello " } });
       await sendOpts.onDelta({ update: { type: "text-delta", text: "there" } });
-      await sendOpts.onDelta({ update: { type: "summary-completed" } });
       return new FakeRun(`Final answer. Team: ${toolOut.split("\n")[0]}`);
     }
     close() {}
@@ -83,32 +84,33 @@ function fakeSdk(opts: { failSendOnce?: string } = {}) {
       async delete() {},
     },
     AgentNotFoundError,
-    JsonlLocalAgentStore: class {
-      dir: string;
-      constructor(dir: string) {
-        this.dir = dir;
-      }
-    },
     Cursor: { models: { list: async () => [{ id: "composer-2.5", displayName: "Composer 2.5", parameters: [] }] } },
   };
-  return { sdk: sdk as unknown as Sdk, calls };
+  const openStore = async (o: { workspaceRef: string; stateRoot: string }) => {
+    const store = { ...o, dispose: async () => void calls.disposed++ };
+    calls.stores.push(store);
+    return store as any;
+  };
+  return { sdk: sdk as unknown as Sdk, calls, openStore };
 }
 
-function runtime(sdk: Sdk, dir: string) {
+function runtime(fake: ReturnType<typeof fakeSdk>, dir: string) {
   return new CursorRuntime({
     apiKey: "key_test",
     storeDir: path.join(dir, "store"),
     scratchDir: path.join(dir, "scratch"),
     settings: () => ({ defaultModel: { id: "composer-2.5" }, autoReview: true, sandbox: false }),
-    loadSdk: async () => sdk,
+    loadSdk: async () => fake.sdk,
+    openStore: fake.openStore,
   });
 }
 
 test("Cursor runtime: create, custom tools, streaming, outcome mapping", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cb-cursor-"));
   try {
-    const { sdk, calls } = fakeSdk();
-    const rt = runtime(sdk, dir);
+    const fake = fakeSdk();
+    const { calls } = fake;
+    const rt = runtime(fake, dir);
     const session = await rt.open({ botId: "b1", name: "Critic", cwd: "/ws" });
     assert.equal(session.agentId, "agent-1");
     const created = calls.create[0];
@@ -118,6 +120,8 @@ test("Cursor runtime: create, custom tools, streaming, outcome mapping", async (
     assert.deepEqual(created.local.settingSources, ["project"]);
     assert.equal(created.local.autoReview, true);
     assert.deepEqual(created.local.sandboxOptions, { enabled: false });
+    assert.equal(created.local.store, calls.stores[0], "sessions share one opened store");
+    assert.deepEqual({ ...calls.stores[0], dispose: undefined }, { workspaceRef: "/ws", stateRoot: path.join(dir, "store"), dispose: undefined });
 
     const events: RuntimeEvent[] = [];
     let toolCalled = false;
@@ -146,6 +150,11 @@ test("Cursor runtime: create, custom tools, streaming, outcome mapping", async (
     assert.deepEqual(sent.opts.mcpServers.docs, { type: "http", url: "https://e.com/mcp", headers: { Authorization: "Bearer z" } });
     assert.equal(sent.opts.local.force, false);
     assert.equal(await run.steer!("also this"), true);
+
+    await rt.open({ botId: "b2", name: "Writer", cwd: "/ws" });
+    assert.equal(calls.stores.length, 1, "a second bot reuses the store");
+    await rt.dispose();
+    assert.equal(calls.disposed, 1);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
@@ -154,8 +163,9 @@ test("Cursor runtime: create, custom tools, streaming, outcome mapping", async (
 test("Cursor runtime: resume, fall back when the checkpoint store lost the agent, retry a stuck run", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cb-cursor-"));
   try {
-    const { sdk, calls } = fakeSdk({ failSendOnce: "Agent is busy: an active run exists" });
-    const rt = runtime(sdk, dir);
+    const fake = fakeSdk({ failSendOnce: "Agent is busy: an active run exists" });
+    const { calls } = fake;
+    const rt = runtime(fake, dir);
     const resumed = await rt.open({ botId: "b1", agentId: "agent-old", name: "Critic", cwd: "/ws" });
     assert.equal(resumed.agentId, "agent-old");
     assert.equal(calls.resume[0].id, "agent-old");
@@ -174,8 +184,9 @@ test("Cursor runtime: resume, fall back when the checkpoint store lost the agent
 
 test("a harness bot runs end to end on the Cursor adapter and keeps its agent id", async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cb-cursor-home-"));
-  const { sdk, calls } = fakeSdk();
-  const h = new Harness({ home, runtimes: [runtime(sdk, home)] });
+  const fake = fakeSdk();
+  const { calls } = fake;
+  const h = new Harness({ home, runtimes: [runtime(fake, home)] });
   h.store.settings.runtime = "cursor";
   await h.start({ gatewayUrl: "http://127.0.0.1:1" });
   try {
@@ -199,7 +210,7 @@ test("a harness bot runs end to end on the Cursor adapter and keeps its agent id
     await settle(h);
     assert.equal(calls.create.length, 1);
     assert.equal(calls.sends.length, 2);
-    // The fake emitted summary-completed, so identity + memory are re-sent in full.
+    // The fake's stream reported a compaction ("task"), so identity + memory are re-sent in full.
     assert.match(calls.sends[1].message.text, /<memory>/);
   } finally {
     await h.stop();

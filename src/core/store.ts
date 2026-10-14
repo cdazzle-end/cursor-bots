@@ -90,6 +90,8 @@ export class Store {
     list = [];
     try {
       const raw = fs.readFileSync(this.messageFile(convId), "utf8");
+      // Start the next append on a fresh line, or it would fuse with a torn tail and be lost too.
+      if (raw.length && !raw.endsWith("\n")) fs.appendFileSync(this.messageFile(convId), "\n");
       for (const line of raw.split("\n")) {
         if (!line.trim()) continue;
         try {

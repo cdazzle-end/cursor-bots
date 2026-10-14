@@ -2,9 +2,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { DEFAULT_AGENTS_MD, HARNESS_MANUAL } from "./manual.ts";
 import type { HomePaths } from "./paths.ts";
-import { readJson, writeFileAtomic, writeJson } from "./util.ts";
+import { readJson, writeFileAtomic } from "./util.ts";
 
-const GATE_SCRIPT = `#!/usr/bin/env node
+const GATE_SCRIPT_BODY = `
 // Installed by Cursor Bots. Cursor runs this hook at three points:
 //   prompt: before each prompt a bot submits, to tell the gateway which bot
 //           owns this Cursor conversation (only the prompt's first lines are sent).
@@ -12,20 +12,16 @@ const GATE_SCRIPT = `#!/usr/bin/env node
 //   tool:   before file tools, to keep bots out of the gateway's own state
 //           (tokens, secrets, settings). This check runs locally.
 // If the gateway isn't running (e.g. you opened this folder in the Cursor IDE
-// yourself) everything is allowed, so it never gets in your way.
+// yourself) everything is allowed, so it never gets in your way. The gateway
+// rewrites this file before every bot turn, so edits to it don't stick.
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 const mode = ["prompt", "shell", "tool"].includes(process.argv[2]) ? process.argv[2] : "shell";
 const pass = mode === "prompt" ? { continue: true } : { permission: "allow" };
-const here = path.dirname(fileURLToPath(import.meta.url));
 let input = {};
 try { input = JSON.parse(fs.readFileSync(0, "utf8") || "{}"); } catch {}
-let cfg;
-try { cfg = JSON.parse(fs.readFileSync(path.join(here, "cursor-bots-gate.json"), "utf8")); } catch {}
 const done = (out) => { process.stdout.write(JSON.stringify(out)); process.exit(0); };
-if (!cfg) done(pass);
 
 if (mode === "tool") {
   const roots = (cfg.protect ?? []).map((p) => path.resolve(p));
@@ -72,7 +68,31 @@ try {
  * Prepare the shared workspace ("the computer"): house rules, the harness
  * manual as an always-on Cursor rule, the approval hook, and folders.
  */
-export function prepareWorkspace(paths: HomePaths, gate: { url: string; token: string; timeoutMs: number; protect: string[] }): void {
+export interface GateConfig {
+  url: string;
+  token: string;
+  timeoutMs: number;
+  protect: string[];
+}
+
+function gateScript(cfg: GateConfig): string {
+  return `#!/usr/bin/env node\nconst cfg = ${JSON.stringify(cfg)};\n${GATE_SCRIPT_BODY}`;
+}
+
+/** Write a file only when its content differs (keeps the per-turn heal cheap). */
+function writeIfChanged(file: string, content: string, onlyIfChanged: boolean): void {
+  if (onlyIfChanged) {
+    try {
+      if (fs.readFileSync(file, "utf8") === content) return;
+    } catch {
+      // Missing: write it.
+    }
+  }
+  writeFileAtomic(file, content);
+}
+
+export function prepareWorkspace(paths: HomePaths, gate: GateConfig, opts: { onlyIfChanged?: boolean } = {}): void {
+  const quick = opts.onlyIfChanged ?? false;
   for (const dir of [paths.workspace, paths.skills, paths.uploads, paths.hooksDir, paths.rulesDir, path.join(paths.workspace, "bots")]) {
     fs.mkdirSync(dir, { recursive: true });
   }
@@ -81,12 +101,17 @@ export function prepareWorkspace(paths: HomePaths, gate: { url: string; token: s
   // Browser profiles hold thousands of files; keep them out of Cursor's workspace scans and search.
   const ignore = path.join(paths.workspace, ".cursorignore");
   if (!fs.existsSync(ignore)) writeFileAtomic(ignore, "# Managed by Cursor Bots; add your own patterns below.\n.browser/\n**/node_modules/\n");
-  writeFileAtomic(path.join(paths.rulesDir, "cursor-bots.mdc"), HARNESS_MANUAL);
+  writeIfChanged(path.join(paths.rulesDir, "cursor-bots.mdc"), HARNESS_MANUAL, quick);
 
   const gateFile = path.join(paths.hooksDir, "cursor-bots-gate.mjs");
-  writeFileAtomic(gateFile, GATE_SCRIPT);
-  fs.chmodSync(gateFile, 0o755);
-  writeJson(path.join(paths.hooksDir, "cursor-bots-gate.json"), gate);
+  writeIfChanged(gateFile, gateScript(gate), quick);
+  try {
+    fs.chmodSync(gateFile, 0o755);
+  } catch {
+    // Not fatal: Cursor runs it with `node`.
+  }
+  // Older versions kept the gate's config (including its token) in a separate file.
+  fs.rmSync(path.join(paths.hooksDir, "cursor-bots-gate.json"), { force: true });
 
   // Merge our hook into hooks.json without clobbering hooks you added yourself.
   const cfg = readJson<{ version?: number; hooks?: Record<string, Array<Record<string, unknown>>> }>(paths.hooksJson, {});
@@ -102,7 +127,7 @@ export function prepareWorkspace(paths: HomePaths, gate: { url: string; token: s
   const tool = (cfg.hooks.preToolUse ?? []).filter((h) => !ours(h));
   tool.unshift({ command: "node .cursor/hooks/cursor-bots-gate.mjs tool", matcher: "Read|Write|Edit|Delete|Grep|Glob|LS", timeout: 10 });
   cfg.hooks.preToolUse = tool;
-  writeJson(paths.hooksJson, cfg);
+  writeIfChanged(paths.hooksJson, JSON.stringify(cfg, null, 2) + "\n", quick);
 }
 
 export function ensureBotFolder(paths: HomePaths, handle: string): string {

@@ -20,26 +20,49 @@ export interface SkillInfo {
   updatedAt: number;
 }
 
+const FRONTMATTER = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/;
+/** Keys save() writes itself; any other key in an existing SKILL.md is kept as written. */
+const MANAGED_KEYS = new Set(["name", "description", "disable-model-invocation", "created-by"]);
+
+/** Top-level frontmatter entries: each key line plus its indented continuation lines, verbatim. */
+function frontmatterEntries(block: string): Array<{ key: string; lines: string[] }> {
+  const out: Array<{ key: string; lines: string[] }> = [];
+  for (const line of block.split(/\r?\n/)) {
+    const kv = /^([A-Za-z0-9_-]+):/.exec(line);
+    if (kv) out.push({ key: kv[1]!, lines: [line] });
+    else if (out.length && (/^\s+/.test(line) || !line.trim())) out.at(-1)!.lines.push(line);
+  }
+  return out;
+}
+
 export function parseFrontmatter(md: string): { data: Record<string, string>; body: string } {
-  const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(md);
+  const m = FRONTMATTER.exec(md);
   if (!m) return { data: {}, body: md };
   const data: Record<string, string> = {};
-  let currentKey: string | undefined;
-  for (const line of m[1]!.split(/\r?\n/)) {
-    const kv = /^([A-Za-z0-9_-]+):\s*(.*)$/.exec(line);
-    if (kv) {
-      currentKey = kv[1]!;
-      data[currentKey] = unquote(kv[2]!.trim());
-    } else if (currentKey && /^\s+/.test(line)) {
-      // Folded continuation lines and nested metadata are kept as text.
-      data[currentKey] = `${data[currentKey]} ${line.trim()}`.trim();
+  for (const { key, lines } of frontmatterEntries(m[1]!)) {
+    const first = /^[A-Za-z0-9_-]+:\s*(.*)$/.exec(lines[0]!)![1]!.trim();
+    const rest = lines.slice(1).map((l) => l.trim());
+    const block = /^([>|])[-+]?$/.exec(first);
+    if (block) {
+      // YAML block scalar: ">" folds lines into one, "|" keeps them.
+      data[key] = (block[1] === ">" ? rest.filter(Boolean).join(" ") : rest.join("\n")).trim();
+    } else {
+      // Plain values may wrap onto indented lines; nested metadata is kept as text.
+      data[key] = [unquote(first), ...rest.filter(Boolean)].join(" ").trim();
     }
   }
   return { data, body: md.slice(m[0].length) };
 }
 
 function unquote(v: string): string {
-  if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) return v.slice(1, -1);
+  if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) {
+    try {
+      return String(JSON.parse(v));
+    } catch {
+      return v.slice(1, -1);
+    }
+  }
+  if (v.length >= 2 && v.startsWith("'") && v.endsWith("'")) return v.slice(1, -1).replace(/''/g, "'");
   return v;
 }
 
@@ -112,6 +135,13 @@ export class SkillLibrary {
     const lines = ["---", `name: ${name}`, `description: ${quote(input.description)}`];
     if (input.manualOnly) lines.push("disable-model-invocation: true");
     if (input.createdBy) lines.push(`created-by: ${quote(input.createdBy)}`);
+    // Keep the keys this library doesn't manage (license, allowed-tools, metadata, ...).
+    if (existing) {
+      const old = FRONTMATTER.exec(fs.readFileSync(path.join(this.workspace, existing.path), "utf8"));
+      for (const e of old ? frontmatterEntries(old[1]!) : []) {
+        if (!MANAGED_KEYS.has(e.key)) lines.push(...trimTrailingBlank(e.lines));
+      }
+    }
     lines.push("---", "", body.startsWith("#") ? body : `# ${input.name.trim()}\n\n${body}`, "");
     writeFileAtomic(path.join(dir, "SKILL.md"), lines.join("\n"));
     return this.find(name)!;
@@ -125,4 +155,10 @@ export class SkillLibrary {
     fs.rmSync(dir, { recursive: true, force: true });
     return true;
   }
+}
+
+function trimTrailingBlank(lines: string[]): string[] {
+  let end = lines.length;
+  while (end > 1 && !lines[end - 1]!.trim()) end--;
+  return lines.slice(0, end);
 }

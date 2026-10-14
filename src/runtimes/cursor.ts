@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type {
   InteractionUpdate,
@@ -25,9 +26,12 @@ import type {
 
 export type Sdk = typeof import("@cursor/sdk");
 
+/** An agent store the runtime opened and closes on dispose. */
+export type OpenedStore = LocalAgentStore & { dispose?(): Promise<void> };
+
 export interface CursorRuntimeOptions {
   apiKey?: string;
-  /** Directory for the SDK's JSONL agent store (conversation checkpoints). */
+  /** State root of the SDK's SQLite agent store (index.db plus checkpoint blobs). */
   storeDir: string;
   /** Scratch directory for one-shot routing prompts (kept empty on purpose). */
   scratchDir: string;
@@ -35,20 +39,37 @@ export interface CursorRuntimeOptions {
   settings: () => { defaultModel: ModelChoice; autoReview: boolean; sandbox: boolean };
   /** Load the SDK module. Tests inject a fake; normally it's a dynamic import. */
   loadSdk?: () => Promise<Sdk>;
+  /** Open an agent store. Tests inject a fake; normally the SDK's SQLite store. */
+  openStore?: (o: { workspaceRef: string; stateRoot: string }) => Promise<OpenedStore>;
+}
+
+/** Where Cursor credentials come from: CURSOR_API_KEY, or the SDK's stored login (~/.cursor/sdk/auth.json). */
+export function cursorCredentials(apiKey?: string): "key" | "login" | undefined {
+  if (apiKey || process.env.CURSOR_API_KEY) return "key";
+  if (fs.existsSync(path.join(os.homedir(), ".cursor", "sdk", "auth.json"))) return "login";
+  return undefined;
+}
+
+async function openSqliteStore(o: { workspaceRef: string; stateRoot: string }): Promise<OpenedStore> {
+  const { SqliteLocalAgentStore } = await import("@cursor/sdk/sqlite");
+  return SqliteLocalAgentStore.open(o);
 }
 
 /**
  * Bots run on the Cursor SDK's *local* runtime: the agent loop runs inside
  * this process, files come from the shared workspace on disk, and inference
  * goes through Cursor's hosted models. Each bot is one durable SDK agent
- * (`agent-<uuid>`) whose conversation checkpoints live in a JSONL store, so a
- * bot keeps its context across restarts via Agent.resume().
+ * (`agent-<uuid>`) whose conversation checkpoints live in the SDK's SQLite
+ * store, so a bot keeps its context across restarts via Agent.resume().
+ * (The SDK's JSONL store rewrites its whole file for every streamed event,
+ * which gets slower with every turn, so it isn't used.)
  */
 export class CursorRuntime implements AgentRuntime {
   readonly id = "cursor";
   readonly label = "Cursor SDK (local agent loop, Cursor-hosted models)";
   private sdk?: Sdk;
-  private store?: LocalAgentStore;
+  /** One store per state root, opened once and shared by every session on it. */
+  private stores = new Map<string, Promise<OpenedStore>>();
   private opts: CursorRuntimeOptions;
 
   constructor(opts: CursorRuntimeOptions) {
@@ -60,19 +81,25 @@ export class CursorRuntime implements AgentRuntime {
   }
 
   available(): { ok: boolean; reason?: string } {
-    if (this.apiKey()) return { ok: true };
-    const stored = path.join(process.env.HOME ?? "", ".cursor", "sdk", "auth.json");
-    if (fs.existsSync(stored)) return { ok: true };
-    return { ok: false, reason: "No CURSOR_API_KEY set (create one at cursor.com/dashboard → API Keys)." };
+    if (cursorCredentials(this.opts.apiKey)) return { ok: true };
+    return { ok: false, reason: "No Cursor credentials: set CURSOR_API_KEY (create one at cursor.com/dashboard → API Keys)." };
   }
 
-  private async load(): Promise<{ sdk: Sdk; store: LocalAgentStore }> {
-    if (!this.sdk) {
-      this.sdk = this.opts.loadSdk ? await this.opts.loadSdk() : await import("@cursor/sdk");
-      fs.mkdirSync(this.opts.storeDir, { recursive: true });
-      this.store = new this.sdk.JsonlLocalAgentStore(this.opts.storeDir);
+  private async load(): Promise<Sdk> {
+    if (!this.sdk) this.sdk = this.opts.loadSdk ? await this.opts.loadSdk() : await import("@cursor/sdk");
+    return this.sdk;
+  }
+
+  private storeFor(workspaceRef: string, stateRoot: string): Promise<OpenedStore> {
+    let store = this.stores.get(stateRoot);
+    if (!store) {
+      fs.mkdirSync(stateRoot, { recursive: true });
+      store = (this.opts.openStore ?? openSqliteStore)({ workspaceRef, stateRoot });
+      // A failed open is retried on the next session instead of sticking.
+      store.catch(() => this.stores.delete(stateRoot));
+      this.stores.set(stateRoot, store);
     }
-    return { sdk: this.sdk, store: this.store! };
+    return store;
   }
 
   private localOptions(cwd: string, store: LocalAgentStore) {
@@ -87,7 +114,8 @@ export class CursorRuntime implements AgentRuntime {
   }
 
   async open(spec: SessionSpec): Promise<RuntimeSession> {
-    const { sdk, store } = await this.load();
+    const sdk = await this.load();
+    const store = await this.storeFor(spec.cwd, this.opts.storeDir);
     const apiKey = this.apiKey();
     const model = spec.model ?? this.opts.settings().defaultModel;
     let agent: SDKAgent | undefined;
@@ -111,9 +139,9 @@ export class CursorRuntime implements AgentRuntime {
   }
 
   async complete(prompt: string, opts?: { model?: ModelChoice }): Promise<string> {
-    const { sdk } = await this.load();
+    const sdk = await this.load();
     fs.mkdirSync(this.opts.scratchDir, { recursive: true });
-    const scratchStore = new sdk.JsonlLocalAgentStore(path.join(this.opts.scratchDir, ".store"));
+    const scratchStore = await this.storeFor(this.opts.scratchDir, path.join(this.opts.scratchDir, ".store"));
     const agent = await sdk.Agent.create({
       apiKey: this.apiKey(),
       name: "cursor-bots-router",
@@ -132,7 +160,7 @@ export class CursorRuntime implements AgentRuntime {
   }
 
   async listModels(): Promise<RuntimeModel[]> {
-    const { sdk } = await this.load();
+    const sdk = await this.load();
     const models = await sdk.Cursor.models.list({ apiKey: this.apiKey() });
     return models.map((m) => ({
       id: m.id,
@@ -140,6 +168,12 @@ export class CursorRuntime implements AgentRuntime {
       description: m.description,
       parameters: m.parameters,
     }));
+  }
+
+  async dispose(): Promise<void> {
+    const stores = [...this.stores.values()];
+    this.stores.clear();
+    for (const store of stores) await (await store.catch(() => undefined))?.dispose?.().catch(() => {});
   }
 }
 
@@ -188,7 +222,7 @@ class CursorRun implements RuntimeRun {
   private streamDone: Promise<void>;
   constructor(run: Run, onEvent: SendInput["onEvent"]) {
     this.run = run;
-    // Tool lifecycle comes from the normalized stream; text deltas come from onDelta.
+    // Tool lifecycle and compaction come from the normalized stream; text deltas come from onDelta.
     this.streamDone = (async () => {
       try {
         if (!run.supports("stream")) return;
@@ -275,9 +309,6 @@ function forwardDelta(update: InteractionUpdate, onEvent: SendInput["onEvent"]):
     case "thinking-delta":
       onEvent({ type: "thinking", text: update.text });
       break;
-    case "summary-completed":
-      onEvent({ type: "summary" });
-      break;
   }
 }
 
@@ -286,5 +317,9 @@ function forwardMessage(ev: SDKMessage, onEvent: SendInput["onEvent"]): void {
     onEvent({ type: "tool", callId: ev.call_id, name: ev.name, status: ev.status, args: ev.args, result: ev.result });
   } else if (ev.type === "status") {
     onEvent({ type: "status", status: ev.status });
+  } else if (ev.type === "task") {
+    // The SDK keeps summary updates out of onDelta; in a local run the stream's
+    // "task" message is the compaction summary.
+    onEvent({ type: "summary" });
   }
 }

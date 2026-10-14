@@ -7,9 +7,19 @@ import { parseArgs } from "node:util";
 import { Harness } from "./core/harness.ts";
 import { defaultHome } from "./core/paths.ts";
 import { createStarterTeam } from "./core/starter.ts";
-import { CursorRuntime } from "./runtimes/cursor.ts";
+import { CursorRuntime, cursorCredentials } from "./runtimes/cursor.ts";
 import { MockRuntime } from "./runtimes/mock.ts";
 import { createServer } from "./server/http.ts";
+
+// The Cursor SDK keeps bot contexts in node:sqlite, which Node 22 still labels
+// experimental. Keep that one notice off the console; other warnings still show.
+const emitWarning = process.emitWarning;
+process.emitWarning = ((warning: string | Error, ...rest: unknown[]) => {
+  const text = typeof warning === "string" ? warning : warning?.message;
+  const type = typeof rest[0] === "string" ? rest[0] : (rest[0] as { type?: string } | undefined)?.type;
+  if (type === "ExperimentalWarning" && /sqlite/i.test(text ?? "")) return;
+  return (emitWarning as (...a: unknown[]) => void).call(process, warning, ...rest);
+}) as typeof process.emitWarning;
 
 const HELP = `cursor-bots — persistent AI teammates on the Cursor SDK
 
@@ -20,7 +30,8 @@ Usage:
   cursor-bots say BOT MESSAGE [--port 4777] [--home DIR]  Message a bot through a running gateway
 
 Environment:
-  CURSOR_API_KEY     Cursor user or service-account API key (cursor.com/dashboard → API Keys)
+  CURSOR_API_KEY     Cursor user or service-account API key (cursor.com/dashboard → API Keys).
+                     A login stored by the Cursor SDK (~/.cursor/sdk/auth.json) works too.
   CURSOR_BOTS_HOME   Where bots, chats, memory and the shared workspace live (default ~/.cursor-bots)
 `;
 
@@ -84,7 +95,7 @@ async function start(argv: string[]): Promise<void> {
   console.log(`  Runtime:   ${rt?.label ?? h.store.settings.runtime}${avail?.ok ? "" : `  ⚠ ${avail?.reason}`}`);
   console.log(`  Bots:      ${h.store.bots.size}\n`);
   if (!avail?.ok && h.store.settings.runtime === "cursor") {
-    console.log("  Set CURSOR_API_KEY and restart, or run with --runtime mock to try the app with the demo brain.\n");
+    console.log("  No Cursor credentials found: set CURSOR_API_KEY and restart, or start with --runtime mock to try the demo brain.\n");
   }
 
   let stopping = false;
@@ -136,17 +147,18 @@ async function doctor(argv: string[]): Promise<void> {
   try {
     const sdk = await import("@cursor/sdk");
     ok("@cursor/sdk loads");
-    if (process.env.CURSOR_API_KEY) {
+    const creds = cursorCredentials();
+    if (creds) {
       try {
         const me = await sdk.Cursor.me();
-        ok(`API key works (${me.userEmail ?? me.apiKeyName})`);
+        ok(`${creds === "key" ? "CURSOR_API_KEY" : "Stored Cursor login"} works (${me.userEmail ?? me.apiKeyName})`);
         const models = await sdk.Cursor.models.list();
         ok(`${models.length} models available: ${models.slice(0, 8).map((m) => m.id).join(", ")}${models.length > 8 ? ", …" : ""}`);
       } catch (err: any) {
         bad(`API key check failed: ${err?.message ?? err}`);
       }
     } else {
-      warn("CURSOR_API_KEY is not set. Bots will use the demo brain until you set it.");
+      warn("No Cursor credentials found: set CURSOR_API_KEY, or start with --runtime mock to try the demo brain.");
     }
   } catch (err: any) {
     bad(`@cursor/sdk failed to load: ${err?.message ?? err}. Run npm install.`);
@@ -169,7 +181,7 @@ async function doctor(argv: string[]): Promise<void> {
 
 async function models(): Promise<void> {
   const sdk = await import("@cursor/sdk");
-  if (!process.env.CURSOR_API_KEY) throw new Error("Set CURSOR_API_KEY first.");
+  if (!cursorCredentials()) throw new Error("No Cursor credentials found: set CURSOR_API_KEY first.");
   for (const m of await sdk.Cursor.models.list()) {
     const params = (m.parameters ?? []).map((p) => `${p.id}=${p.values.map((v) => v.value).join("|")}`).join(" ");
     console.log(`${m.id.padEnd(28)} ${m.displayName}${params ? `  [${params}]` : ""}`);

@@ -318,11 +318,34 @@ async function openConv(id, opts = {}) {
     const live = (S.messages[id] ?? []).filter((m) => !loaded.some((x) => x.id === m.id));
     S.messages[id] = [...loaded, ...live];
     S.more[id] = res?.more ?? false;
+    if (opts.highlight) {
+      await loadUntil(id, opts.highlight);
+      // A live message may have rendered (and cleared the highlight) while history loaded.
+      S.highlight = opts.highlight;
+    }
+    if (S.current === id) renderTranscript(true);
+  } else if (opts.highlight && (await loadUntil(id, opts.highlight))) {
+    S.highlight = opts.highlight;
     if (S.current === id) renderTranscript(true);
   } else if (!changed) {
     renderTranscript(Boolean(S.highlight));
   }
   markRead(id);
+}
+
+/** Page back through older history until a message is loaded (a search hit). Returns true if it loaded more. */
+async function loadUntil(id, msgId) {
+  let loadedMore = false;
+  while (S.messages[id] && !S.messages[id].some((m) => m.id === msgId) && S.more[id]) {
+    const first = S.messages[id][0];
+    const res = await attempt(() => api("GET", `/api/conversations/${id}/messages?limit=150&before=${first?.ts ?? Date.now()}`));
+    if (!res) break;
+    S.messages[id] = [...res.messages.filter((m) => !S.messages[id].some((x) => x.id === m.id)), ...S.messages[id]];
+    S.more[id] = res.more;
+    loadedMore = true;
+    if (!res.messages.length) break;
+  }
+  return loadedMore;
 }
 
 function markRead(id) {
@@ -444,7 +467,24 @@ function renderTranscript(forceBottom = false) {
     parts.push(`<div class="notice">${c.kind === "dm" ? `This is your chat with ${esc(b?.name)}. Give it a job, its sources, and where it must stop for your approval, then a first task with a clear finish line.` : c.kind === "group" ? "Describe the shared outcome and who owns the next step. Write normally to let the bots decide who answers, or @mention one." : "Handoffs between these bots appear here."}</div>`);
   }
   parts.push('<div id="live"></div>');
+  // Re-rendering must not wipe a secret you're pasting or fold up a step list you opened.
+  const typed = $$("[data-secret-input]", tx).map((el) => [el.dataset.secretInput, el.value]).filter(([, v]) => v);
+  const openDetails = $$(".msg details[open]", tx).map((d) => d.closest(".msg")?.dataset.msg).filter(Boolean);
+  const focused = document.activeElement?.dataset?.secretInput;
+  const sel = focused ? [document.activeElement.selectionStart, document.activeElement.selectionEnd] : null;
   tx.innerHTML = parts.join("");
+  for (const [rid, v] of typed) {
+    const el = tx.querySelector(`[data-secret-input="${CSS.escape(rid)}"]`);
+    if (el) el.value = v;
+  }
+  for (const mid of openDetails) tx.querySelector(`.msg[data-msg="${CSS.escape(mid)}"] details`)?.setAttribute("open", "");
+  if (focused) {
+    const el = tx.querySelector(`[data-secret-input="${CSS.escape(focused)}"]`);
+    if (el) {
+      el.focus();
+      if (sel) el.setSelectionRange(sel[0], sel[1]);
+    }
+  }
   renderLive();
   bindTranscript(tx, c);
   if (S.highlight) {
@@ -650,7 +690,7 @@ function setupComposer(c) {
   };
   input.addEventListener("input", () => {
     autosize();
-    updateSuggest(c);
+    updateSuggest();
     updateSendButton();
   });
   input.addEventListener("keydown", (e) => {
@@ -820,9 +860,11 @@ async function send(c) {
   updateSendButton();
 }
 
-function updateSuggest(c) {
+function updateSuggest() {
   const input = $("#c-input");
+  const c = conv(S.current);
   $("#suggest")?.remove();
+  if (!input || !c) return;
   const before = input.value.slice(0, input.selectionStart);
   const m = /(^|\s)([@/])([\w-]*)$/.exec(before);
   if (!m) return;
@@ -1148,7 +1190,10 @@ function modal({ title, body, foot = "", wide = false, tabs = null }) {
   });
   $("[data-close]", wrap).onclick = close;
   wrap.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") close();
+    if (e.key !== "Escape") return;
+    // Only the innermost modal closes; the document handler would close its parent too.
+    e.stopPropagation();
+    close();
   });
   setTimeout(() => $("input,textarea,select", $(".modal-body", wrap))?.focus(), 20);
   return { el: wrap, close };
@@ -1352,6 +1397,7 @@ function openSettings(tab = "general") {
         <div class="field">Un-addressed group messages<select id="s-routing"><option value="llm" ${s.groupRouting === "llm" ? "selected" : ""}>Bots decide (a quick routing model picks one)</option><option value="lead" ${s.groupRouting === "lead" ? "selected" : ""}>Go to the group's lead</option><option value="heuristic" ${s.groupRouting === "heuristic" ? "selected" : ""}>Name match, then lead (no model call)</option></select></div>
         <div class="toggle-row"><span>Cursor Auto-review classifier for shell/MCP calls (in addition to your rules)</span>${switchHtml("s-ar", s.cursorAutoReview)}</div>
         <div class="toggle-row"><span>Cursor sandbox for shell commands (needs bubblewrap on Linux)</span>${switchHtml("s-sb", s.cursorSandbox)}</div>
+        <div class="muted">Heads-up: with Auto-review or the sandbox on, the Cursor SDK can't ask you about connector (MCP) tool calls in a local run, so it refuses them. Leave both off if your bots use connected apps such as the browser; your approval rules still apply to shell commands.</div>
         <div class="row" style="display:flex;justify-content:flex-end"><button class="btn primary" id="s-save">Save</button></div>`;
       const val = (id) => {
         const v = $(id).value;
@@ -1360,7 +1406,9 @@ function openSettings(tab = "general") {
       $("#s-save").onclick = () => {
         const dm = val("#s-model");
         const rm = val("#s-router");
-        save({ runtime: $("#s-rt").value, defaultModel: dm ? { id: dm } : undefined, routerModel: rm ? { id: rm } : null, groupRouting: $("#s-routing").value, cursorAutoReview: $("#s-ar").checked, cursorSandbox: $("#s-sb").checked }).then(() => {
+        // Same model as before: send it whole so its params (the router's fast mode) survive.
+        const pick = (id, cur) => (id ? (cur?.id === id ? cur : { id }) : null);
+        save({ runtime: $("#s-rt").value, defaultModel: pick(dm, s.defaultModel) ?? undefined, routerModel: pick(rm, s.routerModel), groupRouting: $("#s-routing").value, cursorAutoReview: $("#s-ar").checked, cursorSandbox: $("#s-sb").checked }).then(() => {
           S.models = null;
           refreshState();
         });
@@ -1486,17 +1534,21 @@ function openConnectors() {
       ${Object.entries(list).map(([n, c]) => `<div class="list-row"><div class="grow"><div class="t">${esc(n)}</div><div class="s">${esc(c.description || c.url || [c.command, ...(c.args ?? [])].join(" "))}</div></div>${switchHtml(`cn-${n}`, c.enabled)}<button class="btn small" data-edit="${esc(n)}">Edit</button><button class="btn small danger" data-del="${esc(n)}">Remove</button></div>`).join("") || '<div class="muted">Nothing connected yet.</div>'}
       <div class="d-section"><h4>Add an app</h4><div class="row" style="display:flex;gap:6px;flex-wrap:wrap">${Object.keys(CONNECTOR_PRESETS).map((k) => `<button class="btn small" data-preset="${k}">${k}</button>`).join("")}<button class="btn small" data-preset="">Custom…</button></div></div>`;
     Object.keys(list).forEach((n) => {
-      $(`#cn-${CSS.escape(n)}`, body).onchange = (e) => saveConnectors({ ...list, [n]: { ...list[n], enabled: e.target.checked } });
+      // Read the live map: an earlier toggle in this modal already changed it.
+      $(`#cn-${CSS.escape(n)}`, body).onchange = (e) => {
+        const cur = S.state.connectors ?? {};
+        saveConnectors({ ...cur, [n]: { ...cur[n], enabled: e.target.checked } });
+      };
     });
     $$("[data-del]", body).forEach(
       (b) =>
         (b.onclick = () => {
-          const next = { ...list };
+          const next = { ...(S.state.connectors ?? {}) };
           delete next[b.dataset.del];
           saveConnectors(next).then(draw);
         }),
     );
-    $$("[data-edit]", body).forEach((b) => (b.onclick = () => editConnector(b.dataset.edit, list[b.dataset.edit], draw)));
+    $$("[data-edit]", body).forEach((b) => (b.onclick = () => editConnector(b.dataset.edit, (S.state.connectors ?? {})[b.dataset.edit], draw)));
     $$("[data-preset]", body).forEach((b) => (b.onclick = () => editConnector(b.dataset.preset || "", b.dataset.preset ? { ...CONNECTOR_PRESETS[b.dataset.preset], enabled: true } : { enabled: true }, draw)));
   };
   draw();
@@ -1760,8 +1812,22 @@ function handleEvent(ev) {
     }
     case "conversation.updated": {
       const c = { ...ev.conversation };
-      if (c.id === S.current && document.visibilityState === "visible") c.unread = 0;
+      const prev = conv(c.id);
+      if (c.id === S.current && document.visibilityState === "visible") {
+        // You're looking at it: tell the server too, or the count comes back on reload and in other tabs.
+        if (c.unread || c.attention) api("POST", `/api/conversations/${c.id}/read`).catch(() => {});
+        c.unread = 0;
+        c.attention = false;
+      }
       upsert(st.conversations, c);
+      // A rename or member change shows in the open chat's header, composer and details (not every new message).
+      const shape = (x) => JSON.stringify([x?.title, x?.members, x?.lead, x?.purpose]);
+      if (c.id === S.current && shape(prev) !== shape(c)) {
+        renderHeader();
+        const input = $("#c-input");
+        if (input && c.kind !== "botdm") input.placeholder = c.kind === "group" ? `Message ${convTitle(c)} — @ to address one bot` : `Message ${convTitle(c)}`;
+        if (S.details) renderDetails();
+      }
       scheduleSidebar();
       break;
     }

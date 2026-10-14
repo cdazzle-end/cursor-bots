@@ -18,24 +18,40 @@ function webhookKey(): string {
 
 const DOW = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
 
+export function validTimezone(tz: string): boolean {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function validateCron(expr: string, timezone: string, minGapMinutes: number): string | undefined {
   const fields = expr.trim().split(/\s+/);
   if (fields.length !== 5) return "Use a five-field cron expression: minute hour day-of-month month day-of-week.";
-  let job: Cron;
+  if (!validTimezone(timezone)) return `Unknown time zone: ${timezone}`;
+  let job: Cron | undefined;
   try {
     job = new Cron(expr, { timezone, mode: "5-part", paused: true });
+    // Check every gap over more than a full weekly cycle, not just the next few runs,
+    // so a list like "3,10,…,45,46" can't sneak a 1-minute gap past the check.
+    const horizon = Date.now() + 8 * 86400_000;
+    const maxRuns = Math.ceil((8 * 24 * 60) / Math.max(1, minGapMinutes)) + 2;
+    let prev = job.nextRun();
+    if (!prev) return "That schedule never runs.";
+    for (let i = 0; i < maxRuns; i++) {
+      const next = job.nextRun(prev);
+      if (!next || next.getTime() > horizon) return undefined;
+      if (next.getTime() - prev.getTime() < minGapMinutes * 60_000) return `Runs must be at least ${minGapMinutes} minutes apart.`;
+      prev = next;
+    }
+    return `Runs must be at least ${minGapMinutes} minutes apart.`;
   } catch (err: any) {
     return `Invalid schedule: ${err?.message ?? err}`;
+  } finally {
+    job?.stop();
   }
-  const runs = job.nextRuns(6);
-  job.stop();
-  if (!runs.length) return "That schedule never runs.";
-  for (let i = 1; i < runs.length; i++) {
-    if (runs[i]!.getTime() - runs[i - 1]!.getTime() < minGapMinutes * 60_000) {
-      return `Runs must be at least ${minGapMinutes} minutes apart.`;
-    }
-  }
-  return undefined;
 }
 
 export function nextRunAt(expr: string, timezone: string): number | undefined {
@@ -156,6 +172,9 @@ export class Scheduler {
     postTo?: Id;
     skill?: string;
     webhook?: boolean;
+    /** Copies of a paused routine stay paused. */
+    enabled?: boolean;
+    pausedReason?: string;
   }): Routine {
     const { limits } = this.store.settings;
     if (this.list(input.botId).length >= limits.maxRoutinesPerBot) {
@@ -163,6 +182,7 @@ export class Scheduler {
     }
     if (!input.cron && !input.webhook) throw new Error("A routine needs a schedule (cron) or a webhook trigger.");
     const tz = input.timezone || undefined;
+    if (tz && tz !== "auto" && !validTimezone(tz)) throw new Error(`Unknown time zone: ${tz}`);
     if (input.cron) {
       const err = validateCron(input.cron, tz && tz !== "auto" ? tz : this.timezone(), limits.minRoutineIntervalMinutes);
       if (err) throw new Error(err);
@@ -178,7 +198,8 @@ export class Scheduler {
       postTo: input.postTo,
       skill: input.skill,
       webhookKey: input.webhook ? webhookKey() : undefined,
-      enabled: true,
+      enabled: input.enabled ?? true,
+      pausedReason: input.enabled === false ? input.pausedReason : undefined,
       history: [],
       createdAt: now,
       updatedAt: now,
@@ -194,6 +215,7 @@ export class Scheduler {
     const r = this.store.routines.get(id);
     if (!r) throw new Error("No such routine");
     const { limits } = this.store.settings;
+    if (patch.timezone && patch.timezone !== "auto" && !validTimezone(patch.timezone)) throw new Error(`Unknown time zone: ${patch.timezone}`);
     if (patch.cron !== undefined && patch.cron) {
       const tz = patch.timezone ?? r.timezone;
       const err = validateCron(patch.cron, tz && tz !== "auto" ? tz : this.timezone(), limits.minRoutineIntervalMinutes);
@@ -233,12 +255,34 @@ export class Scheduler {
     for (const r of this.list(botId)) this.delete(r.id);
   }
 
+  /** Re-create every cron job (after the account time zone changes). */
+  rearmAll(): void {
+    for (const r of this.store.routines.values()) {
+      this.arm(r);
+      this.bus.emit({ type: "routine.updated", routine: this.describe(r) });
+    }
+  }
+
+  /** Record how a run ended. Also used for runs restored from the queue after a restart. */
+  finishRun(routineId: Id, runId: Id, ok: boolean, error?: string): void {
+    const r = this.store.routines.get(routineId);
+    const run = r?.history.find((h) => h.id === runId);
+    if (!r || !run || run.status !== "running") return;
+    run.status = ok ? "succeeded" : "failed";
+    run.error = error;
+    run.finishedAt = Date.now();
+    this.store.saveRoutines();
+    this.bus.emit({ type: "routine.updated", routine: this.describe(r) });
+  }
+
   /** Start a run now. Scheduled runs are skipped while paused; tests and webhooks are explicit. */
   async fire(id: Id, trigger: RoutineRun["trigger"], payload?: unknown): Promise<RoutineRun | undefined> {
     const r = this.store.routines.get(id);
     if (!r) return undefined;
     if (trigger === "schedule" && !r.enabled) return undefined;
     if (trigger === "webhook" && !r.enabled) throw new Error("Routine is paused");
+    // A scheduled tick while the last run is still queued or running would only pile up stale copies.
+    if (trigger === "schedule" && r.history.some((h) => h.status === "running")) return undefined;
     const run: RoutineRun = { id: newId("rrun"), trigger, status: "running", startedAt: Date.now() };
     r.history.push(run);
     const keep = this.store.settings.limits.routineHistory;
@@ -246,14 +290,7 @@ export class Scheduler {
     r.lastRunAt = run.startedAt;
     this.store.saveRoutines();
     this.bus.emit({ type: "routine.updated", routine: this.describe(r) });
-    const finish = (ok: boolean, error?: string) => {
-      run.status = ok ? "succeeded" : "failed";
-      run.error = error;
-      run.finishedAt = Date.now();
-      this.store.saveRoutines();
-      const cur = this.store.routines.get(id);
-      if (cur) this.bus.emit({ type: "routine.updated", routine: this.describe(cur) });
-    };
+    const finish = (ok: boolean, error?: string) => this.finishRun(id, run.id, ok, error);
     // Don't await the bot here: the caller (webhook, test button) returns as soon as the run starts.
     this.host
       .runRoutine(r, run, payload)
@@ -267,10 +304,13 @@ export class Scheduler {
     const days = this.store.settings.absencePauseDays;
     const last = this.store.settings.lastUserActivityAt;
     if (!days || !last) return;
-    if (Date.now() - last < days * 86400_000) return;
+    const cutoff = Date.now() - days * 86400_000;
+    if (last > cutoff) return;
     const paused = new Map<Id, number>();
     for (const r of this.store.routines.values()) {
       if (!r.enabled || !r.cron) continue;
+      // You turned it back on (or edited it) recently: that counts as being back for this routine.
+      if (r.updatedAt > cutoff) continue;
       r.enabled = false;
       r.pausedReason = `Paused after ${days} days without activity from you`;
       paused.set(r.botId, (paused.get(r.botId) ?? 0) + 1);

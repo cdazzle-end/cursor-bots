@@ -44,6 +44,9 @@ export class BotRunner {
   private pumping = false;
   private lastError?: string;
   private waiters = new Map<Id, (r: { ok: boolean; error?: string; message?: Message }) => void>();
+  /** Messages already handed to the bot by steering; they're left out of later <context>. */
+  private delivered = new Set<Id>();
+  private shuttingDown = false;
 
   constructor(h: Harness, botId: Id) {
     this.h = h;
@@ -66,22 +69,28 @@ export class BotRunner {
     return new Promise((resolve) => this.waiters.set(wakeId, resolve));
   }
 
+  private resolve(id: Id, r: { ok: boolean; error?: string; message?: Message }): void {
+    this.waiters.get(id)?.(r);
+    this.waiters.delete(id);
+  }
+
   async enqueue(ev: WakeEvent): Promise<void> {
+    if (this.shuttingDown || this.h.isStale(ev)) return this.resolve(ev.id, { ok: false, error: "stopped" });
     // A new message from you in the conversation the bot is working on goes
     // straight into the running turn (Grok Bot: your message "can redirect
-    // the current turn").
+    // the current turn"). Messages with files or /skills wait for their own
+    // turn, because steering only carries text.
     const cur = this.current;
-    if (cur?.run?.steer && ev.source === "user" && ev.convId === cur.wake.convId && !cur.cancelled) {
+    const steerable =
+      ev.source === "user" && !ev.attachments?.length && !this.h.expandSkillRefs(ev.text, cur?.bot ?? this.h.store.bots.get(this.botId)!).length;
+    if (cur?.run?.steer && steerable && ev.convId === cur.wake.convId && !cur.cancelled) {
       const ok = await cur.run.steer(`Message from ${this.h.store.settings.user.name} while you work:\n${ev.text}`);
       if (ok) {
-        if (ev.messageId) {
-          const m = this.h.store.findMessage(ev.convId, ev.messageId);
-          if (m) this.h.store.markSeen(this.botId, ev.convId, m.ts);
-        }
-        this.waiters.get(ev.id)?.({ ok: true });
-        this.waiters.delete(ev.id);
-        return;
+        if (ev.messageId) this.delivered.add(ev.messageId);
+        return this.resolve(ev.id, { ok: true });
       }
+      // The turn ended (or was stopped) before it took the message.
+      if (cur.cancelled || this.h.isStale(ev)) return this.resolve(ev.id, { ok: false, error: "stopped" });
     }
     this.queue.push(ev);
     this.h.persistQueue();
@@ -90,17 +99,18 @@ export class BotRunner {
   }
 
   /** Drop queued work for a conversation and cancel the running turn if it replies there. */
-  async stop(convId?: Id): Promise<boolean> {
-    const before = this.queue.length;
-    const dropped = this.queue.filter((q) => !convId || q.convId === convId);
-    this.queue = this.queue.filter((q) => convId && q.convId !== convId);
-    for (const d of dropped) {
-      this.waiters.get(d.id)?.({ ok: false, error: "stopped" });
-      this.waiters.delete(d.id);
-    }
-    let stopped = before !== this.queue.length;
+  stop(convId?: Id): Promise<boolean> {
+    return this.stopWhere((w) => !convId || w.convId === convId);
+  }
+
+  /** Drop queued wakes matching `match` and cancel the running turn if it matches. */
+  async stopWhere(match: (w: WakeEvent) => boolean): Promise<boolean> {
+    const dropped = this.queue.filter(match);
+    this.queue = this.queue.filter((q) => !match(q));
+    for (const d of dropped) this.resolve(d.id, { ok: false, error: "stopped" });
+    let stopped = dropped.length > 0;
     const cur = this.current;
-    if (cur && (!convId || cur.wake.convId === convId)) {
+    if (cur && !cur.cancelled && match(cur.wake)) {
       cur.cancelled = true;
       stopped = true;
       try {
@@ -112,6 +122,18 @@ export class BotRunner {
     this.h.persistQueue();
     this.emitStatus();
     return stopped;
+  }
+
+  /** Gateway shutdown: cancel the running turn but keep the queue, so it's restored on restart. */
+  async shutdown(): Promise<void> {
+    this.shuttingDown = true;
+    const cur = this.current;
+    if (cur) {
+      cur.cancelled = true;
+      await cur.run?.cancel().catch(() => {});
+    }
+    await this.session?.close().catch(() => {});
+    this.session = undefined;
   }
 
   async dispose(): Promise<void> {
@@ -136,8 +158,13 @@ export class BotRunner {
     const same = this.queue.filter((q) => q.source === "user" && q.convId === first.convId);
     if (!same.length) return first;
     this.queue = this.queue.filter((q) => !same.includes(q));
+    const all = [first, ...same];
+    const direct = all.some((w) => w.addressed === "you" || !w.allowSilence);
     const merged: WakeEvent = {
       ...first,
+      // If any of the merged messages addressed the bot directly, it must answer.
+      allowSilence: direct ? false : first.allowSilence,
+      addressed: all.some((w) => w.addressed === "you") ? "you" : first.addressed,
       text: [first.text, ...same.map((s) => s.text)].filter(Boolean).join("\n\n"),
       attachments: [...(first.attachments ?? []), ...same.flatMap((s) => s.attachments ?? [])],
       messageId: same[same.length - 1]!.messageId ?? first.messageId,
@@ -161,10 +188,14 @@ export class BotRunner {
     if (this.pumping) return;
     this.pumping = true;
     try {
-      while (!this.current) {
+      while (!this.current && !this.shuttingDown) {
         const ev = this.next();
         if (!ev) break;
-        this.h.persistQueue();
+        if (this.h.isStale(ev)) {
+          this.resolve(ev.id, { ok: false, error: "stopped" });
+          this.h.persistQueue();
+          continue;
+        }
         try {
           await this.execute(ev);
         } catch (err) {
@@ -220,21 +251,16 @@ export class BotRunner {
     const store = h.store;
     const bot = store.bots.get(this.botId);
     const conv = store.conversations.get(wake.convId);
-    const finish = (r: { ok: boolean; error?: string; message?: Message }) => {
-      this.waiters.get(wake.id)?.(r);
-      this.waiters.delete(wake.id);
-    };
+    const finish = (r: { ok: boolean; error?: string; message?: Message }) => this.resolve(wake.id, r);
     if (!bot || !conv) return finish({ ok: false, error: "bot or conversation no longer exists" });
 
-    const limits = store.settings.limits;
-    if (wake.chain.runs >= limits.maxChainRuns) {
-      h.postNotice(conv.id, `Stopped a chain of bot-to-bot work after ${limits.maxChainRuns} turns to prevent a loop. Send a message to continue.`);
-      return finish({ ok: false, error: "chain run limit reached" });
-    }
+    // Every turn in a chain counts against one shared budget, however the chain branches.
+    const turns = h.chargeChainTurn(wake, conv.id);
+    if (turns === undefined) return finish({ ok: false, error: "chain run limit reached" });
 
     const state: RunState = {
       runId: newId("run"),
-      wake: { ...wake, chain: { ...wake.chain, runs: wake.chain.runs + 1 } },
+      wake: { ...wake, chain: { ...wake.chain, runs: turns } },
       bot,
       text: "",
       attachments: [],
@@ -244,11 +270,14 @@ export class BotRunner {
     };
     this.current = state;
     this.lastError = undefined;
+    this.h.persistQueue();
     this.emitStatus();
     h.bus.emit({ type: "run.started", botId: bot.id, convId: conv.id, runId: state.runId, source: wake.source });
 
     let outcome: RunOutcome;
     try {
+      // Re-install the approval hooks if anything changed them since the last turn.
+      h.healWorkspace();
       const session = await this.ensureSession(bot);
 
       // Messages in this conversation the bot hasn't seen (other bots, earlier turns).
@@ -260,6 +289,7 @@ export class BotRunner {
             m.ts > seen &&
             m.id !== wake.messageId &&
             !wake.alsoMessageIds?.includes(m.id) &&
+            !this.delivered.has(m.id) &&
             !(m.author.kind === "bot" && m.author.id === bot.id) &&
             m.kind !== "activity",
         )
@@ -311,7 +341,7 @@ export class BotRunner {
         images: images.length ? images : undefined,
         tools: buildTools(h, bot.id, () => this.current),
         mcpServers: h.mcpServersFor(bot),
-        model: bot.model,
+        model: bot.model ?? store.settings.defaultModel,
         onEvent: (ev) => {
           if (ev.type === "text") {
             state.text += ev.text;
@@ -345,6 +375,7 @@ export class BotRunner {
     } finally {
       if (outcome.status === "error") this.lastError = outcome.error;
       this.current = undefined;
+      h.persistQueue();
       h.bus.emit({ type: "run.finished", botId: bot.id, convId: conv.id, runId: state.runId, status: outcome.status, error: outcome.error });
       this.emitStatus();
       finish({ ok: outcome.status === "finished", error: outcome.error, message: posted });

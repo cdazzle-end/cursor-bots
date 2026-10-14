@@ -125,8 +125,17 @@ export interface Chain {
   id: Id;
   /** Number of bot-to-bot hops since a human or a schedule started the chain. */
   depth: number;
-  /** Bot runs spent in this chain so far. */
+  /** Bot runs spent in this chain so far (informational; the harness keeps the shared count). */
   runs: number;
+  /** Conversation where you (or a routine) started the chain; "stop" there stops the whole chain. */
+  originConvId?: Id;
+}
+
+/** Where a deferred decision (approval, secret) resumes the bot: its original turn's context. */
+export interface ResumeContext {
+  convId: Id;
+  replyTo?: ReplyRoute;
+  chain: Chain;
 }
 
 /** Where a handoff's answer goes: back to the requesting bot, in the conversation it was working in. */
@@ -151,6 +160,8 @@ export interface WakeEvent {
   messageId?: Id;
   /** Other messages folded into this wake (several quick messages from you). */
   alsoMessageIds?: Id[];
+  /** Stop generation of convId when this wake was created; a later "stop" there drops it. */
+  stopGen?: number;
   /** Text handed to the bot (already formatted, without the harness envelope). */
   text: string;
   attachments?: Attachment[];
@@ -221,6 +232,8 @@ export interface Approval {
   decidedAt?: number;
   expiresAt?: number;
   messageId?: Id;
+  /** The bot's turn context, so the decision wakes it where it was working (handoff replies keep flowing). */
+  resume?: ResumeContext;
 }
 
 export interface ApprovalRule {
@@ -250,6 +263,7 @@ export interface SecretRequest {
   status: "pending" | "saved" | "dismissed";
   createdAt: number;
   messageId?: Id;
+  resume?: ResumeContext;
 }
 
 export interface ConnectorConfig {

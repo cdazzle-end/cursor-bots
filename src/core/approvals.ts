@@ -1,6 +1,6 @@
 import type { EventBus } from "./events.ts";
 import type { Store } from "./store.ts";
-import type { Approval, ApprovalRule, Id } from "./types.ts";
+import type { Approval, ApprovalRule, Id, ResumeContext } from "./types.ts";
 import { escapeRegExp, newId } from "./util.ts";
 
 export interface ApprovalHost {
@@ -88,6 +88,7 @@ export class ApprovalService {
     details?: string;
     command?: string;
     origin: "foreground" | "background";
+    resume?: ResumeContext;
   }): Approval {
     const subject = input.command ?? input.title;
     for (const a of this.store.approvals.values()) {
@@ -104,6 +105,7 @@ export class ApprovalService {
       command: input.command,
       status: "pending",
       origin: input.origin,
+      resume: input.resume,
       createdAt: now,
       expiresAt:
         input.origin === "background" ? now + this.store.settings.approvals.backgroundExpiryMinutes * 60_000 : undefined,
@@ -194,6 +196,8 @@ export class ApprovalService {
     details?: string;
     origin: "foreground" | "background";
     waitSeconds: number;
+    /** The bot's turn context, so a later decision wakes it where it was working. */
+    resume?: ResumeContext;
   }): Promise<GateResult> {
     if (this.evaluate(input.kind, input.subject) === "allow") return { permission: "allow" };
     const grant = this.consumeGrant(input.botId, input.subject);
@@ -206,6 +210,7 @@ export class ApprovalService {
       details: input.details,
       command: input.kind === "shell" ? input.subject : undefined,
       origin: input.origin,
+      resume: input.resume,
     });
     const decided = await this.waitFor(approval.id, input.waitSeconds);
     if (decided.status === "allowed") {

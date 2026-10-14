@@ -76,7 +76,6 @@ const TOOLS: ToolSpec[] = [
           mentions: mentions.length ? mentions : undefined,
           meta: { via: "send_message" },
         });
-        store.markSeen(state.bot.id, group.id, msg.ts);
         h.routeBotMentions(group, msg, state);
         const woke = mentions.filter((m) => m !== state.bot.id).map((m) => "@" + store.bots.get(m)?.handle);
         return `Posted in ${groupTag(group)}.${woke.length ? ` Woke ${woke.join(", ")}.` : " Nobody was @mentioned, so no bot was woken."}`;
@@ -366,12 +365,13 @@ const TOOLS: ToolSpec[] = [
       const origin = ["user", "approval", "system"].includes(state.wake.source) ? "foreground" : "background";
       const res = await h.approvals.gate({
         botId: state.bot.id,
-        convId: state.wake.convId,
+        convId: h.visibleConvFor(state.wake),
         kind: "action",
         subject: str(args.action).trim(),
         details: str(args.details) || undefined,
         origin,
         waitSeconds: h.store.settings.approvals.inlineWaitSeconds * 2,
+        resume: h.resumeFor(state.wake),
       });
       if (res.permission === "allow") return "Approved. Go ahead with exactly what you described.";
       return res.reason === "pending" ? res.message : { text: res.message, isError: true };
@@ -390,7 +390,7 @@ const TOOLS: ToolSpec[] = [
       const name = str(args.name).trim().toUpperCase();
       if (!SecretVault.validName(name)) return { text: "Use an UPPER_SNAKE_CASE name that doesn't start with CURSOR_.", isError: true };
       if (h.vault.has(name)) return `${name} is already stored. Use run_with_secrets with ["${name}"].`;
-      h.requestSecret(state.bot.id, state.wake.convId, name, str(args.description) || undefined);
+      h.requestSecret(state.bot.id, h.visibleConvFor(state.wake), name, str(args.description) || undefined, h.resumeFor(state.wake));
       return `Asked the user to enter ${name} in a secure card. End your turn now; you'll be woken when it's saved.`;
     },
   },
@@ -424,11 +424,12 @@ const TOOLS: ToolSpec[] = [
       const origin = ["user", "approval", "system"].includes(state.wake.source) ? "foreground" : "background";
       const gate = await h.approvals.gate({
         botId: state.bot.id,
-        convId: state.wake.convId,
+        convId: h.visibleConvFor(state.wake),
         kind: "shell",
         subject: command,
         origin,
         waitSeconds: h.store.settings.approvals.inlineWaitSeconds,
+        resume: h.resumeFor(state.wake),
       });
       if (gate.permission === "deny") return { text: gate.message, isError: gate.reason !== "pending" };
       let cwd = h.store.paths.workspace;

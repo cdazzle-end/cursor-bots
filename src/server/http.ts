@@ -375,6 +375,8 @@ export function createServer(h: Harness, opts: ServerOptions): http.Server {
           if (method !== "GET" && !r.public) {
             const origin = req.headers.origin;
             if (origin && new URL(origin).host !== req.headers.host) throw new HttpError(403, "Cross-origin request refused");
+            // Any change you make (re-enabling a routine, deciding an approval) means you're around.
+            h.touchUserActivity();
           }
           const params: Record<string, string> = {};
           r.keys.forEach((k, i) => (params[k] = decodeURIComponent(m[i + 1]!)));

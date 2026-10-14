@@ -45,12 +45,14 @@ export function renderMarkdown(src, ctx) {
   };
   while (i < lines.length) {
     const line = lines[i];
-    const fence = /^```(\w*)\s*$/.exec(line);
+    // Any info string ("c++", "ts title=x"); the fence closes on at least as many backticks.
+    const fence = /^\s{0,3}(`{3,})[^`]*$/.exec(line);
     if (fence) {
       flush();
+      const close = new RegExp(`^\\s{0,3}\`{${fence[1].length},}\\s*$`);
       const buf = [];
       i++;
-      while (i < lines.length && !/^```\s*$/.test(lines[i])) buf.push(lines[i++]);
+      while (i < lines.length && !close.test(lines[i])) buf.push(lines[i++]);
       i++;
       out.push(`<pre><code>${esc(buf.join("\n"))}</code></pre>`);
       continue;
@@ -65,15 +67,40 @@ export function renderMarkdown(src, ctx) {
     if (/^\s*[-*+]\s+/.test(line) || /^\s*\d+[.)]\s+/.test(line)) {
       flush();
       const ordered = /^\s*\d+[.)]\s+/.test(line);
+      const itemRe = ordered ? /^\s*\d+[.)]\s+/ : /^\s*[-*+]\s+/;
+      const isContinuation = (l) => /^\s{2,}\S/.test(l) && !/^\s*([-*+]|\d+[.)])\s+/.test(l);
+      const nextNonBlank = (from) => {
+        let j = from;
+        while (j < lines.length && /^\s*$/.test(lines[j])) j++;
+        return j;
+      };
+      const start = ordered ? Number(/^\s*(\d+)/.exec(line)[1]) : 1;
       const items = [];
-      while (i < lines.length && (ordered ? /^\s*\d+[.)]\s+/ : /^\s*[-*+]\s+/).test(lines[i])) {
-        let item = lines[i].replace(ordered ? /^\s*\d+[.)]\s+/ : /^\s*[-*+]\s+/, "");
+      while (i < lines.length && itemRe.test(lines[i])) {
+        // An item is its first line plus indented lines; a blank line before more indented text starts a new paragraph in it.
+        const parts = [lines[i].replace(itemRe, "")];
         i++;
-        while (i < lines.length && /^\s{2,}\S/.test(lines[i]) && !/^\s*([-*+]|\d+[.)])\s+/.test(lines[i])) item += " " + lines[i++].trim();
-        const task = /^\[( |x)\]\s+/i.exec(item);
-        items.push(task ? `${task[1].trim() ? "☑" : "☐"} ${inline(item.slice(task[0].length), ctx)}` : inline(item, ctx));
+        for (;;) {
+          while (i < lines.length && isContinuation(lines[i])) parts[parts.length - 1] += " " + lines[i++].trim();
+          const j = nextNonBlank(i);
+          if (j > i && j < lines.length && isContinuation(lines[j])) {
+            parts.push("");
+            i = j;
+            parts[parts.length - 1] = lines[i++].trim();
+            continue;
+          }
+          break;
+        }
+        const task = /^\[( |x)\]\s+/i.exec(parts[0]);
+        if (task) parts[0] = parts[0].slice(task[0].length);
+        const html = parts.map((p) => inline(p, ctx)).join("<br>");
+        items.push(task ? `${task[1].trim() ? "☑" : "☐"} ${html}` : html);
+        // Loose lists: blank lines between items keep the list (and its numbering) going.
+        const j = nextNonBlank(i);
+        if (j > i && j < lines.length && itemRe.test(lines[j])) i = j;
       }
-      out.push(`<${ordered ? "ol" : "ul"}>${items.map((x) => `<li>${x}</li>`).join("")}</${ordered ? "ol" : "ul"}>`);
+      const tag = ordered ? "ol" : "ul";
+      out.push(`<${tag}${ordered && start !== 1 ? ` start="${start}"` : ""}>${items.map((x) => `<li>${x}</li>`).join("")}</${tag}>`);
       continue;
     }
     if (/^>\s?/.test(line)) {

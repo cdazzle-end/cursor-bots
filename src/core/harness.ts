@@ -15,6 +15,7 @@ import type {
   Attachment,
   Author,
   Bot,
+  ConnectorConfig,
   Conversation,
   Id,
   Message,
@@ -22,6 +23,7 @@ import type {
   Routine,
   RoutineRun,
   SecretRequest,
+  ResumeContext,
   Settings,
   WakeEvent,
 } from "./types.ts";
@@ -66,7 +68,7 @@ export interface BotTemplate {
   model?: ModelChoice;
   connectors: Bot["connectors"];
   disabledSkills: string[];
-  routines: Array<Pick<Routine, "name" | "instruction" | "cron" | "timezone" | "skill">>;
+  routines: Array<Pick<Routine, "name" | "instruction" | "cron" | "timezone" | "skill"> & { enabled?: boolean }>;
   /** Lasting rules and preferences from memory (facts and work log are not shared). */
   memory?: string;
 }
@@ -91,7 +93,18 @@ export class Harness {
   private hookSessions = new Map<string, Id>();
   private queueFile: string;
   private restoring = false;
+  private stopping = false;
   private gatewayPort = "";
+  private gateConfig?: { url: string; token: string; timeoutMs: number; protect: string[] };
+  /** Turns spent per chain, shared by every branch of a fan-out. */
+  private chainTurns = new Map<Id, { turns: number; at: number; notified: boolean }>();
+  /** Chains whose hop-limit notice was already posted. */
+  private hopNotified = new Set<Id>();
+  /** Where each live chain started, so "stop" there reaches delegated work. */
+  private chainOrigin = new Map<Id, Id>();
+  private stoppedChains = new Set<Id>();
+  /** Bumped by "stop" in a conversation; wakes created before the bump are dropped. */
+  private stopGens = new Map<Id, number>();
 
   constructor(opts: HarnessOptions) {
     this.store = new Store(opts.home);
@@ -123,18 +136,27 @@ export class Harness {
   async start(opts: { gatewayUrl: string }): Promise<void> {
     const waitMs = (this.store.settings.approvals.inlineWaitSeconds + 30) * 1000;
     this.gatewayPort = new URL(opts.gatewayUrl).port;
-    prepareWorkspace(this.store.paths, { url: opts.gatewayUrl, token: this.gateToken, timeoutMs: waitMs, protect: this.protectedPaths() });
+    this.gateConfig = { url: opts.gatewayUrl, token: this.gateToken, timeoutMs: waitMs, protect: this.protectedPaths() };
+    prepareWorkspace(this.store.paths, this.gateConfig);
     for (const b of this.store.bots.values()) ensureBotFolder(this.store.paths, b.handle);
     this.approvals.start();
     this.scheduler.start();
     this.restoreQueue();
   }
 
+  /** Re-install the hooks and manual if a bot (or anything else) changed them. Cheap when nothing changed. */
+  healWorkspace(): void {
+    if (this.gateConfig) prepareWorkspace(this.store.paths, this.gateConfig, { onlyIfChanged: true });
+  }
+
   async stop(): Promise<void> {
     this.scheduler.stop();
     this.approvals.stop();
+    // Snapshot the queue (and the turns in progress) once, then freeze it: cancelling
+    // the running turns below must not overwrite the snapshot or start new work.
     this.persistQueue();
-    for (const r of this.runners.values()) await r.dispose();
+    this.stopping = true;
+    for (const r of this.runners.values()) await r.shutdown();
     for (const rt of this.runtimes.values()) await rt.dispose?.();
   }
 
@@ -182,6 +204,7 @@ export class Harness {
         avatar: { ...s.user.avatar, ...(patch.user.avatar ?? {}) },
       };
     }
+    let timezoneChanged = false;
     if (typeof patch.timezone === "string") {
       if (patch.timezone !== "auto") {
         try {
@@ -190,14 +213,21 @@ export class Harness {
           throw new Error(`Unknown time zone: ${patch.timezone}`);
         }
       }
+      timezoneChanged = patch.timezone !== s.timezone;
       s.timezone = patch.timezone;
     }
     if (typeof patch.runtime === "string") {
       if (!this.runtimes.has(patch.runtime)) throw new Error(`Unknown runtime: ${patch.runtime}`);
       s.runtime = patch.runtime;
     }
-    if (patch.defaultModel?.id) s.defaultModel = { id: String(patch.defaultModel.id), params: patch.defaultModel.params };
-    if (patch.routerModel !== undefined) s.routerModel = patch.routerModel?.id ? { id: String(patch.routerModel.id), params: patch.routerModel.params } : undefined;
+    // A patch that names the same model without params keeps its params (the router's fast mode).
+    const model = (next: any, cur?: ModelChoice): ModelChoice => {
+      const id = String(next.id);
+      const params = Array.isArray(next.params) ? next.params : next.params === null ? undefined : cur?.id === id ? cur.params : undefined;
+      return params ? { id, params } : { id };
+    };
+    if (patch.defaultModel?.id) s.defaultModel = model(patch.defaultModel, s.defaultModel);
+    if (patch.routerModel !== undefined) s.routerModel = patch.routerModel?.id ? model(patch.routerModel, s.routerModel) : undefined;
     if (["llm", "lead", "heuristic"].includes(patch.groupRouting)) s.groupRouting = patch.groupRouting;
     if (patch.approvals) {
       const a = patch.approvals;
@@ -232,6 +262,8 @@ export class Harness {
     if (typeof patch.cursorSandbox === "boolean") s.cursorSandbox = patch.cursorSandbox;
     this.store.saveSettings();
     if (sessionAffecting) void this.resetAllSessions();
+    // Live cron jobs captured the old zone when they were armed.
+    if (timezoneChanged) this.scheduler.rearmAll();
     this.bus.emit({ type: "settings.updated", settings: s });
     return s;
   }
@@ -240,7 +272,7 @@ export class Harness {
 
   /** Queued work survives a restart; a turn that was running is reported as interrupted. */
   persistQueue(): void {
-    if (this.restoring) return;
+    if (this.restoring || this.stopping) return;
     const queue: WakeEvent[] = [];
     const running: Array<{ botId: Id; wake: WakeEvent }> = [];
     for (const r of this.runners.values()) {
@@ -252,31 +284,104 @@ export class Harness {
 
   private restoreQueue(): void {
     const saved = readJson<{ queue: WakeEvent[]; running: Array<{ botId: Id; wake: WakeEvent }> }>(this.queueFile, { queue: [], running: [] });
+    const queued = (saved.queue ?? []).filter((w) => this.store.bots.has(w.botId) && this.store.conversations.has(w.convId));
     this.restoring = true;
     try {
       for (const { botId, wake } of saved.running ?? []) {
         const bot = this.store.bots.get(botId);
-        if (!bot || !this.store.conversations.has(wake.convId)) continue;
-        this.postNotice(wake.convId, `${bot.name} was interrupted by a restart while working. Send a message to pick it back up.`);
-        if (wake.routineId && wake.routineRunId) {
-          const r = this.store.routines.get(wake.routineId);
-          const run = r?.history.find((h) => h.id === wake.routineRunId);
-          if (run && run.status === "running") {
+        const conv = this.store.conversations.get(wake.convId);
+        if (!bot || !conv) continue;
+        // Tell you where you can act on it (a bot-to-bot thread is read-only).
+        const where = this.visibleConvFor(wake);
+        this.postNotice(where, `${bot.name} was interrupted by a restart while working${conv.kind === "botdm" ? " on a handoff" : ""}. Send a message to pick it back up.`);
+        if (wake.replyTo) {
+          this.deliverHandoffReply(
+            { wake, bot } as RunState,
+            { text: "the work was interrupted by a gateway restart; ask again if it's still needed", failed: true },
+          );
+        }
+      }
+      // Any routine run still marked running belongs to a turn that died with the old process,
+      // unless its wake is queued again below.
+      const requeued = new Set(queued.map((w) => w.routineRunId).filter(Boolean));
+      let changed = false;
+      for (const r of this.store.routines.values()) {
+        for (const run of r.history) {
+          if (run.status === "running" && !requeued.has(run.id)) {
             run.status = "failed";
             run.error = "Interrupted by a restart";
             run.finishedAt = Date.now();
-            this.store.saveRoutines();
+            changed = true;
           }
         }
       }
-      for (const w of saved.queue ?? []) {
-        if (this.store.bots.has(w.botId) && this.store.conversations.has(w.convId)) void this.runner(w.botId).enqueue(w);
+      if (changed) this.store.saveRoutines();
+      for (const w of queued) {
+        const runner = this.runner(w.botId);
+        if (w.routineId && w.routineRunId) {
+          const routineId = w.routineId;
+          const runId = w.routineRunId;
+          void runner.whenDone(w.id).then((res) => this.scheduler.finishRun(routineId, runId, res.ok, res.error));
+        }
+        if (w.chain.originConvId) this.chainOrigin.set(w.chain.id, w.chain.originConvId);
+        void runner.enqueue(w);
       }
     } finally {
       this.restoring = false;
       this.persistQueue();
     }
   }
+
+  // ------------------------------------------------------------------ chains & stopping
+
+  /**
+   * Count a turn against its chain's shared budget. Returns the chain's turn
+   * count, or undefined (after posting one notice) when the budget is spent.
+   */
+  chargeChainTurn(wake: WakeEvent, convId: Id): number | undefined {
+    const now = Date.now();
+    if (this.chainTurns.size > 2000) {
+      for (const [id, c] of this.chainTurns) if (now - c.at > 6 * 3600_000) this.chainTurns.delete(id);
+    }
+    const entry = this.chainTurns.get(wake.chain.id) ?? { turns: 0, at: now, notified: false };
+    entry.turns += 1;
+    entry.at = now;
+    this.chainTurns.set(wake.chain.id, entry);
+    const max = this.store.settings.limits.maxChainRuns;
+    if (entry.turns <= max) return entry.turns;
+    if (!entry.notified) {
+      entry.notified = true;
+      this.postNotice(
+        wake.chain.originConvId && this.store.conversations.has(wake.chain.originConvId) ? wake.chain.originConvId : convId,
+        `Stopped a chain of bot-to-bot work after ${max} turns to prevent a loop. Send a message to continue.`,
+      );
+    }
+    return undefined;
+  }
+
+  /** True while a chain may still create bot-to-bot wakes. */
+  private chainOpen(chainId: Id): boolean {
+    const c = this.chainTurns.get(chainId);
+    return !this.stoppedChains.has(chainId) && !(c && c.turns >= this.store.settings.limits.maxChainRuns);
+  }
+
+  private hopLimitNotice(chainId: Id, convId: Id, text: string): void {
+    if (this.hopNotified.has(chainId)) return;
+    this.hopNotified.add(chainId);
+    this.postNotice(convId, text);
+  }
+
+  stopGen(convId: Id): number {
+    return this.stopGens.get(convId) ?? 0;
+  }
+
+  /** A wake is stale if "stop" was sent in its conversation after it was created, or its chain was stopped. */
+  isStale(w: WakeEvent): boolean {
+    if (this.stoppedChains.has(w.chain.id)) return true;
+    return w.stopGen !== undefined && w.stopGen < this.stopGen(w.convId);
+  }
+
+  // ------------------------------------------------------------------ bots
 
   // ------------------------------------------------------------------ bots
 
@@ -398,6 +503,8 @@ export class Harness {
           this.bus.emit({ type: "conversation.updated", conversation: c });
         }
       } else {
+        // The partner in a bot-to-bot thread stops working for a requester that no longer exists.
+        for (const other of c.members) if (other !== id) void this.runners.get(other)?.stop(c.id);
         this.store.conversations.delete(c.id);
         this.store.deleteConversationMessages(c.id);
         this.bus.emit({ type: "conversation.deleted", id: c.id });
@@ -433,9 +540,20 @@ export class Harness {
     });
     for (const r of this.scheduler.list(id)) {
       try {
-        this.scheduler.create({ botId: copy.id, name: r.name, instruction: r.instruction, cron: r.cron, timezone: r.timezone, skill: r.skill });
+        // Paused routines stay paused; a webhook trigger gets a fresh key.
+        this.scheduler.create({
+          botId: copy.id,
+          name: r.name,
+          instruction: r.instruction,
+          cron: r.cron,
+          timezone: r.timezone,
+          skill: r.skill,
+          webhook: !!r.webhookKey,
+          enabled: r.enabled,
+          pausedReason: r.pausedReason,
+        });
       } catch {
-        // Webhook-only routines need a new key; skip them.
+        // Skip routines that no longer validate.
       }
     }
     return copy;
@@ -459,7 +577,10 @@ export class Harness {
       model: bot.model,
       connectors: bot.connectors,
       disabledSkills: bot.disabledSkills,
-      routines: this.scheduler.list(id).filter((r) => r.cron).map((r) => ({ name: r.name, instruction: r.instruction, cron: r.cron, timezone: r.timezone, skill: r.skill })),
+      routines: this.scheduler
+        .list(id)
+        .filter((r) => r.cron)
+        .map((r) => ({ name: r.name, instruction: r.instruction, cron: r.cron, timezone: r.timezone, skill: r.skill, enabled: r.enabled })),
       memory: keep || undefined,
     };
   }
@@ -478,7 +599,16 @@ export class Harness {
     if (t.memory) this.store.writeMemory(bot.id, `# ${bot.name}'s memory\n\n${t.memory}\n\n## Facts\n\n## Work log\n`);
     for (const r of t.routines ?? []) {
       try {
-        this.scheduler.create({ botId: bot.id, name: r.name, instruction: r.instruction, cron: r.cron, timezone: r.timezone, skill: r.skill });
+        this.scheduler.create({
+          botId: bot.id,
+          name: r.name,
+          instruction: r.instruction,
+          cron: r.cron,
+          timezone: r.timezone,
+          skill: r.skill,
+          enabled: r.enabled !== false,
+          pausedReason: r.enabled === false ? "Paused in the template" : undefined,
+        });
       } catch {
         // Skip routines that no longer validate.
       }
@@ -629,11 +759,14 @@ export class Harness {
     return { ids, everyone };
   }
 
-  private newChain(): WakeEvent["chain"] {
-    return { id: newId("chain"), depth: 0, runs: 0 };
+  private newChain(originConvId: Id): WakeEvent["chain"] {
+    const chain = { id: newId("chain"), depth: 0, runs: 0, originConvId };
+    this.chainOrigin.set(chain.id, originConvId);
+    return chain;
   }
 
-  private touchUserActivity(): void {
+  /** Anything you do (not just chatting) counts as being around for the absence pause. */
+  touchUserActivity(): void {
     const now = Date.now();
     const last = this.store.settings.lastUserActivityAt ?? 0;
     this.store.settings.lastUserActivityAt = now;
@@ -675,7 +808,9 @@ export class Harness {
       messageId: msg.id,
       text,
       attachments: msg.attachments,
-      chain: this.newChain(),
+      chain: this.newChain(convId),
+      // Captured before routing (which can take a while in groups) so a "stop" meanwhile still wins.
+      stopGen: this.stopGen(convId),
       createdAt: Date.now(),
     };
     if (conv.kind === "dm") {
@@ -757,15 +892,27 @@ export class Harness {
   }
 
   wake(ev: WakeEvent): Promise<void> {
-    if (!this.store.bots.has(ev.botId)) return Promise.resolve();
+    if (this.stopping || !this.store.bots.has(ev.botId) || this.isStale(ev)) return Promise.resolve();
+    if (ev.chain.originConvId) this.chainOrigin.set(ev.chain.id, ev.chain.originConvId);
     return this.runner(ev.botId).enqueue(ev);
   }
 
+  /**
+   * "Stop" in a conversation: cancel work replying there, drop anything queued
+   * or still being routed for it, and stop every chain that started there,
+   * including work already handed to other bots.
+   */
   async stopConversation(convId: Id): Promise<boolean> {
     const conv = this.store.conversations.get(convId);
     if (!conv) return false;
+    this.stopGens.set(convId, this.stopGen(convId) + 1);
+    const chains = new Set<Id>();
+    for (const [chainId, origin] of this.chainOrigin) if (origin === convId) chains.add(chainId);
+    for (const c of chains) this.stoppedChains.add(c);
     let any = false;
-    for (const id of conv.members) if (await this.runner(id).stop(convId)) any = true;
+    for (const r of this.runners.values()) {
+      if (await r.stopWhere((w) => w.convId === convId || chains.has(w.chain.id))) any = true;
+    }
     return any;
   }
 
@@ -783,6 +930,9 @@ export class Harness {
     if (depth > limits.maxChainDepth) {
       throw new Error(`Hop limit reached (${limits.maxChainDepth} bot-to-bot hops in this chain). Stop delegating and report back to the user.`);
     }
+    if (!this.chainOpen(from.wake.chain.id)) {
+      throw new Error("This chain of bot-to-bot work was stopped or used up its turn budget. Report back to the user instead of delegating.");
+    }
     const thread = this.botDm(from.bot.id, target.id);
     const handoffId = newId("hof");
     const message = this.postMessage({
@@ -794,8 +944,8 @@ export class Harness {
       mentions: [target.id],
       meta: { handoffId, to: target.id, expectReply },
     });
-    // Make the handoff visible where the requesting bot is working.
-    if (from.wake.convId !== thread.id) {
+    // Make the handoff visible where the requesting bot is working (if that chat still exists).
+    if (from.wake.convId !== thread.id && this.store.conversations.has(from.wake.convId)) {
       this.postMessage({
         convId: from.wake.convId,
         author: { kind: "bot", id: from.bot.id },
@@ -818,7 +968,7 @@ export class Harness {
       allowSilence: false,
       kind: "handoff",
       replyTo: expectReply ? { botId: from.bot.id, convId: from.wake.convId, handoffId, upstream: from.wake.replyTo } : undefined,
-      chain: { id: from.wake.chain.id, depth, runs: from.wake.chain.runs },
+      chain: { ...from.wake.chain, depth },
       createdAt: Date.now(),
     });
     return { thread, message };
@@ -826,15 +976,20 @@ export class Harness {
 
   /** A bot posts into a group (final reply or send_message); wake the bots it @mentions. */
   routeBotMentions(conv: Conversation, msg: Message, state: RunState): void {
-    if (conv.kind !== "group") return;
+    if (conv.kind !== "group" || this.stopping) return;
     const { ids } = this.parseMentions(msg.text, conv.members);
     const targets = ids.filter((id) => id !== state.bot.id);
     if (!targets.length) return;
     const depth = state.wake.chain.depth + 1;
     if (depth > this.store.settings.limits.maxChainDepth) {
-      this.postNotice(conv.id, `Didn't wake ${targets.map((t) => "@" + this.store.bots.get(t)?.handle).join(", ")}: this chain of bot-to-bot messages hit the hop limit. Reply to continue.`);
+      this.hopLimitNotice(
+        state.wake.chain.id,
+        conv.id,
+        `Didn't wake ${targets.map((t) => "@" + this.store.bots.get(t)?.handle).join(", ")}: this chain of bot-to-bot messages hit the hop limit. Reply to continue.`,
+      );
       return;
     }
+    if (!this.chainOpen(state.wake.chain.id)) return;
     for (const botId of targets) {
       void this.wake({
         id: newId("wake"),
@@ -850,7 +1005,7 @@ export class Harness {
         allowSilence: true,
         kind: "group_message",
         addressed: "you",
-        chain: { id: state.wake.chain.id, depth, runs: state.wake.chain.runs },
+        chain: { ...state.wake.chain, depth },
         createdAt: Date.now(),
       });
     }
@@ -858,13 +1013,19 @@ export class Harness {
 
   private deliverHandoffReply(state: RunState, reply: { text: string; attachments?: Attachment[]; failed?: boolean }): void {
     const route = state.wake.replyTo;
-    if (!route) return;
+    if (!route || this.stopping) return;
     const requester = this.store.bots.get(route.botId);
     const conv = this.store.conversations.get(route.convId);
     if (!requester || !conv) return;
+    // A "stop" in the requester's conversation (or of this chain) ends the chain here.
+    if (!this.chainOpen(state.wake.chain.id)) return;
     const depth = state.wake.chain.depth + 1;
     if (depth > this.store.settings.limits.maxChainDepth) {
-      this.postNotice(route.convId, `@${state.bot.handle} answered @${requester.handle}, but the chain hit the hop limit, so @${requester.handle} wasn't woken. Reply to continue.`);
+      this.hopLimitNotice(
+        state.wake.chain.id,
+        route.convId,
+        `@${state.bot.handle} answered @${requester.handle}, but the chain hit the hop limit, so @${requester.handle} wasn't woken. Reply to continue.`,
+      );
       return;
     }
     void this.wake({
@@ -881,7 +1042,7 @@ export class Harness {
       allowSilence: conv.kind === "group",
       kind: "handoff_reply",
       replyTo: route.upstream,
-      chain: { id: state.wake.chain.id, depth, runs: state.wake.chain.runs },
+      chain: { ...state.wake.chain, depth },
       createdAt: Date.now(),
     });
   }
@@ -950,7 +1111,6 @@ export class Harness {
       runId: state.runId,
       meta,
     });
-    this.store.markSeen(bot.id, convId, msg.ts);
     this.routeBotMentions(conv, msg, state);
     if (state.wake.replyTo) this.deliverHandoffReply(state, { text, attachments: msg.attachments });
     return msg;
@@ -1015,18 +1175,52 @@ export class Harness {
     for (const [name, c] of Object.entries(this.store.connectors)) {
       if (!c.enabled) continue;
       if (bot.connectors !== "all" && !bot.connectors.includes(name)) continue;
-      out[name] = {
-        type: c.type ?? (c.url ? "http" : "stdio"),
-        command: c.command ? x(c.command) : undefined,
-        args: c.args?.map(x).filter((a) => a !== ""),
-        env: c.env ? Object.fromEntries(Object.entries(c.env).map(([k, v]) => [k, x(v)])) : undefined,
-        cwd: c.command ? this.store.paths.workspace : undefined,
-        url: c.url ? x(c.url) : undefined,
-        headers: c.headers ? Object.fromEntries(Object.entries(c.headers).map(([k, v]) => [k, x(v)])) : undefined,
-      };
+      out[name] = this.connectorSpec(c, x);
+    }
+    // Per-turn servers replace the workspace's .cursor/mcp.json for that run, so
+    // carry its servers along (a connector with the same name wins).
+    if (Object.keys(out).length) {
+      for (const [name, c] of Object.entries(this.projectMcpServers())) if (!(name in out)) out[name] = this.connectorSpec(c, (v) => v);
     }
     return out;
   }
+
+  private connectorSpec(c: Omit<ConnectorConfig, "enabled">, x: (v: string) => string): McpServerSpec {
+    return {
+      type: c.type ?? (c.url ? "http" : "stdio"),
+      command: c.command ? x(c.command) : undefined,
+      args: c.args?.map(x).filter((a) => a !== ""),
+      env: c.env ? Object.fromEntries(Object.entries(c.env).map(([k, v]) => [k, x(v)])) : undefined,
+      cwd: c.command ? this.store.paths.workspace : undefined,
+      url: c.url ? x(c.url) : undefined,
+      headers: c.headers ? Object.fromEntries(Object.entries(c.headers).map(([k, v]) => [k, x(v)])) : undefined,
+    };
+  }
+
+  /** Servers from workspace/.cursor/mcp.json (Cursor's own format). Unreadable files count as empty. */
+  private projectMcpServers(): Record<string, Omit<ConnectorConfig, "enabled">> {
+    try {
+      const raw = JSON.parse(fs.readFileSync(path.join(this.store.paths.workspace, ".cursor", "mcp.json"), "utf8"));
+      const servers = raw?.mcpServers;
+      if (!servers || typeof servers !== "object") return {};
+      const out: Record<string, Omit<ConnectorConfig, "enabled">> = {};
+      for (const [name, v] of Object.entries(servers as Record<string, any>)) {
+        if (!v || typeof v !== "object" || (!v.command && !v.url)) continue;
+        out[name] = {
+          type: v.type === "sse" || v.type === "http" || v.type === "stdio" ? v.type : undefined,
+          command: typeof v.command === "string" ? v.command : undefined,
+          args: Array.isArray(v.args) ? v.args.map(String) : undefined,
+          env: v.env && typeof v.env === "object" ? v.env : undefined,
+          url: typeof v.url === "string" ? v.url : undefined,
+          headers: v.headers && typeof v.headers === "object" ? v.headers : undefined,
+        };
+      }
+      return out;
+    } catch {
+      return {};
+    }
+  }
+
 
   // ------------------------------------------------------------------ routines
 
@@ -1058,7 +1252,7 @@ export class Harness {
       kind: "routine",
       routineId: r.id,
       routineRunId: run.id,
-      chain: this.newChain(),
+      chain: this.newChain(conv.id),
       createdAt: Date.now(),
     };
     const runner = this.runner(bot.id);
@@ -1082,26 +1276,49 @@ export class Harness {
     return msg.id;
   }
 
+  /** Where you can see and act on something a bot raises mid-turn (a bot-to-bot thread is read-only). */
+  visibleConvFor(wake: WakeEvent): Id {
+    const conv = this.store.conversations.get(wake.convId);
+    if (conv && conv.kind !== "botdm") return conv.id;
+    const origin = wake.chain.originConvId ? this.store.conversations.get(wake.chain.originConvId) : undefined;
+    if (origin && origin.kind !== "botdm") return origin.id;
+    return this.store.dmFor(wake.botId)?.id ?? wake.convId;
+  }
+
+  resumeFor(wake: WakeEvent): ResumeContext {
+    return { convId: wake.convId, replyTo: wake.replyTo, chain: wake.chain };
+  }
+
+  /** Wake a bot to continue after a decision, in the turn context it paused in (keeps handoff replies flowing). */
+  private resumeWake(botId: Id, resume: ResumeContext | undefined, fallbackConv: Id, extra: Pick<WakeEvent, "priority" | "source" | "text" | "kind"> & Partial<WakeEvent>): void {
+    const convId = resume && this.store.conversations.has(resume.convId) ? resume.convId : fallbackConv;
+    if (!this.store.conversations.has(convId)) return;
+    void this.wake({
+      id: newId("wake"),
+      botId,
+      convId,
+      allowSilence: false,
+      replyTo: resume?.replyTo,
+      chain: resume ? { ...resume.chain } : this.newChain(convId),
+      createdAt: Date.now(),
+      ...extra,
+    });
+  }
+
   private onApprovalDecided(a: Approval): void {
     const bot = this.store.bots.get(a.botId);
-    if (!bot || !this.store.conversations.has(a.convId)) return;
+    if (!bot) return;
     const subject = a.command ? `\`${a.command}\`` : `“${a.title}”`;
     const text =
       a.status === "allowed"
         ? `The user approved your request ${a.id} (${a.decision === "always" ? "always allow" : "allow once"}): ${subject}. Continue the task you paused.${a.command ? " Run the exact same command again now." : ""}`
         : `The user denied your request ${a.id}: ${subject}. Don't do it. Tell the user briefly what you'll do instead, or stop.`;
-    void this.wake({
-      id: newId("wake"),
-      botId: bot.id,
+    this.resumeWake(bot.id, a.resume, a.convId, {
       priority: a.origin === "foreground" ? 0 : 1,
       source: "approval",
-      convId: a.convId,
       text,
-      allowSilence: false,
       kind: "approval",
       approvalId: a.id,
-      chain: this.newChain(),
-      createdAt: Date.now(),
     });
   }
 
@@ -1136,7 +1353,8 @@ export class Harness {
   /** The gateway's own state: bots must not read or change it (tokens, secrets, settings, checkpoints). */
   protectedPaths(): string[] {
     const p = this.store.paths;
-    return [p.state, p.cursorStore, p.config, p.connectors, p.logs];
+    // The hooks folder and hooks.json are the approval gate itself; the manual is the bots' rulebook.
+    return [p.state, p.cursorStore, p.config, p.connectors, p.logs, p.hooksDir, p.hooksJson, path.join(p.rulesDir, "cursor-bots.mdc")];
   }
 
   /**
@@ -1146,7 +1364,8 @@ export class Harness {
    */
   touchesHarness(command: string): boolean {
     if (this.protectedPaths().some((p) => command.includes(p))) return true;
-    if (/\b(secret\.key|secrets\.vault|ui\.token|mcp\.token|gate\.token|cursor-store)\b/.test(command)) return true;
+    if (/\b(secret\.key|secrets\.vault|ui\.token|mcp\.token|gate\.token|cursor-store|cursor-bots-gate|cursor-bots\.mdc)\b/.test(command)) return true;
+    if (/\.cursor\/(hooks\b|hooks\.json)/.test(command)) return true;
     if (/\.\.\/+(state|settings\.json|connectors\.json)\b/.test(command)) return true;
     if (this.gatewayPort && new RegExp(`(localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|\\[::1\\]):${this.gatewayPort}\\b`).test(command)) return true;
     return false;
@@ -1168,7 +1387,7 @@ export class Harness {
     // Not one of our bots (e.g. you opened the workspace in the Cursor IDE): leave it to Cursor.
     if (!botId) return { permission: "allow" };
     const cur = this.runners.get(botId)?.current;
-    const convId = cur?.wake.convId ?? this.store.dmFor(botId)?.id;
+    const convId = cur ? this.visibleConvFor(cur.wake) : this.store.dmFor(botId)?.id;
     if (!convId) return { permission: "allow" };
     const res = await this.approvals.gate({
       botId,
@@ -1177,6 +1396,7 @@ export class Harness {
       subject: command,
       origin: cur && ["user", "approval", "system"].includes(cur.wake.source) ? "foreground" : "background",
       waitSeconds: this.store.settings.approvals.inlineWaitSeconds,
+      resume: cur ? this.resumeFor(cur.wake) : undefined,
     });
     if (res.permission === "allow") return { permission: "allow" };
     return {
@@ -1188,11 +1408,11 @@ export class Harness {
 
   // ------------------------------------------------------------------ secrets
 
-  requestSecret(botId: Id, convId: Id, name: string, description?: string): SecretRequest {
+  requestSecret(botId: Id, convId: Id, name: string, description?: string, resume?: ResumeContext): SecretRequest {
     for (const s of this.store.secretRequests.values()) {
       if (s.status === "pending" && s.botId === botId && s.name === name) return s;
     }
-    const req: SecretRequest = { id: newId("sreq"), botId, convId, name, description, status: "pending", createdAt: Date.now() };
+    const req: SecretRequest = { id: newId("sreq"), botId, convId, name, description, status: "pending", createdAt: Date.now(), resume };
     const msg = this.postMessage({
       convId,
       author: { kind: "bot", id: botId },
@@ -1216,17 +1436,11 @@ export class Harness {
     this.store.saveSecretRequests();
     this.bus.emit({ type: "secretRequest.updated", request: req });
     this.markRead(req.convId);
-    void this.wake({
-      id: newId("wake"),
-      botId: req.botId,
+    this.resumeWake(req.botId, req.resume, req.convId, {
       priority: 0,
       source: "system",
-      convId: req.convId,
       text: `The user saved the secret ${req.name} securely. You can't see the value; use run_with_secrets with secrets ["${req.name}"] (or a connector that references it) to use it. Continue what you were doing.`,
-      allowSilence: false,
       kind: "system",
-      chain: this.newChain(),
-      createdAt: Date.now(),
     });
     return req;
   }

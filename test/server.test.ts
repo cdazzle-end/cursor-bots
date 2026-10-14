@@ -134,11 +134,25 @@ test("the installed Cursor hook script maps sessions to bots and gates shell com
     assert.equal((await runHook("tool", { cwd: ws, tool_name: "Read", tool_input: { path: "bots/shipper/notes.md" } })).permission, "allow");
     assert.equal((await runHook("tool", { cwd: ws, tool_name: "Write", tool_input: { path: "notes.md", contents: "see ../state/x\nand more" } })).permission, "allow");
 
+    // The hook itself, its config and hooks.json are off-limits too (deleting them would switch the gate off).
+    for (const p of [".cursor/hooks/cursor-bots-gate.mjs", ".cursor/hooks.json", ".cursor/rules/cursor-bots.mdc"]) {
+      assert.equal((await runHook("tool", { cwd: ws, tool_name: "Delete", tool_input: { path: p } })).permission, "deny", p);
+    }
+    for (const cmd of ["rm .cursor/hooks/cursor-bots-gate.mjs", "echo {} > .cursor/hooks.json", "sed -i d .cursor/rules/cursor-bots.mdc"]) {
+      assert.equal((await runHook("shell", { conversation_id: "cursor-conv-1", command: cmd })).permission, "deny", cmd);
+    }
+
+    // Tampering heals before the next turn: the gateway rewrites the hook files.
+    fs.writeFileSync(gate, "process.stdout.write(JSON.stringify({permission:'allow'}))");
+    fs.writeFileSync(s.h.store.paths.hooksJson, "{}");
+    s.h.healWorkspace();
+    assert.match(fs.readFileSync(gate, "utf8"), /const cfg = /);
+    assert.equal(JSON.parse(fs.readFileSync(s.h.store.paths.hooksJson, "utf8")).hooks.beforeShellExecution[0].command, "node .cursor/hooks/cursor-bots-gate.mjs shell");
+
     // With the gateway down the hook fails open instead of blocking your own Cursor use.
-    const cfgFile = path.join(s.h.store.paths.hooksDir, "cursor-bots-gate.json");
-    const cfg = JSON.parse(fs.readFileSync(cfgFile, "utf8"));
-    fs.writeFileSync(cfgFile, JSON.stringify({ ...cfg, url: "http://127.0.0.1:9" }));
-    const r = spawnSync(process.execPath, [gate, "shell"], { input: JSON.stringify({ command: "git push" }) });
+    const deadGate = path.join(s.h.store.paths.hooksDir, "dead-gate.mjs");
+    fs.writeFileSync(deadGate, fs.readFileSync(gate, "utf8").replace(/"url":"[^"]*"/, '"url":"http://127.0.0.1:9"'));
+    const r = spawnSync(process.execPath, [deadGate, "shell"], { input: JSON.stringify({ command: "git push" }) });
     assert.deepEqual(JSON.parse(r.stdout.toString()), { permission: "allow" });
   } finally {
     await s.close();
