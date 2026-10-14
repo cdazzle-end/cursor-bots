@@ -1,0 +1,30 @@
+{
+  "name": "cursor-bots",
+  "version": "0.1.0",
+  "description": "A self-hosted, Grok-Bot-style multi-agent harness powered by the Cursor SDK: persistent named bots with memory, skills, routines, approvals, group chats and bot-to-bot handoffs.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "cursor-bots": "./bin/cursor-bots.mjs"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node src/cli.ts start",
+    "dev": "node --watch src/cli.ts start",
+    "demo": "node src/cli.ts start --runtime mock --home ./.demo-home --starter",
+    "doctor": "node src/cli.ts doctor",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.ts\"",
+    "check": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "@cursor/sdk": "^1.0.37",
+    "croner": "^10.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
+  }
+}
