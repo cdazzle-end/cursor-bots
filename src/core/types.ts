@@ -147,6 +147,8 @@ export interface WakeEvent {
   convId: Id;
   /** The message that triggered this wake, if any. */
   messageId?: Id;
+  /** Other messages folded into this wake (several quick messages from you). */
+  alsoMessageIds?: Id[];
   /** Text handed to the bot (already formatted, without the harness envelope). */
   text: string;
   attachments?: Attachment[];

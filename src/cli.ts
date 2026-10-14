@@ -243,6 +243,9 @@ async function main(): Promise<void> {
   }
 }
 
+// A long-running gateway logs stray async errors instead of exiting.
+process.on("unhandledRejection", (err) => console.error("  ⚠ unhandled:", (err as Error)?.stack ?? err));
+
 main().catch((err) => {
   console.error(`\n  ✖ ${err?.message ?? err}\n`);
   process.exit(1);

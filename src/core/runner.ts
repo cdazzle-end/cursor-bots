@@ -141,6 +141,7 @@ export class BotRunner {
       text: [first.text, ...same.map((s) => s.text)].filter(Boolean).join("\n\n"),
       attachments: [...(first.attachments ?? []), ...same.flatMap((s) => s.attachments ?? [])],
       messageId: same[same.length - 1]!.messageId ?? first.messageId,
+      alsoMessageIds: [first.messageId, ...same.map((x) => x.messageId)].filter((x): x is Id => Boolean(x)),
     };
     for (const s of same) {
       const w = this.waiters.get(s.id);
@@ -164,7 +165,17 @@ export class BotRunner {
         const ev = this.next();
         if (!ev) break;
         this.h.persistQueue();
-        await this.execute(ev);
+        try {
+          await this.execute(ev);
+        } catch (err) {
+          // Never let one bad turn take the gateway down; report it where the bot was working.
+          this.current = undefined;
+          this.lastError = String((err as Error)?.message ?? err);
+          this.h.postNotice(ev.convId, `Something went wrong delivering a reply: ${this.lastError}`);
+          this.waiters.get(ev.id)?.({ ok: false, error: this.lastError });
+          this.waiters.delete(ev.id);
+          this.emitStatus();
+        }
       }
     } finally {
       this.pumping = false;
@@ -244,7 +255,14 @@ export class BotRunner {
       const seen = store.lastSeen(bot.id, conv.id);
       const unseen = store
         .messages(conv.id)
-        .filter((m) => m.ts > seen && m.id !== wake.messageId && !(m.author.kind === "bot" && m.author.id === bot.id) && m.kind !== "activity")
+        .filter(
+          (m) =>
+            m.ts > seen &&
+            m.id !== wake.messageId &&
+            !wake.alsoMessageIds?.includes(m.id) &&
+            !(m.author.kind === "bot" && m.author.id === bot.id) &&
+            m.kind !== "activity",
+        )
         .slice(-MAX_UNSEEN);
 
       // Images you attached go to the model directly; other files are referenced by path.
@@ -318,6 +336,8 @@ export class BotRunner {
     } catch (err: any) {
       outcome = { status: "error", text: "", error: describeError(err) };
     }
+    // If the turn failed, the model may never have seen the full identity block.
+    if (outcome.status === "error") this.needIdentity = true;
 
     let posted: Message | undefined;
     try {
