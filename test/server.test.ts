@@ -142,3 +142,31 @@ test("a token protects the API when one is configured", async () => {
     await s.close();
   }
 });
+
+test("Team MCP: outside agents can list bots, message one and get its reply", async () => {
+  const s = await boot();
+  try {
+    s.h.createBot({ name: "Critic", label: "Reviews" });
+    const rpc = async (method: string, params?: unknown, id: number | null = 1, token = s.h.mcpToken) => {
+      const res = await fetch(s.base + "/mcp", {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: `Bearer ${token}` },
+        body: JSON.stringify(id === null ? { jsonrpc: "2.0", method, params } : { jsonrpc: "2.0", id, method, params }),
+      });
+      const text = await res.text();
+      return { status: res.status, body: text ? JSON.parse(text) : undefined };
+    };
+    assert.equal((await rpc("tools/list", {}, 1, "wrong")).status, 401);
+    const init = await rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "1" } });
+    assert.equal(init.body.result.serverInfo.name, "cursor-bots");
+    assert.equal((await rpc("notifications/initialized", {}, null)).status, 202);
+    const list = await rpc("tools/list");
+    assert.deepEqual(list.body.result.tools.map((t: any) => t.name), ["list_bots", "message_bot", "read_chat", "create_bot"]);
+    const bots = await rpc("tools/call", { name: "list_bots", arguments: {} });
+    assert.match(bots.body.result.content[0].text, /@critic "Critic" — Reviews/);
+    const ask = await rpc("tools/call", { name: "message_bot", arguments: { to: "@critic", text: "is V12 ready?", wait_seconds: 10 } });
+    assert.match(ask.body.result.content[0].text, /@critic: Hi Boss! I'm Critic/);
+  } finally {
+    await s.close();
+  }
+});

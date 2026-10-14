@@ -37,6 +37,7 @@ No key yet? `npm run demo` starts the same app with a scripted demo brain and a 
 | Bots creating focused helper bots | ✔ `create_bot` |
 | Attention states and notifications | ✔ working spinner, unread, needs-you badge, desktop notifications |
 | Phone access | ✔ responsive web app; `--host 0.0.0.0` with a token |
+| Your *other* agents talking to the team | ✔ **Team MCP** at `/mcp`: Claude Code, the Cursor IDE, Hermes, OpenClaw or any MCP client can `list_bots`, `message_bot` (and wait for the answer), `read_chat`, `create_bot` |
 | No model picker | You choose: per-bot model from your Cursor account, or the default |
 
 Not included: a virtual desktop with "watch the computer" and takeover (bots get a real browser through the Playwright connector instead), teach-by-demonstration, voice chat (dictation works), native Slack/X apps, team admin. See [RESEARCH.md §5](docs/RESEARCH.md#5-where-cursor-bots-differs-from-grok-bot).
@@ -58,7 +59,13 @@ Not included: a virtual desktop with "watch the computer" and takeover (bots get
 7. **Make it a routine**: "Every weekday at 8:45 AM, run /weekly-report and post it here. If the data source is down, tell me instead." Manage routines in the bot's details: pause, **Test**, edit, webhook URL and key, run history.
 8. **Approvals**: when a bot wants to `git push`, `rm -rf`, send email, publish…, a card appears. Choose **Allow once**, **Always allow** or **Deny**. Edit the rules in Settings → Approvals.
 9. **Connect apps**: add MCP servers (a real browser, GitHub, Notion…). Store their tokens in Settings → Secrets and reference them as `${secret:GITHUB_TOKEN}`.
-10. **From the terminal**: `node src/cli.ts say critic "is V12 ready?"` streams a bot's reply.
+10. **Give bots a real browser**: Connect apps → **browser**. Each bot gets its own persistent Playwright browser profile in `workspace/.browser/<bot>`, so several bots can browse at once and stay signed in. On a desktop the window is visible, so you can take over for a login. Run `npx @playwright/mcp install-browser chrome-for-testing` once first.
+11. **From the terminal**: `node src/cli.ts say critic "is V12 ready?"` streams a bot's reply.
+12. **From your other agents**: Settings → *Connect your agents* shows the MCP URL, token and copy-paste config. For example, in Claude Code:
+    ```
+    claude mcp add --transport http cursor-bots http://localhost:4777/mcp --header "Authorization: Bearer <token>"
+    ```
+    Then "ask @researcher to dig into this and tell me what it finds" works from inside Claude Code.
 
 House rules for *all* bots live in `~/.cursor-bots/workspace/AGENTS.md` (Shared computer → AGENTS.md).
 
@@ -112,6 +119,7 @@ Everything else is in the app's Settings: your name and label, time zone, defaul
 src/
   cli.ts                 start | doctor | models | say
   server/http.ts         REST API, SSE events, uploads, webhooks, Cursor hook endpoints
+  server/mcp.ts          Team MCP endpoint for outside agents
   core/harness.ts        the gateway: roster, conversations, routing, handoffs, approvals, secrets
   core/runner.ts         one per bot: priority queue, steering, the turn loop
   core/prompt.ts         the per-turn envelope (identity, memory, team, context)

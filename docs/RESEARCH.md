@@ -129,6 +129,8 @@ What Cursor does *not* give you: a roster, identity that survives across convers
 2. **Cursor Cloud Agents + Automations.** These are persistent VMs with schedules, but they are coding-task oriented (repo, branch, PR). Custom in-process tools don't work there, and there's no roster or bot-to-bot messaging.
 3. **Build a harness on the Cursor SDK local runtime (chosen).** You get Cursor's agent loop, tools and models, and you own the harness. It's the closest match to Grok Bot's design (one shared computer, durable named agents), and everything is plain files you can read.
 
+These options aren't exclusive. Cursor Bots exposes a **Team MCP** endpoint, so a Hermes or OpenClaw agent (or Claude Code, or the Cursor IDE) can message your Cursor-powered bots and wait for their answers. Skills are plain Agent Skills folders, so the same `SKILL.md` works in all of them.
+
 ---
 
 ## 5. Where Cursor Bots differs from Grok Bot

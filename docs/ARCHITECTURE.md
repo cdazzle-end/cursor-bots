@@ -205,13 +205,26 @@ interface RuntimeRun { steer?(text); cancel(); wait(): Promise<{ status, text, e
 
 To add your own (the Claude Agent SDK, an OpenAI-compatible loop, a Cursor Cloud Agent), implement these three interfaces and register the runtime in `src/cli.ts`. Bots pick a runtime in their details.
 
-## 10. Extending
+## 10. Team MCP: letting other harnesses in
+
+`src/server/mcp.ts` serves a Model Context Protocol endpoint at `POST /mcp` (Streamable HTTP with JSON responses, Bearer token in `state/mcp.token`). Any MCP client can call four tools, acting as you:
+
+| Tool | What it does |
+| --- | --- |
+| `list_bots` | The roster and groups, with who's busy |
+| `message_bot` | Post as you to `@bot` or `#group`, then wait (up to `wait_seconds`) until the bots in that chat go quiet, and return their replies |
+| `read_chat` | Recent messages in a bot's chat or a group |
+| `create_bot` | Add a bot with a job |
+
+This is how a Claude Code session, the Cursor IDE, Hermes or OpenClaw can delegate to your persistent team. It's the cross-harness version of the bot-to-bot handoff: the outside agent is just another teammate who messages through you.
+
+## 11. Extending
 
 - **A new tool**: add a `ToolSpec` to `TOOLS` in `src/core/tools.ts`. It receives `{ h, state }`, where `state.wake` says why the bot is running and `state.bot` says who it is.
-- **A new connector**: Connect apps → Custom, or edit `connectors.json` (any MCP server, stdio or HTTP).
+- **A new connector**: Connect apps → Custom, or edit `connectors.json` (any MCP server, stdio or HTTP). Values can use `${bot.handle}`, `${bot.name}`, `${workspace}`, `${headless}` and `${secret:NAME}`, which are resolved per bot. The browser preset uses `--user-data-dir ${workspace}/.browser/${bot.handle}` to give each bot its own screen. (A single shared browser over CDP was tried: Playwright MCP clients then drive the same tab.)
 - **House rules for everyone**: edit `workspace/AGENTS.md`.
 - **A skill**: drop a folder with `SKILL.md` into `workspace/.cursor/skills/`, or ask a bot to `skill_save` one.
 
-## 11. Testing
+## 12. Testing
 
 `npm test` runs the suite on the mock runtime: DMs, restart persistence, handoffs, groups and the loop guard, approvals, the real hook script, routines and webhooks, skills, secrets, steering and stop, helper bots, deletion, the token gate. `npm run typecheck` checks everything against the real `@cursor/sdk` types.

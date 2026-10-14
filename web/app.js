@@ -1217,6 +1217,7 @@ function openSettings(tab = "general") {
     ["brain", "Brain & models"],
     ["approvals", "Approvals"],
     ["secrets", "Secrets"],
+    ["agents", "Connect your agents"],
     ["limits", "Limits"],
     ["about", "About"],
   ]
@@ -1333,6 +1334,24 @@ function openSettings(tab = "general") {
         );
       };
       draw();
+    } else if (t === "agents") {
+      const url = `${location.origin}/mcp`;
+      const tok = S.state.mcpToken;
+      const claude = `claude mcp add --transport http cursor-bots ${url} --header "Authorization: Bearer ${tok}"`;
+      const cursorJson = JSON.stringify({ mcpServers: { "cursor-bots": { url, headers: { Authorization: `Bearer ${tok}` } } } }, null, 2);
+      body.innerHTML = `<p>Let agents outside this app (Claude Code, the Cursor IDE, Hermes, OpenClaw, any MCP client) work with your team. They get four tools: <code>list_bots</code>, <code>message_bot</code> (message a bot or #group as you and wait for the reply), <code>read_chat</code>, <code>create_bot</code>.</p>
+        <div class="copy-field"><span>URL</span><code>${esc(url)}</code><button class="btn small" data-copytext="${esc(url)}">Copy</button></div>
+        <div class="copy-field"><span>Header</span><code>Authorization: Bearer ${esc(tok)}</code><button class="btn small" data-copytext="Authorization: Bearer ${esc(tok)}">Copy</button></div>
+        <div class="d-section"><h4>Claude Code</h4><div class="copy-field"><code>${esc(claude)}</code><button class="btn small" data-copytext="${esc(claude)}">Copy</button></div></div>
+        <div class="d-section"><h4>Cursor IDE (.cursor/mcp.json)</h4><pre class="input mono" style="white-space:pre-wrap;margin:0">${esc(cursorJson)}</pre><div class="row"><button class="btn small" data-copytext="${esc(cursorJson)}">Copy</button></div></div>
+        <div class="muted">Hermes, OpenClaw and other harnesses: add an HTTP (streamable) MCP server with the URL and header above. Keep the token private; it can message your bots as you.</div>`;
+      $$("[data-copytext]", body).forEach(
+        (b) =>
+          (b.onclick = () => {
+            navigator.clipboard?.writeText(b.dataset.copytext);
+            toast("Copied");
+          }),
+      );
     } else if (t === "limits") {
       const L = s.limits;
       const f = (k, label) => `<div class="field">${label}<input type="number" min="1" data-limit="${k}" value="${L[k]}"></div>`;

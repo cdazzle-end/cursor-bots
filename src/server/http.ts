@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Harness, BotTemplate } from "../core/harness.ts";
 import { createStarterTeam } from "../core/starter.ts";
+import { handleMcp, mcpClientName } from "./mcp.ts";
 import type { ConnectorConfig } from "../core/types.ts";
 import { mimeFor, resolveInside } from "../core/util.ts";
 
@@ -334,6 +335,35 @@ export function createServer(h: Harness, opts: ServerOptions): http.Server {
   return http.createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
     try {
+      if (url.pathname === "/mcp") {
+        // Team MCP for outside agents. Always token-protected, so browsers can't reach it cross-site.
+        const bearer = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
+        if (bearer !== h.mcpToken) throw new HttpError(401, "Missing or wrong MCP token (see Settings → Connect your agents)");
+        if (req.method === "DELETE") return void res.writeHead(200).end();
+        if (req.method !== "POST") {
+          res.writeHead(405, { allow: "POST, DELETE" });
+          res.end();
+          return;
+        }
+        const buf = await readBody(req, MAX_JSON);
+        let msg: unknown;
+        try {
+          msg = JSON.parse(buf.toString("utf8"));
+        } catch {
+          throw new HttpError(400, "Invalid JSON");
+        }
+        const sid = typeof req.headers["mcp-session-id"] === "string" ? req.headers["mcp-session-id"] : undefined;
+        const out = await handleMcp(h, msg, () => mcpClientName(sid) ?? "an outside agent (MCP)");
+        const headers: Record<string, string> = out.sessionId ? { "mcp-session-id": out.sessionId } : {};
+        if (out.json === undefined) {
+          res.writeHead(out.status, headers);
+          res.end();
+        } else {
+          res.writeHead(out.status, { ...headers, "content-type": "application/json" });
+          res.end(JSON.stringify(out.json));
+        }
+        return;
+      }
       if (url.pathname.startsWith("/api/")) {
         const method = req.method ?? "GET";
         for (const r of routes) {

@@ -85,6 +85,8 @@ export class Harness {
   readonly scheduler: Scheduler;
   readonly runtimes = new Map<string, AgentRuntime>();
   readonly gateToken: string;
+  /** Bearer token for the Team MCP endpoint (/mcp) that outside agents use. */
+  readonly mcpToken: string;
   private runners = new Map<Id, BotRunner>();
   private hookSessions = new Map<string, Id>();
   private queueFile: string;
@@ -99,6 +101,9 @@ export class Harness {
     const tokenFile = path.join(this.store.paths.state, "gate.token");
     if (!fs.existsSync(tokenFile)) fs.writeFileSync(tokenFile, randomBytes(18).toString("base64url"), { mode: 0o600 });
     this.gateToken = fs.readFileSync(tokenFile, "utf8").trim();
+    const mcpFile = path.join(this.store.paths.state, "mcp.token");
+    if (!fs.existsSync(mcpFile)) fs.writeFileSync(mcpFile, randomBytes(24).toString("base64url"), { mode: 0o600 });
+    this.mcpToken = fs.readFileSync(mcpFile, "utf8").trim();
     this.approvals = new ApprovalService(this.store, this.bus, {
       postCard: (a) => this.postApprovalCard(a),
       onDeferredDecision: (a) => this.onApprovalDecided(a),
@@ -1275,6 +1280,7 @@ export class Harness {
       runtimes: [...this.runtimes.values()].map((r) => ({ id: r.id, label: r.label, ...r.available() })),
       workspace: s.paths.workspace,
       home: s.paths.home,
+      mcpToken: this.mcpToken,
       avatarShapes: AVATAR_SHAPES,
     };
   }
