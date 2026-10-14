@@ -886,11 +886,22 @@ export class Harness {
     });
   }
 
+  private recordUsage(bot: Bot, outcome: RunOutcome): void {
+    const u = (bot.usage ??= { turns: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, since: Date.now() });
+    u.turns += 1;
+    u.inputTokens += outcome.usage?.inputTokens ?? 0;
+    u.outputTokens += outcome.usage?.outputTokens ?? 0;
+    u.totalTokens += outcome.usage?.totalTokens ?? 0;
+    this.store.saveBots();
+    this.bus.emit({ type: "bot.updated", bot: this.describeBot(bot) });
+  }
+
   /** Called by the runner when a turn ends: post the reply and route it onward. */
   finishRun(state: RunState, convId: Id, outcome: RunOutcome): Message | undefined {
     const conv = this.store.conversations.get(convId);
     const bot = this.store.bots.get(state.bot.id);
     if (!conv || !bot) return undefined;
+    if (outcome.status !== "cancelled") this.recordUsage(bot, outcome);
     const author: Author = { kind: "bot", id: bot.id };
     const activity = [...state.activity.values()].slice(-60);
     const meta = {

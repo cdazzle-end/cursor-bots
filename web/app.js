@@ -120,6 +120,11 @@ function dayLabel(ts) {
   if (d.toDateString() === y.toDateString()) return "Yesterday";
   return d.toLocaleDateString([], { weekday: "long", month: "short", day: "numeric", year: d.getFullYear() === today.getFullYear() ? undefined : "numeric" });
 }
+function fmtTokens(n) {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`;
+  return String(n);
+}
 function sizeLabel(n) {
   if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
   return `${Math.max(1, Math.round(n / 1024))} KB`;
@@ -462,7 +467,8 @@ function activityHtml(m) {
   const act = m.meta?.activity;
   if (!act?.length) return "";
   const secs = m.meta?.durationMs ? Math.max(1, Math.round(m.meta.durationMs / 1000)) : null;
-  return `<details class="activity"><summary>${ICON.clock}${secs ? `Worked for ${secs < 90 ? `${secs}s` : `${Math.round(secs / 60)}m`} · ` : ""}${act.length} step${act.length === 1 ? "" : "s"}</summary><ul>${act
+  const extra = [m.meta?.model, m.meta?.usage?.totalTokens ? `${fmtTokens(m.meta.usage.totalTokens)} tokens` : ""].filter(Boolean).join(" · ");
+  return `<details class="activity"><summary>${ICON.clock}${secs ? `Worked for ${secs < 90 ? `${secs}s` : `${Math.round(secs / 60)}m`} · ` : ""}${act.length} step${act.length === 1 ? "" : "s"}${extra ? ` · ${esc(extra)}` : ""}</summary><ul>${act
     .map((a) => `<li><span class="dot ${a.status}"></span><span class="tname">${esc(a.name)}</span><span class="tsum">${esc(a.summary || "")}</span></li>`)
     .join("")}</ul></details>`;
 }
@@ -920,6 +926,7 @@ async function renderBotDetails(el, b) {
       <input class="big-name" id="d-name" value="${esc(b.name)}" maxlength="48">
       <input class="label-input" id="d-label" value="${esc(b.label ?? "")}" placeholder="Add a label">
       <div class="handle">@${esc(b.handle)} · ${esc(status)}${b.createdBy !== "user" ? ` · helper of ${esc(bot(b.createdBy)?.name ?? "a bot")}` : ""}</div>
+      ${b.usage?.turns ? `<div class="handle" title="Since ${esc(new Date(b.usage.since).toLocaleDateString())}">${b.usage.turns} turn${b.usage.turns === 1 ? "" : "s"} · ${fmtTokens(b.usage.totalTokens)} tokens</div>` : ""}
       ${b.status?.state === "error" && b.status.detail ? `<div class="banner" style="width:100%">${esc(b.status.detail)}</div>` : ""}
     </div>
     <div class="d-section"><h4>Job</h4>

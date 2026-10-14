@@ -45,6 +45,8 @@ export interface Bot {
   agentId?: string;
   /** Runtime that owns agentId. A runtime switch starts a fresh session. */
   agentRuntime?: string;
+  /** Running totals reported by the runtime (every turn spends usage). */
+  usage?: { turns: number; inputTokens: number; outputTokens: number; totalTokens: number; since: number };
   createdAt: number;
   updatedAt: number;
 }
