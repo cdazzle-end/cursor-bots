@@ -120,6 +120,20 @@ test("the installed Cursor hook script maps sessions to bots and gates shell com
     const pending = s.h.approvals.pendingFor(bot.id);
     assert.equal(pending.length, 1, "the approval card went to the right bot");
 
+    // Bots can't reach the gateway's own API or state, even for "safe" commands.
+    const port = new URL(s.base).port;
+    for (const cmd of [`curl -s -X POST http://127.0.0.1:${port}/api/approvals/x`, "cat ../state/secret.key", `cat ${s.h.store.paths.state}/ui.token`]) {
+      const r = await runHook("shell", { conversation_id: "cursor-conv-1", command: cmd });
+      assert.equal(r.permission, "deny", cmd);
+      assert.match(r.agent_message, /harness tools/);
+    }
+    // File tools: the local check blocks paths into the gateway's state and allows the workspace.
+    const ws = s.h.store.paths.workspace;
+    assert.equal((await runHook("tool", { cwd: ws, tool_name: "Read", tool_input: { path: "../settings.json" } })).permission, "deny");
+    assert.equal((await runHook("tool", { cwd: ws, tool_name: "Write", tool_input: { path: `${s.h.store.paths.state}/bots.json`, contents: "x" } })).permission, "deny");
+    assert.equal((await runHook("tool", { cwd: ws, tool_name: "Read", tool_input: { path: "bots/shipper/notes.md" } })).permission, "allow");
+    assert.equal((await runHook("tool", { cwd: ws, tool_name: "Write", tool_input: { path: "notes.md", contents: "see ../state/x\nand more" } })).permission, "allow");
+
     // With the gateway down the hook fails open instead of blocking your own Cursor use.
     const cfgFile = path.join(s.h.store.paths.hooksDir, "cursor-bots-gate.json");
     const cfg = JSON.parse(fs.readFileSync(cfgFile, "utf8"));

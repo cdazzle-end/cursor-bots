@@ -176,10 +176,12 @@ There are two paths into `src/core/approvals.ts`:
        "beforeSubmitPrompt":   [{ "command": "node .cursor/hooks/cursor-bots-gate.mjs prompt" }],
        "beforeShellExecution": [{ "command": "node .cursor/hooks/cursor-bots-gate.mjs shell" }] } }
    ```
-   Before every command, Cursor runs the gate script, which asks the gateway (`POST /api/gate/shell`). The prompt hook tells the gateway which bot owns that Cursor conversation by reading the `<you handle="…">` tag at the top of the envelope.
+   Before every command, Cursor runs the gate script, which asks the gateway (`POST /api/gate/shell`). The prompt hook tells the gateway which bot owns that Cursor conversation by reading the `<you handle="…">` tag at the top of the envelope. (The installed `hooks.json` also has a `preToolUse` entry; see the end of this section.)
 2. **Everything else consequential** (email, posting, purchases, deletes) goes through the bot's `request_approval` tool, which the manual tells it to use.
 
 Decisions follow the rules in Settings → Approvals (regex per command or action; `ask` beats `allow`). On "ask", a card appears (**Allow once / Always allow / Deny**), and the bot waits up to `inlineWaitSeconds`. If you haven't answered, it's told to end its turn, and your later decision **wakes it** with the outcome. "Allow once" is consumed by the retry; "Always allow" adds a rule. Approvals from background work expire (10 min), as in Grok Bot.
+
+The boundary only means something if bots can't route around it. The API needs a token even on localhost. The shell gate refuses commands that reach the gateway's port or its `state/` folder. A third hook (`preToolUse`, mode `tool`) blocks file tools from reading or writing the gateway's own files: tokens, the secret vault, settings, checkpoints.
 
 Defense in depth: turn on Cursor's **Auto-review** classifier or **sandbox** (bubblewrap/seatbelt) in Settings → Brain.
 

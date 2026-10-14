@@ -9,7 +9,7 @@ Under the hood every bot is a durable [Cursor SDK](https://cursor.com/docs/sdk/t
 ```
 npm install
 export CURSOR_API_KEY=key_...      # cursor.com/dashboard → API Keys
-npm start                          # → http://localhost:4777
+npm start                          # prints http://localhost:4777/?token=…  (open it once)
 ```
 
 No key yet? `npm run demo` starts the same app with a scripted demo brain and a starter team, so you can click through everything.
@@ -90,7 +90,7 @@ User=bots
 WantedBy=multi-user.target
 ```
 
-With `--host` set to anything but localhost, the app requires a token. It's printed on start (`http://host:4777/?token=…`) and stored in `state/ui.token`. Put it behind HTTPS (Caddy, Tailscale, Cloudflare Tunnel) before exposing it beyond your network.
+The app always requires its access token, which is printed on start (`http://host:4777/?token=…`) and stored in `state/ui.token`. Your browser keeps it in a cookie after the first visit. Put the app behind HTTPS (Caddy, Tailscale, Cloudflare Tunnel) before exposing it beyond your network.
 
 ## Configuration
 
@@ -101,6 +101,7 @@ With `--host` set to anything but localhost, the app requires a token. It's prin
 | `--port`, `--host` | Web/API address (default `127.0.0.1:4777`) |
 | `--runtime cursor\|mock` | Default brain (saved to settings) |
 | `--starter` | Create the starter team on first run |
+| `--open` | Open the app in your browser on start |
 | `CURSOR_BOTS_TOKEN` | Force a specific access token |
 
 Everything else is in the app's Settings: your name and label, time zone, default and routing models, group routing, approval mode and rules, Cursor Auto-review and sandbox, limits, secrets.
@@ -111,7 +112,8 @@ Everything else is in the app's Settings: your name and label, time zone, defaul
 - Like Grok Bot's shared computer, **every bot can read every file and use every login** on that machine or workspace. Keep credentials in Secrets, not in files.
 - Consequential shell commands stop for approval. The rules are regexes you control. The hook fails *open* if the gateway is down, so it never blocks you from using Cursor yourself in that folder.
 - Text from web pages, files and other bots is treated as data, and the bots' manual says so. Prompt injection is still possible, so keep external actions behind approval.
-- The API refuses cross-origin writes, and requires a token beyond localhost.
+- The API needs the access token even on localhost, so a bot can't `curl` its own approval endpoint. It also refuses cross-origin writes.
+- Harness integrity guards (best effort, enforced by the workspace hooks): bots are blocked from shell commands that call the gateway's port or touch `~/.cursor-bots/state`, and from file tools that read or write the gateway's state, settings or checkpoints. Bots run as your OS user, so this raises the bar but isn't a sandbox. Secret values are never put in prompts or chats, but a deliberately malicious process running as you could still read the vault.
 
 ## Project layout
 

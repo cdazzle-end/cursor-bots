@@ -420,6 +420,7 @@ const TOOLS: ToolSpec[] = [
       const names = strList(args.secrets).map((n) => n.toUpperCase());
       const missing = names.filter((n) => !h.vault.has(n));
       if (missing.length) return { text: `Not stored: ${missing.join(", ")}. Use request_secret first.`, isError: true };
+      if (h.touchesHarness(command)) return { text: "Bots can't call the Cursor Bots gateway or read its files directly.", isError: true };
       const origin = ["user", "approval", "system"].includes(state.wake.source) ? "foreground" : "background";
       const gate = await h.approvals.gate({
         botId: state.bot.id,

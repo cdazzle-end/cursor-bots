@@ -91,6 +91,7 @@ export class Harness {
   private hookSessions = new Map<string, Id>();
   private queueFile: string;
   private restoring = false;
+  private gatewayPort = "";
 
   constructor(opts: HarnessOptions) {
     this.store = new Store(opts.home);
@@ -121,7 +122,8 @@ export class Harness {
 
   async start(opts: { gatewayUrl: string }): Promise<void> {
     const waitMs = (this.store.settings.approvals.inlineWaitSeconds + 30) * 1000;
-    prepareWorkspace(this.store.paths, { url: opts.gatewayUrl, token: this.gateToken, timeoutMs: waitMs });
+    this.gatewayPort = new URL(opts.gatewayUrl).port;
+    prepareWorkspace(this.store.paths, { url: opts.gatewayUrl, token: this.gateToken, timeoutMs: waitMs, protect: this.protectedPaths() });
     for (const b of this.store.bots.values()) ensureBotFolder(this.store.paths, b.handle);
     this.approvals.start();
     this.scheduler.start();
@@ -1119,10 +1121,37 @@ export class Harness {
     return { continue: true };
   }
 
+  /** The gateway's own state: bots must not read or change it (tokens, secrets, settings, checkpoints). */
+  protectedPaths(): string[] {
+    const p = this.store.paths;
+    return [p.state, p.cursorStore, p.config, p.connectors, p.logs];
+  }
+
+  /**
+   * Best-effort integrity check for shell commands: a bot calling the gateway's
+   * API or reading its state could approve its own requests or read secrets.
+   * (Bots run as your OS user, so this raises the bar; it isn't a sandbox.)
+   */
+  touchesHarness(command: string): boolean {
+    if (this.protectedPaths().some((p) => command.includes(p))) return true;
+    if (/\b(secret\.key|secrets\.vault|ui\.token|mcp\.token|gate\.token|cursor-store)\b/.test(command)) return true;
+    if (/\.\.\/+(state|settings\.json|connectors\.json)\b/.test(command)) return true;
+    if (this.gatewayPort && new RegExp(`(localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|\\[::1\\]):${this.gatewayPort}\\b`).test(command)) return true;
+    return false;
+  }
+
   /** Handler for the beforeShellExecution hook installed in the workspace. */
   async gateShell(input: Record<string, unknown>): Promise<{ permission: "allow" | "deny"; user_message?: string; agent_message?: string }> {
     const command = String(input.command ?? "").trim();
     if (!command) return { permission: "allow" };
+    if (this.touchesHarness(command)) {
+      return {
+        permission: "deny",
+        user_message: "Blocked: a bot tried to reach Cursor Bots' own API or state.",
+        agent_message:
+          "Bots can't call the Cursor Bots gateway or read its files directly. Use your harness tools (send_message, request_approval, memory_update, request_secret, run_with_secrets, routine_*).",
+      };
+    }
     const botId = this.hookBot(typeof input.conversation_id === "string" ? input.conversation_id : undefined);
     // Not one of our bots (e.g. you opened the workspace in the Cursor IDE): leave it to Cursor.
     if (!botId) return { permission: "allow" };

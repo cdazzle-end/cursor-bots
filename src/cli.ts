@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -13,10 +14,10 @@ import { createServer } from "./server/http.ts";
 const HELP = `cursor-bots — persistent AI teammates on the Cursor SDK
 
 Usage:
-  cursor-bots start   [--port 4777] [--host 127.0.0.1] [--home DIR] [--runtime cursor|mock] [--starter]
+  cursor-bots start   [--port 4777] [--host 127.0.0.1] [--home DIR] [--runtime cursor|mock] [--starter] [--open]
   cursor-bots doctor  [--home DIR]          Check Node, the Cursor SDK, your API key and the workspace
   cursor-bots models                        List the models your Cursor API key can use
-  cursor-bots say BOT MESSAGE [--port 4777] Message a bot through a running gateway and stream the reply
+  cursor-bots say BOT MESSAGE [--port 4777] [--home DIR]  Message a bot through a running gateway
 
 Environment:
   CURSOR_API_KEY     Cursor user or service-account API key (cursor.com/dashboard → API Keys)
@@ -44,6 +45,7 @@ async function start(argv: string[]): Promise<void> {
       home: { type: "string", default: defaultHome() },
       runtime: { type: "string" },
       starter: { type: "boolean", default: false },
+      open: { type: "boolean", default: false },
     },
   });
   const home = path.resolve(values.home!);
@@ -58,15 +60,9 @@ async function start(argv: string[]): Promise<void> {
   }
 
   const loopback = ["127.0.0.1", "localhost", "::1"].includes(values.host!);
-  let token: string | undefined;
-  if (!loopback || process.env.CURSOR_BOTS_TOKEN) {
-    const tokenFile = path.join(h.store.paths.state, "ui.token");
-    token = process.env.CURSOR_BOTS_TOKEN || (fs.existsSync(tokenFile) ? fs.readFileSync(tokenFile, "utf8").trim() : "");
-    if (!token) {
-      token = randomBytes(18).toString("base64url");
-      fs.writeFileSync(tokenFile, token, { mode: 0o600 });
-    }
-  }
+  // The API always needs a token, even on localhost: otherwise a bot could
+  // curl its own approval endpoint. Your browser gets it once from the link below.
+  const token = uiToken(h.store.paths.state);
 
   const port = Number(values.port);
   const server = createServer(h, { port, host: values.host!, token });
@@ -80,7 +76,9 @@ async function start(argv: string[]): Promise<void> {
   const rt = h.runtimes.get(h.store.settings.runtime);
   const avail = rt?.available();
   const shownHost = loopback ? "localhost" : values.host;
-  console.log(`\n  Cursor Bots is running → http://${shownHost}:${port}${token ? `/?token=${token}` : ""}`);
+  const link = `http://${shownHost}:${port}/?token=${token}`;
+  console.log(`\n  Cursor Bots is running → ${link}`);
+  console.log(`  (Open that link once; your browser remembers the token.)`);
   console.log(`  Home:      ${h.store.paths.home}`);
   console.log(`  Workspace: ${h.store.paths.workspace}  (the shared computer)`);
   console.log(`  Runtime:   ${rt?.label ?? h.store.settings.runtime}${avail?.ok ? "" : `  ⚠ ${avail?.reason}`}`);
@@ -90,6 +88,8 @@ async function start(argv: string[]): Promise<void> {
   }
 
   let stopping = false;
+  if (values.open) openBrowser(link);
+
   const shutdown = async () => {
     if (stopping) return;
     stopping = true;
@@ -100,6 +100,28 @@ async function start(argv: string[]): Promise<void> {
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+}
+
+function uiToken(stateDir: string): string {
+  if (process.env.CURSOR_BOTS_TOKEN) return process.env.CURSOR_BOTS_TOKEN;
+  const tokenFile = path.join(stateDir, "ui.token");
+  let token = fs.existsSync(tokenFile) ? fs.readFileSync(tokenFile, "utf8").trim() : "";
+  if (!token) {
+    fs.mkdirSync(stateDir, { recursive: true });
+    token = randomBytes(18).toString("base64url");
+    fs.writeFileSync(tokenFile, token, { mode: 0o600 });
+  }
+  return token;
+}
+
+function openBrowser(url: string): void {
+  const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+  const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
+  try {
+    spawn(cmd, args, { stdio: "ignore", detached: true }).unref();
+  } catch {
+    // No browser available; the link is printed above.
+  }
 }
 
 async function doctor(argv: string[]): Promise<void> {
@@ -155,12 +177,16 @@ async function models(): Promise<void> {
 }
 
 async function say(argv: string[]): Promise<void> {
-  const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: { port: { type: "string", default: "4777" } } });
+  const { values, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    options: { port: { type: "string", default: "4777" }, home: { type: "string", default: defaultHome() } },
+  });
   const [botRef, ...words] = positionals;
   if (!botRef || !words.length) throw new Error("Usage: cursor-bots say BOT MESSAGE");
   const base = `http://127.0.0.1:${values.port}`;
   const headers: Record<string, string> = { "content-type": "application/json" };
-  if (process.env.CURSOR_BOTS_TOKEN) headers.authorization = `Bearer ${process.env.CURSOR_BOTS_TOKEN}`;
+  headers.authorization = `Bearer ${uiToken(path.join(path.resolve(values.home!), "state"))}`;
   const state = await (await fetch(`${base}/api/state`, { headers })).json();
   const ref = botRef.replace(/^@/, "").toLowerCase();
   const bot = state.bots.find((b: any) => b.handle === ref || b.name.toLowerCase() === ref);

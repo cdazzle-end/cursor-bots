@@ -5,18 +5,19 @@ import type { HomePaths } from "./paths.ts";
 import { readJson, writeFileAtomic, writeJson } from "./util.ts";
 
 const GATE_SCRIPT = `#!/usr/bin/env node
-// Installed by Cursor Bots. Cursor runs this hook in two places:
+// Installed by Cursor Bots. Cursor runs this hook at three points:
 //   prompt: before each prompt a bot submits, to tell the gateway which bot
-//           owns this Cursor conversation (it sends only the prompt's first line).
-//   shell:  before every shell command a bot runs, to ask the gateway whether the
-//           command needs your approval.
+//           owns this Cursor conversation (only the prompt's first lines are sent).
+//   shell:  before every shell command, to ask the gateway whether it needs your approval.
+//   tool:   before file tools, to keep bots out of the gateway's own state
+//           (tokens, secrets, settings). This check runs locally.
 // If the gateway isn't running (e.g. you opened this folder in the Cursor IDE
-// yourself) it lets everything through, so it never gets in your way.
+// yourself) everything is allowed, so it never gets in your way.
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const mode = process.argv[2] === "prompt" ? "prompt" : "shell";
+const mode = ["prompt", "shell", "tool"].includes(process.argv[2]) ? process.argv[2] : "shell";
 const pass = mode === "prompt" ? { continue: true } : { permission: "allow" };
 const here = path.dirname(fileURLToPath(import.meta.url));
 let input = {};
@@ -25,6 +26,32 @@ let cfg;
 try { cfg = JSON.parse(fs.readFileSync(path.join(here, "cursor-bots-gate.json"), "utf8")); } catch {}
 const done = (out) => { process.stdout.write(JSON.stringify(out)); process.exit(0); };
 if (!cfg) done(pass);
+
+if (mode === "tool") {
+  const roots = (cfg.protect ?? []).map((p) => path.resolve(p));
+  const cwd = input.cwd || (input.workspace_roots ?? [])[0] || process.cwd();
+  const hits = [];
+  const visit = (v) => {
+    if (typeof v === "string") {
+      if (v.length < 4096 && !v.includes("\\n") && /[\\/\\\\]/.test(v)) {
+        const abs = path.resolve(cwd, v);
+        if (roots.some((r) => abs === r || abs.startsWith(r + path.sep))) hits.push(v);
+      }
+    } else if (v && typeof v === "object") {
+      for (const x of Object.values(v)) visit(x);
+    }
+  };
+  visit(input.tool_input);
+  if (hits.length) {
+    done({
+      permission: "deny",
+      user_message: "Blocked: a bot tried to touch Cursor Bots' own state files.",
+      agent_message: "That path belongs to the Cursor Bots gateway (tokens, secrets, settings) and is off-limits. Use your harness tools instead (memory_update, request_secret, run_with_secrets, routine_*).",
+    });
+  }
+  done(pass);
+}
+
 const body = mode === "prompt"
   ? { conversation_id: input.conversation_id, prompt: String(input.prompt ?? "").slice(0, 400) }
   : input;
@@ -45,7 +72,7 @@ try {
  * Prepare the shared workspace ("the computer"): house rules, the harness
  * manual as an always-on Cursor rule, the approval hook, and folders.
  */
-export function prepareWorkspace(paths: HomePaths, gate: { url: string; token: string; timeoutMs: number }): void {
+export function prepareWorkspace(paths: HomePaths, gate: { url: string; token: string; timeoutMs: number; protect: string[] }): void {
   for (const dir of [paths.workspace, paths.skills, paths.uploads, paths.hooksDir, paths.rulesDir, path.join(paths.workspace, "bots")]) {
     fs.mkdirSync(dir, { recursive: true });
   }
@@ -69,6 +96,9 @@ export function prepareWorkspace(paths: HomePaths, gate: { url: string; token: s
   const prompt = (cfg.hooks.beforeSubmitPrompt ?? []).filter((h) => !ours(h));
   prompt.unshift({ command: "node .cursor/hooks/cursor-bots-gate.mjs prompt", timeout: 10 });
   cfg.hooks.beforeSubmitPrompt = prompt;
+  const tool = (cfg.hooks.preToolUse ?? []).filter((h) => !ours(h));
+  tool.unshift({ command: "node .cursor/hooks/cursor-bots-gate.mjs tool", matcher: "Read|Write|Edit|Delete|Grep|Glob|LS", timeout: 10 });
+  cfg.hooks.preToolUse = tool;
   writeJson(paths.hooksJson, cfg);
 }
 

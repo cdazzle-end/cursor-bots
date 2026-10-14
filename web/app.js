@@ -1816,7 +1816,12 @@ async function boot() {
   try {
     S.state = await api("GET", "/api/state");
   } catch (err) {
-    document.body.innerHTML = `<div class="empty"><h2>Can't reach Cursor Bots</h2><p>${esc(err.message)}</p><p class="muted">If you started it with a token, open the URL printed in the terminal.</p></div>`;
+    if (/Unauthorized/.test(err.message)) {
+      document.body.innerHTML = `<div class="empty"><h2>Open Cursor Bots from your terminal</h2><p>For safety the app needs its access token. Open the link that <code>cursor-bots start</code> printed (it ends in <code>?token=…</code>), or paste the token from <code>~/.cursor-bots/state/ui.token</code>.</p><div class="row"><input class="input" id="tok" placeholder="token" style="width:280px"><button class="btn primary" id="tok-go">Open</button></div></div>`;
+      $("#tok-go").onclick = () => (location.href = `/?token=${encodeURIComponent($("#tok").value.trim())}`);
+      return;
+    }
+    document.body.innerHTML = `<div class="empty"><h2>Can't reach Cursor Bots</h2><p>${esc(err.message)}</p></div>`;
     return;
   }
   if (location.search.includes("token=")) history.replaceState(null, "", location.pathname + location.hash);
