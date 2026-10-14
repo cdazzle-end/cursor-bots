@@ -78,6 +78,9 @@ export function prepareWorkspace(paths: HomePaths, gate: { url: string; token: s
   }
   const agentsMd = path.join(paths.workspace, "AGENTS.md");
   if (!fs.existsSync(agentsMd)) writeFileAtomic(agentsMd, DEFAULT_AGENTS_MD);
+  // Browser profiles hold thousands of files; keep them out of Cursor's workspace scans and search.
+  const ignore = path.join(paths.workspace, ".cursorignore");
+  if (!fs.existsSync(ignore)) writeFileAtomic(ignore, "# Managed by Cursor Bots; add your own patterns below.\n.browser/\n**/node_modules/\n");
   writeFileAtomic(path.join(paths.rulesDir, "cursor-bots.mdc"), HARNESS_MANUAL);
 
   const gateFile = path.join(paths.hooksDir, "cursor-bots-gate.mjs");

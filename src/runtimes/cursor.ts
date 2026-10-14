@@ -23,7 +23,7 @@ import type {
   SessionSpec,
 } from "./types.ts";
 
-type Sdk = typeof import("@cursor/sdk");
+export type Sdk = typeof import("@cursor/sdk");
 
 export interface CursorRuntimeOptions {
   apiKey?: string;
@@ -33,6 +33,8 @@ export interface CursorRuntimeOptions {
   scratchDir: string;
   /** Read live so settings changes apply to the next session that opens. */
   settings: () => { defaultModel: ModelChoice; autoReview: boolean; sandbox: boolean };
+  /** Load the SDK module. Tests inject a fake; normally it's a dynamic import. */
+  loadSdk?: () => Promise<Sdk>;
 }
 
 /**
@@ -66,7 +68,7 @@ export class CursorRuntime implements AgentRuntime {
 
   private async load(): Promise<{ sdk: Sdk; store: LocalAgentStore }> {
     if (!this.sdk) {
-      this.sdk = await import("@cursor/sdk");
+      this.sdk = this.opts.loadSdk ? await this.opts.loadSdk() : await import("@cursor/sdk");
       fs.mkdirSync(this.opts.storeDir, { recursive: true });
       this.store = new this.sdk.JsonlLocalAgentStore(this.opts.storeDir);
     }
