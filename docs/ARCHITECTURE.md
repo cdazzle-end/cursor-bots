@@ -37,12 +37,13 @@ Start the app and look in `~/.cursor-bots` (or the `--home` you passed):
     secrets.vault          AES-256-GCM encrypted secret values (+ secret.key, mode 0600)
     seen.json              what each bot has already seen in each conversation
     queue.json             queued work, so a restart doesn't lose it
-  cursor-store/            the Cursor SDK's JSONL agent store: each bot's conversation checkpoints
+  cursor-store/            the Cursor SDK's SQLite agent store (index.db + checkpoint blobs): each bot's conversation context
   workspace/               THE SHARED COMPUTER (every bot's working directory)
     AGENTS.md              house rules for all bots (Cursor loads it automatically)
     .cursor/rules/cursor-bots.mdc   the harness manual, always applied (managed)
     .cursor/skills/<name>/SKILL.md  the shared skill library
-    .cursor/hooks.json     + hooks/cursor-bots-gate.mjs: the approval gate
+    .cursor/hooks.json     + hooks/cursor-bots-gate.mjs: the approval gate (managed, rewritten if changed)
+    .cursor/mcp.json       optional project MCP servers (also passed to bots that have connectors)
     bots/<handle>/         each bot's scratch folder
     uploads/<date>/        files you attach in chat
 ```
@@ -57,12 +58,16 @@ Two kinds of memory live here, and the difference matters:
 `src/core/runner.ts` (`ensureSession`) opens one Cursor SDK agent per bot:
 
 ```ts
-Agent.create({ name, model, local: { cwd: workspace, store: jsonlStore, settingSources: ["project"] } })
+Agent.create({ name, model, local: { cwd: workspace, store: sqliteStore, settingSources: ["project"] } })
 // later, even from a new process:
 Agent.resume(bot.agentId, { model, local: { ... } })
 ```
 
 `bot.agentId` (like `agent-3f…`) is saved in `bots.json`, so a restart resumes the same conversation. `settingSources: ["project"]` makes Cursor load the workspace's rules, skills, `AGENTS.md`, hooks and MCP config, which is how every bot gets the shared manual, skills and approval gate without any per-bot setup.
+
+The store is the SDK's `SqliteLocalAgentStore` (`@cursor/sdk/sqlite`), opened once and shared by every bot. The SDK also ships a JSONL store, but it rewrites its whole file for every streamed event and checkpoint, so turns get slower as history grows. (Node 22 labels `node:sqlite` experimental; the CLI hides that one warning.) If the store loses a bot's agent, the bot starts a fresh context and keeps its memory.
+
+Connectors go to the SDK as per-turn `mcpServers`, which *replace* the workspace's MCP config for that run. So when a bot has connectors, the harness adds the servers from `workspace/.cursor/mcp.json` too (a connector wins on a name clash).
 
 Identity can't go in the system prompt: the SDK's `systemPrompt` replaces Cursor's whole prompt and is account-gated, and rules files are shared by everyone in the workspace. So the harness puts identity in **each turn's message**.
 
@@ -158,13 +163,15 @@ A bot's group post that @mentions a teammate wakes that teammate. That's how vis
 
 ### Loop protection
 
-Every wake carries a **chain** `{ id, depth, runs }`. You or a schedule start a fresh chain. Each bot-to-bot hop adds 1 to `depth`, and each bot turn adds 1 to `runs`. Past `maxChainDepth` (8) the harness stops waking bots and posts a notice. Past `maxChainRuns` (24) it refuses more turns. The manual also tells bots not to answer thank-yous and to keep one owner per stage.
+Every wake carries a **chain** `{ id, depth, runs, originConvId }`. You or a schedule start a fresh chain. Each bot-to-bot hop adds 1 to `depth`. Every bot turn in the chain is charged to **one shared budget** kept by the harness, however the chain branches (a bot handing work to five teammates spends five turns, not one each). Past `maxChainDepth` (8) the harness stops waking bots and posts a notice. Once `maxChainRuns` (24) turns are spent, it refuses more turns, refuses new handoffs and stops delivering replies, with one notice in the conversation where the chain started. The manual also tells bots not to answer thank-yous and to keep one owner per stage.
+
+**Stop** works the same way. "stop" (or the stop button) in a conversation cancels the turn replying there, drops anything queued or still being routed for it, and stops every chain that started there, including work already handed to other bots. Wakes record the conversation's stop generation when they're created, so a wake that was in flight during the stop is dropped when it arrives.
 
 ## 6. Routines
 
 `src/core/scheduler.ts` uses [croner](https://github.com/hexagon/croner) for five-field cron in your time zone. Limits follow Grok Bot: 50 per bot, runs at least 5 minutes apart, last 20 runs kept. A routine can also have a **webhook**: `POST /api/webhooks/routines/<id>` with `Authorization: Bearer <key>`. The JSON body is passed to the bot as data. A 200 means the run started, not that it finished.
 
-A run posts a "Routine … started" pill in its conversation, then wakes the owner with `kind="routine"` at low priority. Your messages still come first. Routines pause themselves after `absencePauseDays` (14) without any message from you.
+A run posts a "Routine … started" pill in its conversation, then wakes the owner with `kind="routine"` at low priority. Your messages still come first. A scheduled tick is skipped while the previous run is still going. Routines pause themselves after `absencePauseDays` (14) without activity from you; anything you change through the app counts, so a routine you switch back on stays on. Changing your time zone re-arms the routines that follow it. Cron expressions are checked over a full week of runs (in the routine's zone) against the 5-minute minimum.
 
 ## 7. Approvals: the boundary
 
@@ -179,11 +186,11 @@ There are two paths into `src/core/approvals.ts`:
    Before every command, Cursor runs the gate script, which asks the gateway (`POST /api/gate/shell`). The prompt hook tells the gateway which bot owns that Cursor conversation by reading the `<you handle="…">` tag at the top of the envelope. (The installed `hooks.json` also has a `preToolUse` entry; see the end of this section.)
 2. **Everything else consequential** (email, posting, purchases, deletes) goes through the bot's `request_approval` tool, which the manual tells it to use.
 
-Decisions follow the rules in Settings → Approvals (regex per command or action; `ask` beats `allow`). On "ask", a card appears (**Allow once / Always allow / Deny**), and the bot waits up to `inlineWaitSeconds`. If you haven't answered, it's told to end its turn, and your later decision **wakes it** with the outcome. "Allow once" is consumed by the retry; "Always allow" adds a rule. Approvals from background work expire (10 min), as in Grok Bot.
+Decisions follow the rules in Settings → Approvals (regex per command or action; `ask` beats `allow`). On "ask", a card appears (**Allow once / Always allow / Deny**), and the bot waits up to `inlineWaitSeconds`. If you haven't answered, it's told to end its turn, and your later decision **wakes it** with the outcome. The approval stores the turn's context (conversation, handoff route, chain), so a bot that was answering a handoff resumes in that thread and its result still flows back to the bot that asked. Secret requests work the same way. "Allow once" is consumed by the retry; "Always allow" adds a rule. Approvals from background work expire (10 min), as in Grok Bot.
 
-The boundary only means something if bots can't route around it. The API needs a token even on localhost. The shell gate refuses commands that reach the gateway's port or its `state/` folder. A third hook (`preToolUse`, mode `tool`) blocks file tools from reading or writing the gateway's own files: tokens, the secret vault, settings, checkpoints.
+The boundary only means something if bots can't route around it. The API needs a token even on localhost. The shell gate refuses commands that reach the gateway's port, its `state/` folder or the hook files. A third hook (`preToolUse`, mode `tool`) blocks file tools from reading or writing the gateway's own files: tokens, the secret vault, settings, checkpoints, and the hook script, `hooks.json` and the manual rule themselves. The gate's URL and token are embedded in the script (no side config file to delete), and before every turn the gateway rewrites any hook file that changed, so tampering doesn't outlive a turn. If the gateway isn't running at all (you opened the workspace in the Cursor IDE yourself), the hook allows everything; no bot can run then.
 
-Defense in depth: turn on Cursor's **Auto-review** classifier or **sandbox** (bubblewrap/seatbelt) in Settings → Brain.
+Defense in depth: Cursor's **Auto-review** classifier and **sandbox** (bubblewrap/seatbelt) can be turned on in Settings → Brain. Know the trade-off: with either one on, a local SDK run can't ask you about MCP tool calls, so the SDK refuses connector tools (the browser, GitHub, …). Leave both off if your bots use connectors; your approval rules still gate shell commands.
 
 ## 8. Secrets
 
@@ -229,4 +236,4 @@ This is how a Claude Code session, the Cursor IDE, Hermes or OpenClaw can delega
 
 ## 12. Testing
 
-`npm test` runs the suite on the mock runtime: DMs, restart persistence, handoffs, groups and the loop guard, approvals, the real hook script, routines and webhooks, skills, secrets, steering and stop, helper bots, deletion, the token gate. `npm run typecheck` checks everything against the real `@cursor/sdk` types.
+`npm test` runs the suite on the mock runtime: DMs, restart persistence, handoffs, groups and the loop guard, approvals, the real hook script (including tamper healing), routines and webhooks, skills, secrets, steering and stop, helper bots, deletion, the token gate. `test/regressions.test.ts` pins down fixed defects: shared chain budgets, stop reaching delegated work, queue survival across restarts, approvals inside handoffs, torn JSONL lines, skill frontmatter round-trips, paused routines on copy and import, time zone re-arming, absence pauses, and the chat Markdown renderer. `npm run typecheck` checks everything against the real `@cursor/sdk` types.

@@ -100,7 +100,7 @@ The app always requires its access token, which is printed on start (`http://hos
 
 | | |
 | --- | --- |
-| `CURSOR_API_KEY` | Cursor API key used by every bot |
+| `CURSOR_API_KEY` | Cursor API key used by every bot (a login stored by the Cursor SDK in `~/.cursor/sdk/auth.json` works too) |
 | `CURSOR_BOTS_HOME` / `--home` | Where everything lives (default `~/.cursor-bots`) |
 | `--port`, `--host` | Web/API address (default `127.0.0.1:4777`) |
 | `--runtime cursor\|mock` | Default brain (saved to settings) |
@@ -112,12 +112,12 @@ Everything else is in the app's Settings: your name and label, time zone, defaul
 
 ## Security model
 
-- Bots run with **your** permissions on the machine running the gateway, inside the shared workspace by convention (not by enforcement). For stronger isolation, enable the Cursor sandbox in Settings, or run the gateway in a container or VM.
+- Bots run with **your** permissions on the machine running the gateway, inside the shared workspace by convention (not by enforcement). For stronger isolation, run the gateway in a container or VM, or enable the Cursor sandbox in Settings (note: with the sandbox or Auto-review on, the Cursor SDK refuses connector/MCP tool calls in local runs).
 - Like Grok Bot's shared computer, **every bot can read every file and use every login** on that machine or workspace. Keep credentials in Secrets, not in files.
 - Consequential shell commands stop for approval. The rules are regexes you control. The hook fails *open* if the gateway is down, so it never blocks you from using Cursor yourself in that folder.
 - Text from web pages, files and other bots is treated as data, and the bots' manual says so. Prompt injection is still possible, so keep external actions behind approval.
 - The API needs the access token even on localhost, so a bot can't `curl` its own approval endpoint. It also refuses cross-origin writes.
-- Harness integrity guards (best effort, enforced by the workspace hooks): bots are blocked from shell commands that call the gateway's port or touch `~/.cursor-bots/state`, and from file tools that read or write the gateway's state, settings or checkpoints. Bots run as your OS user, so this raises the bar but isn't a sandbox. Secret values are never put in prompts or chats, but a deliberately malicious process running as you could still read the vault.
+- Harness integrity guards (best effort, enforced by the workspace hooks): bots are blocked from shell commands that call the gateway's port or touch `~/.cursor-bots/state` or the hook files, and from file tools that read or write the gateway's state, settings, checkpoints, the hook script, `hooks.json` or the manual rule. The gateway rewrites changed hook files before every turn. Bots run as your OS user, so this raises the bar but isn't a sandbox. Secret values are never put in prompts or chats, but a deliberately malicious process running as you could still read the vault.
 
 ## Project layout
 

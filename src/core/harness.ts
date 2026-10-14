@@ -347,16 +347,20 @@ export class Harness {
     entry.turns += 1;
     entry.at = now;
     this.chainTurns.set(wake.chain.id, entry);
-    const max = this.store.settings.limits.maxChainRuns;
-    if (entry.turns <= max) return entry.turns;
-    if (!entry.notified) {
-      entry.notified = true;
-      this.postNotice(
-        wake.chain.originConvId && this.store.conversations.has(wake.chain.originConvId) ? wake.chain.originConvId : convId,
-        `Stopped a chain of bot-to-bot work after ${max} turns to prevent a loop. Send a message to continue.`,
-      );
-    }
+    if (entry.turns <= this.store.settings.limits.maxChainRuns) return entry.turns;
+    this.budgetNotice(wake.chain, convId);
     return undefined;
+  }
+
+  /** Tell you once per chain that its turn budget ran out (a "stop" you sent needs no notice). */
+  private budgetNotice(chain: WakeEvent["chain"], convId: Id): void {
+    const entry = this.chainTurns.get(chain.id);
+    if (!entry || entry.notified || this.stoppedChains.has(chain.id)) return;
+    entry.notified = true;
+    this.postNotice(
+      chain.originConvId && this.store.conversations.has(chain.originConvId) ? chain.originConvId : convId,
+      `Stopped a chain of bot-to-bot work after ${this.store.settings.limits.maxChainRuns} turns to prevent a loop. Send a message to continue.`,
+    );
   }
 
   /** True while a chain may still create bot-to-bot wakes. */
@@ -989,7 +993,7 @@ export class Harness {
       );
       return;
     }
-    if (!this.chainOpen(state.wake.chain.id)) return;
+    if (!this.chainOpen(state.wake.chain.id)) return this.budgetNotice(state.wake.chain, conv.id);
     for (const botId of targets) {
       void this.wake({
         id: newId("wake"),
@@ -1017,8 +1021,8 @@ export class Harness {
     const requester = this.store.bots.get(route.botId);
     const conv = this.store.conversations.get(route.convId);
     if (!requester || !conv) return;
-    // A "stop" in the requester's conversation (or of this chain) ends the chain here.
-    if (!this.chainOpen(state.wake.chain.id)) return;
+    // A "stop" in the requester's conversation (or of this chain) ends the chain here; so does a spent budget.
+    if (!this.chainOpen(state.wake.chain.id)) return this.budgetNotice(state.wake.chain, route.convId);
     const depth = state.wake.chain.depth + 1;
     if (depth > this.store.settings.limits.maxChainDepth) {
       this.hopLimitNotice(

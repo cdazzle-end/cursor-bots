@@ -308,9 +308,9 @@ export class Scheduler {
     if (last > cutoff) return;
     const paused = new Map<Id, number>();
     for (const r of this.store.routines.values()) {
+      // Re-enabling one from the UI or in chat counts as activity (see touchUserActivity), so it
+      // isn't paused again; routines bots create or edit while you're away still pause.
       if (!r.enabled || !r.cron) continue;
-      // You turned it back on (or edited it) recently: that counts as being back for this routine.
-      if (r.updatedAt > cutoff) continue;
       r.enabled = false;
       r.pausedReason = `Paused after ${days} days without activity from you`;
       paused.set(r.botId, (paused.get(r.botId) ?? 0) + 1);
