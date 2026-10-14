@@ -1356,7 +1356,11 @@ function openSettings(tab = "general") {
 }
 
 const CONNECTOR_PRESETS = {
-  browser: { description: "A real browser (Playwright). Bots can browse, click and read pages; sign-ins persist in the workspace profile.", command: "npx", args: ["-y", "@playwright/mcp@latest", "--user-data-dir", ".browser/profile"] },
+  browser: {
+    description: "A real browser (Playwright). Each bot gets its own persistent browser profile (its own screen), so bots can browse at the same time and stay signed in. On a desktop the window is visible so you can take over for logins. First time: run `npx @playwright/mcp install-browser chrome-for-testing`.",
+    command: "npx",
+    args: ["-y", "@playwright/mcp@latest", "${headless}", "--user-data-dir", "${workspace}/.browser/${bot.handle}"],
+  },
   github: { description: "GitHub issues, PRs and repos.", command: "npx", args: ["-y", "@modelcontextprotocol/server-github"], env: { GITHUB_PERSONAL_ACCESS_TOKEN: "${secret:GITHUB_TOKEN}" } },
   notion: { description: "Notion pages and databases.", command: "npx", args: ["-y", "@notionhq/notion-mcp-server"], env: { NOTION_TOKEN: "${secret:NOTION_TOKEN}" } },
   fetch: { description: "Fetch web pages as Markdown.", command: "uvx", args: ["mcp-server-fetch"] },
@@ -1368,7 +1372,7 @@ function openConnectors() {
   const body = $(".modal-body", m.el);
   const draw = () => {
     const list = S.state.connectors ?? {};
-    body.innerHTML = `<div class="muted">Connectors are MCP servers your bots can use. They're account-wide; limit a bot to specific ones in its details. Put credentials in Settings → Secrets and reference them as <code>\${secret:NAME}</code>.</div>
+    body.innerHTML = `<div class="muted">Connectors are MCP servers your bots can use. They're account-wide; limit a bot to specific ones in its details. Put credentials in Settings → Secrets and reference them as <code>\${secret:NAME}</code>. Per-bot placeholders: <code>\${bot.handle}</code>, <code>\${workspace}</code>, <code>\${headless}</code>.</div>
       ${Object.entries(list).map(([n, c]) => `<div class="list-row"><div class="grow"><div class="t">${esc(n)}</div><div class="s">${esc(c.description || c.url || [c.command, ...(c.args ?? [])].join(" "))}</div></div>${switchHtml(`cn-${n}`, c.enabled)}<button class="btn small" data-edit="${esc(n)}">Edit</button><button class="btn small danger" data-del="${esc(n)}">Remove</button></div>`).join("") || '<div class="muted">Nothing connected yet.</div>'}
       <div class="d-section"><h4>Add an app</h4><div class="row" style="display:flex;gap:6px;flex-wrap:wrap">${Object.keys(CONNECTOR_PRESETS).map((k) => `<button class="btn small" data-preset="${k}">${k}</button>`).join("")}<button class="btn small" data-preset="">Custom…</button></div></div>`;
     Object.keys(list).forEach((n) => {

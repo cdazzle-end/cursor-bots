@@ -301,3 +301,25 @@ test("deleting a bot removes its chat and routines but keeps workspace files", a
     await cleanup();
   }
 });
+
+test("connectors resolve per-bot placeholders and secrets, and respect per-bot allowlists", async () => {
+  const { h, cleanup } = await makeHarness();
+  try {
+    const a = h.createBot({ name: "Surfer" });
+    const b = h.createBot({ name: "Quiet", connectors: [] });
+    h.vault.set("GH_TOKEN", "ghp_123456");
+    h.store.connectors = {
+      browser: { command: "npx", args: ["-y", "@playwright/mcp@latest", "${headless}", "--user-data-dir", "${workspace}/.browser/${bot.handle}"], enabled: true },
+      github: { command: "npx", args: ["server-github"], env: { TOKEN: "${secret:GH_TOKEN}" }, enabled: true },
+      off: { url: "https://example.com/mcp", enabled: false },
+    };
+    const mcp = h.mcpServersFor(a);
+    assert.deepEqual(Object.keys(mcp).sort(), ["browser", "github"]);
+    assert.ok(mcp.browser!.args!.includes(`${h.store.paths.workspace}/.browser/surfer`));
+    assert.ok(!mcp.browser!.args!.includes(""), "empty ${headless} is dropped");
+    assert.equal(mcp.github!.env!.TOKEN, "ghp_123456");
+    assert.deepEqual(h.mcpServersFor(b), {});
+  } finally {
+    await cleanup();
+  }
+});

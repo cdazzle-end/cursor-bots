@@ -974,16 +974,32 @@ export class Harness {
     return wake.addressed;
   }
 
+  /**
+   * Connectors are account-wide configs with placeholders resolved per bot:
+   * ${workspace}, ${bot.handle}, ${bot.name}, ${bot.id}, ${secret:NAME}, and
+   * ${headless} (becomes --headless when there's no display, else is dropped).
+   * Per-bot values let one "browser" connector give every bot its own
+   * persistent browser profile (its own screen).
+   */
   mcpServersFor(bot: Bot): Record<string, McpServerSpec> {
     const out: Record<string, McpServerSpec> = {};
+    const noDisplay = process.platform === "linux" && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY;
+    const x = (v: string) =>
+      this.vault.expand(
+        v
+          .replace(/\$\{workspace\}/g, this.store.paths.workspace)
+          .replace(/\$\{bot\.handle\}/g, bot.handle)
+          .replace(/\$\{bot\.name\}/g, bot.name)
+          .replace(/\$\{bot\.id\}/g, bot.id)
+          .replace(/\$\{headless\}/g, noDisplay ? "--headless" : ""),
+      );
     for (const [name, c] of Object.entries(this.store.connectors)) {
       if (!c.enabled) continue;
       if (bot.connectors !== "all" && !bot.connectors.includes(name)) continue;
-      const x = (s: string) => this.vault.expand(s);
       out[name] = {
         type: c.type ?? (c.url ? "http" : "stdio"),
         command: c.command ? x(c.command) : undefined,
-        args: c.args?.map(x),
+        args: c.args?.map(x).filter((a) => a !== ""),
         env: c.env ? Object.fromEntries(Object.entries(c.env).map(([k, v]) => [k, x(v)])) : undefined,
         cwd: c.command ? this.store.paths.workspace : undefined,
         url: c.url ? x(c.url) : undefined,
