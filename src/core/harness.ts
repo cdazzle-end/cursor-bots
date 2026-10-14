@@ -25,7 +25,7 @@ import type {
   Settings,
   WakeEvent,
 } from "./types.ts";
-import { colorFor, hostTimezone, mimeFor, newId, oneLine, readJson, resolveInside, slugify, writeJson } from "./util.ts";
+import { colorFor, hostTimezone, mimeFor, newId, oneLine, readJson, resolveInside, slugify, stripMarkdown, writeJson } from "./util.ts";
 import { ensureBotFolder, prepareWorkspace } from "./workspace.ts";
 import type { AgentRuntime, McpServerSpec, RunOutcome } from "../runtimes/types.ts";
 
@@ -519,7 +519,7 @@ export class Harness {
     return conv;
   }
 
-  updateConversation(id: Id, patch: Partial<Pick<Conversation, "title" | "members" | "lead" | "purpose" | "pinned" | "hidden">>): Conversation {
+  updateConversation(id: Id, patch: Partial<Pick<Conversation, "title" | "members" | "lead" | "purpose" | "pinned" | "hidden" | "unread">>): Conversation {
     const c = this.store.conversations.get(id);
     if (!c) throw new Error("No such conversation");
     if (c.kind === "group") {
@@ -536,6 +536,7 @@ export class Harness {
     }
     if (patch.pinned !== undefined) c.pinned = patch.pinned;
     if (patch.hidden !== undefined) c.hidden = patch.hidden;
+    if (typeof patch.unread === "number") c.unread = Math.max(0, Math.floor(patch.unread));
     c.updatedAt = Date.now();
     this.store.saveConversations();
     this.bus.emit({ type: "conversation.updated", conversation: c });
@@ -596,7 +597,7 @@ export class Harness {
     this.store.appendMessage(msg);
     if (msg.kind !== "activity") {
       conv.lastMessageAt = ts;
-      conv.lastPreview = oneLine(msg.text || (msg.attachments?.length ? `📎 ${msg.attachments.map((a) => a.name).join(", ")}` : ""), 160);
+      conv.lastPreview = oneLine(stripMarkdown(msg.text) || (msg.attachments?.length ? `📎 ${msg.attachments.map((a) => a.name).join(", ")}` : ""), 160);
       if (msg.author.kind !== "user") conv.unread += 1;
       if (msg.kind === "approval" || msg.kind === "secret_request") conv.attention = true;
       conv.updatedAt = ts;

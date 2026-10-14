@@ -141,8 +141,12 @@ function upsert(list, item) {
 // Sidebar
 // ---------------------------------------------------------------------------
 
+function isPinned(c) {
+  return c.kind === "dm" ? Boolean(bot(c.members[0])?.pinned) : Boolean(c.pinned);
+}
+
 function sortConvs(list) {
-  return list.sort((a, b) => Number(b.pinned) - Number(a.pinned) || (b.lastMessageAt ?? b.createdAt) - (a.lastMessageAt ?? a.createdAt));
+  return list.sort((a, b) => Number(isPinned(b)) - Number(isPinned(a)) || (b.lastMessageAt ?? b.createdAt) - (a.lastMessageAt ?? a.createdAt));
 }
 
 function convRow(c) {
@@ -202,7 +206,13 @@ function renderSidebar() {
       <button class="icon-btn" id="btn-files" title="Shared computer (workspace files)">${ICON.folder}</button>
     </div>`;
   el.innerHTML = html;
-  $$(".conv", el).forEach((row) => row.addEventListener("click", () => openConv(row.dataset.conv)));
+  $$(".conv", el).forEach((row) => {
+    row.addEventListener("click", () => openConv(row.dataset.conv));
+    row.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      convMenu(row.dataset.conv, e.clientX, e.clientY);
+    });
+  });
   $$("[data-toggle]", el).forEach((t) =>
     t.addEventListener("click", () => {
       S.collapsed[t.dataset.toggle] = !S.collapsed[t.dataset.toggle];
@@ -216,6 +226,64 @@ function renderSidebar() {
   $("#btn-connect").onclick = () => openConnectors();
   $("#btn-skills").onclick = () => openSkills();
   $("#btn-files").onclick = () => openFiles();
+}
+
+/** Right-click menu on a sidebar row: Pin, sections, Mark as unread, Rename, Hide, Delete. */
+function convMenu(id, x, y) {
+  $("#ctx")?.remove();
+  const c = conv(id);
+  if (!c) return;
+  const b = c.kind === "dm" ? bot(c.members[0]) : null;
+  const pinned = b ? b.pinned : c.pinned;
+  const hidden = b ? b.hidden : c.hidden;
+  const items = [
+    ["pin", pinned ? "Unpin" : "Pin"],
+    ...(b ? [["section", b.section ? "Move to section…" : "Move to new section…"]] : []),
+    ["unread", "Mark as unread"],
+    ...(c.kind !== "botdm" ? [["rename", b ? "Rename bot" : "Rename chat"]] : []),
+    ["copyid", "Copy conversation ID"],
+    ...(c.kind !== "botdm" ? [["hide", hidden ? "Show in sidebar" : "Hide from sidebar"]] : []),
+    ...(c.kind !== "botdm" ? [["delete", b ? "Delete bot" : "Delete group"]] : []),
+  ];
+  const menu = document.createElement("div");
+  menu.id = "ctx";
+  menu.className = "suggest";
+  menu.style.cssText = `position:fixed;left:${Math.min(x, innerWidth - 240)}px;top:${Math.min(y, innerHeight - 40 * items.length)}px;bottom:auto;min-width:220px`;
+  menu.innerHTML = items.map(([k, label]) => `<div class="item" data-act="${k}" ${k === "delete" ? 'style="color:var(--danger)"' : ""}>${esc(label)}</div>`).join("");
+  document.body.appendChild(menu);
+  const close = () => menu.remove();
+  setTimeout(() => document.addEventListener("click", close, { once: true }), 0);
+  const patchBot = (body) => attempt(() => api("PATCH", `/api/bots/${b.id}`, body));
+  const patchConv = (body) => attempt(() => api("PATCH", `/api/conversations/${c.id}`, body));
+  $$("[data-act]", menu).forEach(
+    (el) =>
+      (el.onclick = async () => {
+        close();
+        const act = el.dataset.act;
+        if (act === "pin") b ? patchBot({ pinned: !pinned }) : patchConv({ pinned: !pinned });
+        else if (act === "hide") b ? patchBot({ hidden: !hidden }) : patchConv({ hidden: !hidden });
+        else if (act === "section") {
+          const sec = prompt("Section name (empty to remove):", b.section ?? "");
+          if (sec !== null) patchBot({ section: sec });
+        } else if (act === "unread") {
+          if (S.current === id) {
+            S.current = null;
+            history.replaceState(null, "", "#/");
+            renderMain();
+          }
+          patchConv({ unread: Math.max(1, c.unread) });
+        } else if (act === "rename") {
+          const name = prompt("New name:", convTitle(c));
+          if (name?.trim()) b ? patchBot({ name: name.trim() }) : patchConv({ title: name.trim() });
+        } else if (act === "copyid") {
+          navigator.clipboard?.writeText(c.id);
+          toast("Conversation ID copied");
+        } else if (act === "delete") {
+          if (!confirm(b ? `Delete ${b.name}? This removes its profile, chat and routines.` : `Delete the group “${convTitle(c)}”? The bots stay.`)) return;
+          await attempt(() => api("DELETE", b ? `/api/bots/${b.id}` : `/api/conversations/${c.id}`));
+        }
+      }),
+  );
 }
 
 // ---------------------------------------------------------------------------

@@ -4,6 +4,10 @@
 
 Each bot has a name, a job, a picture, its own chat and a memory that persists. All of them share one computer (a workspace folder). They message you and each other, work together in group chats, hand work off, save reusable skills, run routines on a schedule, and stop for your approval before consequential actions.
 
+![A group chat: e-boy posts an image and asks @critic, Critic answers](docs/images/group-chat.png)
+![A bot's own chat with images, an approval card and a handoff to another bot](docs/images/bot-chat.png)
+<sub>Screenshots use seeded demo data.</sub>
+
 Under the hood every bot is a durable [Cursor SDK](https://cursor.com/docs/sdk/typescript.md) agent: Cursor's own agent loop, tools and models. This repo is the **harness** around those agents: identity, memory, messaging, routing, schedules, approvals, secrets and the app.
 
 ```
