@@ -53,6 +53,7 @@ export function defaultSettings(): Settings {
     absencePauseDays: 14,
     cursorAutoReview: false,
     cursorSandbox: false,
+    providers: [],
   };
 }
 

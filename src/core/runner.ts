@@ -5,7 +5,9 @@ import type { ActivityItem, Attachment, Bot, Id, Message, WakeEvent } from "./ty
 import { hash, isImageMime, newId, oneLine, resolveInside } from "./util.ts";
 import type { BotStatus } from "./events.ts";
 import type { RunOutcome, RuntimeRun, RuntimeSession } from "../runtimes/types.ts";
+import { McpHub } from "./mcp-client.ts";
 import { buildTools } from "./tools.ts";
+import { buildWorkspaceTools } from "./workspace-tools.ts";
 
 /** State of the turn a bot is currently taking. Tools read and write it. */
 export interface RunState {
@@ -47,6 +49,8 @@ export class BotRunner {
   /** Messages already handed to the bot by steering; they're left out of later <context>. */
   private delivered = new Set<Id>();
   private shuttingDown = false;
+  /** Connector client for runtimes without their own MCP support (opened on first use). */
+  private mcp?: McpHub;
 
   constructor(h: Harness, botId: Id) {
     this.h = h;
@@ -154,12 +158,14 @@ export class BotRunner {
     if (cur) await cur.run?.cancel().catch(() => {});
     await this.session?.close().catch(() => {});
     this.session = undefined;
+    await this.closeMcp();
   }
 
   async dispose(): Promise<void> {
     await this.stop();
     await this.session?.close().catch(() => {});
     this.session = undefined;
+    await this.closeMcp();
   }
 
   /** Forget the runtime session (e.g. after the bot's runtime or model changed). */
@@ -167,6 +173,30 @@ export class BotRunner {
     await this.session?.close().catch(() => {});
     this.session = undefined;
     this.needIdentity = true;
+    await this.closeMcp();
+  }
+
+  private async closeMcp(): Promise<void> {
+    const hub = this.mcp;
+    this.mcp = undefined;
+    await hub?.close().catch(() => {});
+  }
+
+  private mcpHub(): McpHub {
+    if (!this.mcp) {
+      const h = this.h;
+      this.mcp = new McpHub({
+        clientName: `cursor-bots/${h.store.bots.get(this.botId)?.handle ?? this.botId}`,
+        cwd: h.store.paths.workspace,
+        env: () => h.childEnv(),
+        scrub: (text) => h.scrubSecrets(text),
+        onError: (server, message) => {
+          const dm = h.store.dmFor(this.botId);
+          if (dm) h.postNotice(dm.id, `Connector "${server}" isn't working: ${message}`);
+        },
+      });
+    }
+    return this.mcp;
   }
 
   private next(): WakeEvent | undefined {
@@ -243,7 +273,7 @@ export class BotRunner {
       agentId: resumeId,
       name: bot.name,
       cwd: this.h.store.paths.workspace,
-      model: bot.model ?? this.h.store.settings.defaultModel,
+      model: this.h.modelFor(bot, runtime),
     });
     this.sessionRuntime = runtime.id;
     if (bot.agentId !== this.session.agentId || bot.agentRuntime !== runtime.id) {
@@ -355,12 +385,20 @@ export class BotRunner {
       });
       const newest = store.messages(conv.id).at(-1);
 
+      // A plain model API brings no tools, rules or MCP client of its own: the harness supplies them.
+      const runtime = h.runtimeFor(bot);
+      const provides = runtime.provides ?? { workspaceTools: true, projectContext: true, mcp: true };
+      const tools = buildTools(h, bot.id, () => this.current);
+      if (!provides.workspaceTools) tools.push(...buildWorkspaceTools(h, bot.id, () => this.current));
+      if (!provides.mcp) tools.push(...(await this.mcpHub().tools(h.mcpServersFor(bot))));
+
       const run = await session.send({
+        system: provides.projectContext ? undefined : h.systemPromptFor(bot, runtime),
         text: prompt,
         images: images.length ? images : undefined,
-        tools: buildTools(h, bot.id, () => this.current),
-        mcpServers: h.mcpServersFor(bot),
-        model: bot.model ?? store.settings.defaultModel,
+        tools,
+        mcpServers: provides.mcp ? h.mcpServersFor(bot) : {},
+        model: h.modelFor(bot, runtime),
         onEvent: (ev) => {
           if (ev.type === "text") {
             state.text += ev.text;

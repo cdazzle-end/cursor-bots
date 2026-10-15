@@ -2,9 +2,9 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { ApprovalService } from "./approvals.ts";
 import { EventBus } from "./events.ts";
+import { HARNESS_MANUAL, WORKSPACE_TOOLS_MANUAL } from "./manual.ts";
 import { emptyMemory } from "./memory.ts";
 import { groupTag } from "./prompt.ts";
 import { BotRunner, type RunState } from "./runner.ts";
@@ -31,6 +31,7 @@ import type {
   WakeEvent,
 } from "./types.ts";
 import { colorFor, hostTimezone, mimeFor, newId, oneLine, readJson, resolveInside, slugify, stripMarkdown, writeJson } from "./util.ts";
+import { insideAny } from "./guard.ts";
 import { ensureBotFolder, prepareWorkspace, type GateConfig } from "./workspace.ts";
 import type { AgentRuntime, McpServerSpec, RunOutcome } from "../runtimes/types.ts";
 
@@ -89,6 +90,10 @@ export class Harness {
   readonly approvals: ApprovalService;
   readonly scheduler: Scheduler;
   readonly runtimes = new Map<string, AgentRuntime>();
+  /** API keys for model providers: a separate vault, so no secrets tool can hand them to a bot. */
+  readonly providerKeys: SecretVault;
+  /** Provider keys that came from environment variables (removed from bots' child environments). */
+  private providerKeyEnvNames = new Set<string>();
   readonly gateToken: string;
   /** Bearer token for the Team MCP endpoint (/mcp) that outside agents use. */
   readonly mcpToken: string;
@@ -116,6 +121,11 @@ export class Harness {
     for (const rt of opts.runtimes) this.runtimes.set(rt.id, rt);
     this.skills = new SkillLibrary(this.store.paths.workspace, this.store.paths.skills);
     this.vault = new SecretVault(this.store.paths);
+    this.providerKeys = new SecretVault({
+      secretKey: this.store.paths.secretKey,
+      secretsVault: this.store.paths.providerKeysVault,
+      secretsMeta: this.store.paths.providerKeysMeta,
+    });
     this.queueFile = path.join(this.store.paths.state, "queue.json");
     const tokenFile = path.join(this.store.paths.state, "gate.token");
     if (!fs.existsSync(tokenFile)) fs.writeFileSync(tokenFile, randomBytes(18).toString("base64url"), { mode: 0o600 });
@@ -210,11 +220,65 @@ export class Harness {
 
   runtimeFor(bot: Bot): AgentRuntime {
     const id = bot.runtime || this.store.settings.runtime;
-    const rt = this.runtimes.get(id) ?? this.runtimes.get(this.store.settings.runtime) ?? [...this.runtimes.values()][0];
+    // A bot's own brain that no longer exists (a deleted provider) is an error, not a silent switch:
+    // its model id and context belong to that provider.
+    if (bot.runtime && !this.runtimes.has(bot.runtime)) {
+      throw new Error(`${bot.name}'s brain "${bot.runtime}" no longer exists. Pick another one in the bot's details.`);
+    }
+    const rt = this.runtimes.get(id) ?? [...this.runtimes.values()][0];
     if (!rt) throw new Error("No agent runtime is configured.");
     const ok = rt.available();
     if (!ok.ok) throw new Error(`Runtime "${rt.id}" is not available: ${ok.reason}`);
     return rt;
+  }
+
+  /** The model a bot uses on a runtime: its own pick if made for that runtime, else the runtime's default. */
+  modelFor(bot: Bot, rt: AgentRuntime): ModelChoice | undefined {
+    if (bot.model?.id && (bot.modelRuntime ?? "cursor") === rt.id) return bot.model;
+    const provider = this.store.settings.providers.find((p) => p.id === rt.id);
+    if (provider) {
+      const id = provider.defaultModel || provider.models[0]?.id;
+      return id ? { id } : undefined;
+    }
+    return rt.id === "cursor" || rt.id === this.store.settings.runtime ? this.store.settings.defaultModel : undefined;
+  }
+
+  /**
+   * Standing instructions for runtimes that don't read the workspace's rules
+   * themselves: the manual (from the constant, so a tampered file changes
+   * nothing), the workspace tools' rules, the house rules in AGENTS.md, any
+   * other always-on rules, and an index of the skills this bot may use.
+   */
+  systemPromptFor(bot: Bot, rt: AgentRuntime): string {
+    const parts = [HARNESS_MANUAL.replace(/^---\n[\s\S]*?\n---\n+/, "").trim()];
+    if (rt.provides && !rt.provides.workspaceTools) parts.push(WORKSPACE_TOOLS_MANUAL.trim());
+    const read = (file: string, max: number) => {
+      try {
+        const text = fs.readFileSync(file, "utf8").trim();
+        return text.length > max ? `${text.slice(0, max)}\n…(truncated)` : text;
+      } catch {
+        return "";
+      }
+    };
+    const house = read(path.join(this.store.paths.workspace, "AGENTS.md"), 12_000);
+    if (house) parts.push(`# House rules (workspace AGENTS.md)\n\n${house}`);
+    const rules: string[] = [];
+    try {
+      for (const f of fs.readdirSync(this.store.paths.rulesDir).sort()) {
+        if (!f.endsWith(".mdc") || f === "cursor-bots.mdc") continue;
+        const text = read(path.join(this.store.paths.rulesDir, f), 6_000);
+        if (/^---[\s\S]*?\balwaysApply:\s*true\b[\s\S]*?---/.test(text)) rules.push(text.replace(/^---\n[\s\S]*?\n---\n+/, "").trim());
+      }
+    } catch {
+      // No rules folder.
+    }
+    if (rules.length) parts.push(`# More rules for everyone in this workspace\n\n${rules.join("\n\n")}`.slice(0, 12_000));
+    const skills = this.skills.list().filter((s) => !s.manualOnly && !bot.disabledSkills.includes(s.name));
+    if (skills.length) {
+      const lines = skills.slice(0, 80).map((s) => `- ${s.name}: ${s.description}`);
+      parts.push(`# Skills you can use\n\nLoad one with skill_read before following it.\n\n${lines.join("\n")}`);
+    }
+    return parts.join("\n\n");
   }
 
   runner(botId: Id): BotRunner {
@@ -505,6 +569,7 @@ export class Harness {
       about: input.about?.trim() || undefined,
       avatar: { shape: input.avatar?.shape ?? AVATAR_SHAPES[shapeIdx]!, color: input.avatar?.color ?? colorFor(name), image: input.avatar?.image },
       model: input.model,
+      modelRuntime: input.model ? input.runtime || this.store.settings.runtime : undefined,
       runtime: input.runtime,
       connectors: input.connectors ?? "all",
       disabledSkills: input.disabledSkills ?? [],
@@ -555,11 +620,14 @@ export class Harness {
     if (patch.label !== undefined) bot.label = patch.label.trim() || undefined;
     if (patch.about !== undefined) bot.about = patch.about.trim() || undefined;
     if (patch.avatar) bot.avatar = { ...bot.avatar, ...patch.avatar };
-    if (patch.model !== undefined) bot.model = patch.model?.id ? patch.model : undefined;
     let runtimeChanged = false;
     if (patch.runtime !== undefined) {
       runtimeChanged = (patch.runtime || undefined) !== bot.runtime;
       bot.runtime = patch.runtime || undefined;
+    }
+    if (patch.model !== undefined) {
+      bot.model = patch.model?.id ? patch.model : undefined;
+      bot.modelRuntime = bot.model ? bot.runtime || this.store.settings.runtime : undefined;
     }
     if (patch.connectors !== undefined) bot.connectors = patch.connectors;
     if (patch.disabledSkills !== undefined) bot.disabledSkills = patch.disabledSkills;
@@ -1455,27 +1523,28 @@ export class Harness {
   }
 
   /** True if a path (after following symlinks) is one of the protected paths or inside one. */
-  private insideProtected(target: string): boolean {
-    // Spell the path out the way the SDK does before it spawns the shell (~, $HOME, file:// URLs).
-    let t = target.trim();
-    if (t.startsWith("file://")) {
-      try {
-        t = fileURLToPath(t);
-      } catch {
-        // Not a usable URL; check it as written.
-      }
+  insideProtected(target: string, opts: { alsoProcessCwd?: boolean } = { alsoProcessCwd: true }): boolean {
+    // The Cursor SDK resolves a relative working directory against this process's cwd, not the
+    // workspace, so the shell gate checks both. The harness's own tools resolve against the workspace only.
+    const bases = opts.alsoProcessCwd ? [this.store.paths.workspace, process.cwd()] : [this.store.paths.workspace];
+    return insideAny(target, this.protectedPaths(), bases);
+  }
+
+  /**
+   * Environment for processes bots start (shell tools, MCP servers): this
+   * process's environment without credentials the gateway holds for itself.
+   */
+  childEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    for (const k of Object.keys(env)) {
+      if (k === "CURSOR_API_KEY" || k === "CURSOR_BOTS_TOKEN" || this.providerKeyEnvNames.has(k)) delete env[k];
     }
-    t = t.replace(/^~(?=$|[\\/])/, os.homedir()).replace(/^(\$\{HOME\}|\$HOME)(?=$|[\\/])/, os.homedir());
-    // The SDK resolves a relative working directory against this process's cwd, not the workspace: check both.
-    const bases = path.isAbsolute(t) ? [this.store.paths.workspace] : [this.store.paths.workspace, process.cwd()];
-    const candidates = bases.flatMap((b) => {
-      const abs = path.resolve(b, t);
-      return [abs, realPrefix(abs)];
-    });
-    return this.protectedPaths().some((root) => {
-      const roots = [root, realPrefix(root)];
-      return candidates.some((c) => roots.some((r) => c === r || c.startsWith(r + path.sep)));
-    });
+    return { ...env, ...extra };
+  }
+
+  /** Remove every stored secret value (and provider API key) from text that goes back to a model. */
+  scrubSecrets(text: string): string {
+    return this.providerKeys.scrub(this.vault.scrub(text));
   }
 
   /**
@@ -1488,7 +1557,7 @@ export class Harness {
     const home = os.homedir();
     const cmd = command.replace(/(^|[\s=:'"(])~(?=\/)/g, `$1${home}`).replace(/\$\{HOME\}|\$HOME\b/g, home);
     if (this.protectedPaths().some((p) => cmd.includes(p))) return true;
-    if (/\b(secret\.key|secrets\.vault|ui\.token|mcp\.token|gate\.token|cursor-store|cursor-bots-gate|cursor-bots\.mdc)\b/.test(cmd)) return true;
+    if (/\b(secret\.key|secrets\.vault|provider-keys\.(vault|json)|ui\.token|mcp\.token|gate\.token|cursor-store|cursor-bots-gate|cursor-bots\.mdc)\b/.test(cmd)) return true;
     // Relative to the workspace (the bots' cwd); another project's .cursor folder is fine to touch.
     if (/(^|[\s'"=:(;&|]|\.\/)\.cursor\/(hooks\b|hooks\.json|mcp\.json|mcp-approvals\.json|cli\.json|cli-config\.json|permissions\.json|sandbox\.json)/.test(cmd)) return true;
     if (/(^|[\s'"=:(;&|]|\.\/)\.(rgignore|cursorignore)\b/.test(cmd)) return true;
@@ -1682,21 +1751,4 @@ export class Harness {
       avatarShapes: AVATAR_SHAPES,
     };
   }
-}
-
-/** Follow symlinks on the longest existing prefix of a path (new files resolve through their parent). */
-function realPrefix(p: string): string {
-  const rest: string[] = [];
-  let cur = p;
-  for (let i = 0; i < 64; i++) {
-    try {
-      return path.join(fs.realpathSync(cur), ...rest);
-    } catch {
-      const parent = path.dirname(cur);
-      if (parent === cur) break;
-      rest.unshift(path.basename(cur));
-      cur = parent;
-    }
-  }
-  return p;
 }

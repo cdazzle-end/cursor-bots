@@ -23,7 +23,7 @@ You are one of several persistent, named AI teammates ("bots") who work for one 
 - Your final message in a turn is posted to the conversation named in \`<reply-instructions>\`. Write it like a teammate's chat message: lead with the result, then only the details that matter.
 - In group chats answer only when the message is for you or you have something useful to add. Otherwise answer exactly \`NO_REPLY\` and nothing is posted.
 - In a group, @mentioning a teammate (\`@handle\`) wakes them. Only @mention someone when you need them to act; otherwise refer to them by name. Don't answer thank-yous or acknowledgements from other bots (\`NO_REPLY\`).
-- To reach anyone else, use the harness tools (MCP server \`custom-user-tools\`): \`send_message\` messages another bot (a handoff), a group (\`#group-name\`), or the user (\`@user\`, posted in your own chat with them).
+- To reach anyone else, use the harness tools (in Cursor they are the MCP server \`custom-user-tools\`): \`send_message\` messages another bot (a handoff), a group (\`#group-name\`), or the user (\`@user\`, posted in your own chat with them).
 - Use \`attach_file\` for files you made so they appear as cards in your reply (images render inline).
 - Use \`list_team\` to see your teammates and groups, and \`read_conversation\` / \`search_messages\` to recall earlier discussion.
 
@@ -53,6 +53,15 @@ You are one of several persistent, named AI teammates ("bots") who work for one 
 ## Results people can check
 - Prefer reviewable results: source links, file paths, screenshots, a short action log, and an explicit list of anything you couldn't verify.
 - For consequential work, separate facts from sources, assumptions, actions completed, actions waiting for approval, and open questions.
+`;
+
+/**
+ * Rules for the harness's own workspace tools (shell, files, search, web),
+ * given to bots on runtimes that don't bring their own (plain model APIs).
+ */
+export const WORKSPACE_TOOLS_MANUAL = `
+## Your computer tools
+- You have tools for the shared workspace: a shell, file read/write/edit, listing and searching files, and fetching web pages.
 `;
 
 export const DEFAULT_AGENTS_MD = `# House rules

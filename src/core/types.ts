@@ -27,8 +27,10 @@ export interface Bot {
   /** The job, in operational terms. Durable rules belong in memory. */
   about?: string;
   avatar: Avatar;
-  /** Per-bot model. Falls back to settings.defaultModel. */
+  /** Per-bot model. Falls back to the runtime's default (settings.defaultModel for Cursor, the provider's default otherwise). */
   model?: ModelChoice;
+  /** Runtime the model was picked for; a model id means nothing to another provider. Unset = "cursor". */
+  modelRuntime?: string;
   /** Runtime id override ("cursor", "mock"). Falls back to settings.runtime. */
   runtime?: string;
   /** Connectors (MCP servers) this bot may use. "all" = every enabled connector. */
@@ -281,6 +283,58 @@ export interface ConnectorConfig {
   enabled: boolean;
 }
 
+/** How a provider's models call tools: the API's function calling, a text format in the reply, or not at all. */
+export type ToolMode = "auto" | "native" | "prompt" | "none";
+
+export interface ProviderModel {
+  /** The id sent as `model` (e.g. "Qwen/Qwen3-32B"). */
+  id: string;
+  label?: string;
+  /** Tokens the model can see (prompt + reply). */
+  contextWindow?: number;
+  /** Longest reply to ask for. */
+  maxOutputTokens?: number;
+  /** Accepts images. */
+  vision?: boolean;
+  /** Overrides the provider's tool mode for this model. */
+  toolMode?: ToolMode;
+  /** Concurrency units one request uses (Featherless: 1, 2 or 4 by model size). */
+  concurrencyCost?: number;
+  /** Extra request fields for this model (e.g. {"chat_template_kwargs": {"enable_thinking": false}}). */
+  extraBody?: Record<string, unknown>;
+}
+
+/**
+ * A model provider with an OpenAI-compatible chat API (Featherless, OpenRouter,
+ * xAI, Ollama, LM Studio, ...). Each one becomes a runtime ("brain") bots can
+ * use. The API key is not stored here: it lives in the provider-key vault.
+ */
+export interface ProviderConfig {
+  /** Slug; also the runtime id bots refer to (e.g. "featherless"). */
+  id: string;
+  label: string;
+  /** e.g. "https://api.featherless.ai/v1" (http is fine for a local server). */
+  baseUrl: string;
+  enabled: boolean;
+  /** Concurrency budget shared by every bot on this provider (Featherless plans count units). */
+  maxConcurrency: number;
+  /** Default tool mode for this provider's models. */
+  toolMode: ToolMode;
+  /** Which request field limits the reply length. */
+  maxTokensParam?: "max_tokens" | "max_completion_tokens";
+  /** Extra non-secret request headers. */
+  headers?: Record<string, string>;
+  /** Model new bots on this provider use. */
+  defaultModel?: string;
+  /** Model used for group routing when this provider is the default brain. */
+  routerModel?: string;
+  /** Context window assumed for models that don't say. */
+  defaultContextWindow?: number;
+  models: ProviderModel[];
+  createdAt: number;
+  updatedAt: number;
+}
+
 export interface UserProfile {
   name: string;
   label: string;
@@ -326,5 +380,7 @@ export interface Settings {
   cursorAutoReview: boolean;
   /** Cursor sandbox for shell commands (bubblewrap/seatbelt). */
   cursorSandbox: boolean;
+  /** OpenAI-compatible model providers (keys live in the provider-key vault). */
+  providers: ProviderConfig[];
   lastUserActivityAt?: number;
 }

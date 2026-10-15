@@ -3,6 +3,7 @@ import type {
   AgentRuntime,
   BoundTool,
   RunOutcome,
+  RuntimeProvides,
   RuntimeRun,
   RuntimeSession,
   SendInput,
@@ -24,9 +25,12 @@ export class MockRuntime implements AgentRuntime {
   /** Delay between streamed chunks; tests set this to 0. */
   chunkDelayMs: number;
   readonly sessions = new Map<string, MockSession>();
+  /** Tests can pretend to be a bare model API, so the harness supplies tools, rules and MCP. */
+  readonly provides?: RuntimeProvides;
 
-  constructor(opts: { chunkDelayMs?: number } = {}) {
+  constructor(opts: { chunkDelayMs?: number; provides?: RuntimeProvides } = {}) {
     this.chunkDelayMs = opts.chunkDelayMs ?? 25;
+    this.provides = opts.provides;
   }
 
   available() {
@@ -67,6 +71,10 @@ export class MockSession implements RuntimeSession {
   private rt: MockRuntime;
   /** Every prompt this session received (tests inspect it). */
   readonly prompts: string[] = [];
+  /** The system prompt sent with each prompt (only for runtimes without project context). */
+  readonly systems: Array<string | undefined> = [];
+  /** Tool names offered with each prompt. */
+  readonly toolNames: string[][] = [];
 
   constructor(agentId: string, name: string, rt: MockRuntime) {
     this.agentId = agentId;
@@ -76,6 +84,8 @@ export class MockSession implements RuntimeSession {
 
   async send(input: SendInput): Promise<RuntimeRun> {
     this.prompts.push(input.text);
+    this.systems.push(input.system);
+    this.toolNames.push(input.tools.map((t) => t.name));
     return new MockRun(this, input, this.rt.chunkDelayMs);
   }
 

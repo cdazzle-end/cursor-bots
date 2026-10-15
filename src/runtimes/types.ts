@@ -6,9 +6,22 @@ import type { ModelChoice } from "../core/types.ts";
  * else (identity, memory, messaging, schedules, approvals). Swapping runtimes
  * swaps the agent, not the team.
  */
+/**
+ * What a runtime brings itself. The Cursor SDK has its own file and shell
+ * tools, loads the workspace's rules and skills, and runs MCP servers; a plain
+ * model API has none of that, so the harness supplies it (its own workspace
+ * tools, a system prompt, and an MCP client). Undefined means "all true".
+ */
+export interface RuntimeProvides {
+  workspaceTools: boolean;
+  projectContext: boolean;
+  mcp: boolean;
+}
+
 export interface AgentRuntime {
   readonly id: string;
   readonly label: string;
+  readonly provides?: RuntimeProvides;
   /** Whether this runtime can run right now (e.g. API key present). */
   available(): { ok: boolean; reason?: string };
   /** Open (create or resume) the long-lived agent session for one bot. */
@@ -23,6 +36,12 @@ export interface RuntimeModel {
   id: string;
   displayName: string;
   description?: string;
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  vision?: boolean;
+  /** The provider says the model supports function calling. */
+  toolUse?: boolean;
+  concurrencyCost?: number;
   parameters?: Array<{ id: string; displayName?: string; values: Array<{ value: string; displayName?: string }> }>;
 }
 
@@ -63,6 +82,8 @@ export interface ToolOutput {
 }
 
 export interface SendInput {
+  /** Standing instructions (manual, house rules, skills index) for runtimes without project context. */
+  system?: string;
   text: string;
   images?: Array<{ data: string; mimeType: string }>;
   tools: BoundTool[];

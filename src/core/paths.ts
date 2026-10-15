@@ -22,6 +22,11 @@ export interface HomePaths {
   memory: string;
   seen: string;
   cursorStore: string;
+  /** Conversation transcripts of bots on OpenAI-compatible providers (one JSONL per agent). */
+  agents: string;
+  /** API keys for model providers, in their own vault so bots can't reach them through secrets tools. */
+  providerKeysVault: string;
+  providerKeysMeta: string;
   logs: string;
   /** The shared "computer": cwd for every bot. */
   workspace: string;
@@ -57,6 +62,9 @@ export function homePaths(home: string): HomePaths {
     memory: path.join(state, "memory"),
     seen: path.join(state, "seen.json"),
     cursorStore: path.join(abs, "cursor-store"),
+    agents: path.join(state, "agents"),
+    providerKeysVault: path.join(state, "provider-keys.vault"),
+    providerKeysMeta: path.join(state, "provider-keys.json"),
     logs: path.join(abs, "logs"),
     workspace,
     skills: path.join(workspace, ".cursor", "skills"),

@@ -215,7 +215,17 @@ export function prepareWorkspace(paths: HomePaths, gate: GateConfig, opts: { onl
 const IGNORE_START = "# >>> Cursor Bots (managed): keep the gateway's keys and tokens out of searches";
 const IGNORE_END = "# <<< Cursor Bots";
 /** The gateway's secret files by name, so a search can't reach them through a symlink in the workspace. */
-export const SEARCH_IGNORED = ["ui.token", "gate.token", "mcp.token", "secret.key", "secrets.vault", "connectors.json", "cursor-store/"];
+export const SEARCH_IGNORED = [
+  "ui.token",
+  "gate.token",
+  "mcp.token",
+  "secret.key",
+  "secrets.vault",
+  "provider-keys.vault",
+  "provider-keys.json",
+  "connectors.json",
+  "cursor-store/",
+];
 
 /**
  * Cursor's Grep and List tools run ripgrep with --follow, so a symlink inside
