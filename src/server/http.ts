@@ -3,6 +3,7 @@ import * as http from "node:http";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Harness, BotTemplate } from "../core/harness.ts";
+import { PROVIDER_PRESETS } from "../core/providers.ts";
 import { createStarterTeam } from "../core/starter.ts";
 import { handleMcp, mcpClientName } from "./mcp.ts";
 import type { ConnectorConfig } from "../core/types.ts";
@@ -84,9 +85,11 @@ export function createServer(h: Harness, opts: ServerOptions): http.Server {
     return KEEP_OPEN;
   });
 
-  route("GET", "/api/models", async () => {
-    const rt = h.runtimes.get(h.store.settings.runtime);
-    if (!rt?.listModels || !rt.available().ok) return { models: [], runtime: rt?.id };
+  route("GET", "/api/models", async ({ url }) => {
+    const rt = h.runtimes.get(url.searchParams.get("runtime") || h.store.settings.runtime);
+    // A provider's configured models list fine without a key; Cursor's list needs a working key.
+    const isProvider = h.store.settings.providers.some((p) => p.id === rt?.id);
+    if (!rt?.listModels || (!isProvider && !rt.available().ok)) return { models: [], runtime: rt?.id };
     try {
       return { models: await rt.listModels(), runtime: rt.id };
     } catch (err: any) {
@@ -271,6 +274,28 @@ export function createServer(h: Harness, opts: ServerOptions): http.Server {
     return { ok };
   });
   route("PATCH", "/api/settings", async ({ body }) => h.updateSettings(await body()));
+
+  // ----------------------------------------------------------------- model providers
+
+  route("GET", "/api/providers", () => ({ providers: h.describeProviders(), presets: PROVIDER_PRESETS }));
+  route("POST", "/api/providers", async ({ body }) => h.createProvider(await body()));
+  route("PATCH", "/api/providers/:id", async ({ params, body }) => h.updateProvider(params.id!, await body()));
+  route("DELETE", "/api/providers/:id", async ({ params }) => {
+    await h.deleteProvider(params.id!);
+    return { ok: true };
+  });
+  // The key is write-only: it is stored in the provider-key vault and never sent back.
+  route("PUT", "/api/providers/:id/key", async ({ params, body }) => {
+    h.setProviderKey(params.id!, (await body()).value);
+    return { ok: true };
+  });
+  route("DELETE", "/api/providers/:id/key", ({ params }) => {
+    h.clearProviderKey(params.id!);
+    return { ok: true };
+  });
+  route("GET", "/api/providers/:id/catalog", async ({ params, url }) => ({ models: await h.providerCatalog(params.id!, url.searchParams.get("search") ?? undefined) }));
+  route("GET", "/api/providers/:id/lookup", async ({ params, url }) => ({ model: (await h.providerLookup(params.id!, url.searchParams.get("model") ?? "")) ?? null }));
+  route("POST", "/api/providers/:id/test", async ({ params }) => h.testProvider(params.id!));
   route("PUT", "/api/connectors", async ({ body }) => {
     const incoming = (await body()) as Record<string, ConnectorConfig>;
     const prev = h.store.connectors;

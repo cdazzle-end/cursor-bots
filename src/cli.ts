@@ -5,11 +5,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AddressInfo } from "node:net";
 import { parseArgs } from "node:util";
-import { Harness } from "./core/harness.ts";
+import { Harness, type ProviderRuntimeFactory } from "./core/harness.ts";
 import { defaultHome } from "./core/paths.ts";
 import { createStarterTeam } from "./core/starter.ts";
 import { CursorRuntime, cursorCredentials } from "./runtimes/cursor.ts";
 import { MockRuntime } from "./runtimes/mock.ts";
+import { OpenAICompatRuntime } from "./runtimes/openai.ts";
 import { createServer } from "./server/http.ts";
 
 // The Cursor SDK keeps bot contexts in node:sqlite, which Node 22 still labels
@@ -22,12 +23,13 @@ process.emitWarning = ((warning: string | Error, ...rest: unknown[]) => {
   return (emitWarning as (...a: unknown[]) => void).call(process, warning, ...rest);
 }) as typeof process.emitWarning;
 
-const HELP = `cursor-bots — persistent AI teammates on the Cursor SDK
+const HELP = `cursor-bots — persistent AI teammates on the Cursor SDK (or any OpenAI-compatible model API)
 
 Usage:
-  cursor-bots start   [--port 4777] [--host 127.0.0.1] [--home DIR] [--runtime cursor|mock] [--starter] [--open]
-  cursor-bots doctor  [--home DIR]          Check Node, the Cursor SDK, your API key and the workspace
-  cursor-bots models                        List the models your Cursor API key can use
+  cursor-bots start   [--port 4777] [--host 127.0.0.1] [--home DIR] [--runtime cursor|mock|<provider id>] [--starter] [--open]
+  cursor-bots doctor  [--home DIR]          Check Node, the Cursor SDK, your keys, your model providers and the workspace
+  cursor-bots models  [--runtime <provider id>] [--search TEXT] [--home DIR]
+                                            List Cursor models, or a provider's configured models and catalogue
   cursor-bots say BOT MESSAGE [--port 4777] [--home DIR]  Message a bot through a running gateway
 
 Environment:
@@ -35,6 +37,10 @@ Environment:
                      A login stored by the Cursor SDK (~/.cursor/sdk/auth.json) works too.
   CURSOR_BOTS_HOME   Where bots, chats, memory and the shared workspace live (default ~/.cursor-bots)
 `;
+
+/** Model providers (Settings → Brain & models → Providers) run on the OpenAI-compatible runtime. */
+const providerRuntime: ProviderRuntimeFactory = (deps) =>
+  new OpenAICompatRuntime({ ...deps, appName: "Cursor Bots", appUrl: "https://github.com/cdazzle-end/cursor-bots" });
 
 function makeRuntimes(home: string, settings: () => Harness["store"]["settings"]) {
   const cursor = new CursorRuntime({
@@ -63,10 +69,10 @@ async function start(argv: string[]): Promise<void> {
   const home = path.resolve(values.home!);
   let harnessRef: Harness | undefined;
   const runtimes = makeRuntimes(home, () => harnessRef!.store.settings);
-  const h = new Harness({ home, runtimes });
+  const h = new Harness({ home, runtimes, providerRuntime });
   harnessRef = h;
   if (values.runtime) {
-    if (!h.runtimes.has(values.runtime)) throw new Error(`Unknown runtime ${values.runtime} (use cursor or mock)`);
+    if (!h.runtimes.has(values.runtime)) throw new Error(`Unknown runtime ${values.runtime} (use ${[...h.runtimes.keys()].join(", ")})`);
     h.store.settings.runtime = values.runtime;
     h.store.saveSettings();
   }
@@ -211,10 +217,52 @@ async function doctor(argv: string[]): Promise<void> {
   else warn("Workspace not prepared yet (it is created on first start)");
   const bwrap = ["/usr/bin/bwrap", "/usr/local/bin/bwrap"].some((p) => fs.existsSync(p));
   if (process.platform === "linux") (bwrap ? ok : warn)(bwrap ? "bubblewrap found (Cursor sandbox available)" : "bubblewrap not found: the optional Cursor sandbox won't work on this Linux host");
+
+  // Model providers: key present, catalogue reachable, configured models known.
+  const h = new Harness({ home, runtimes: [], providerRuntime });
+  for (const p of h.describeProviders()) {
+    if (!p.enabled) {
+      warn(`${p.label}: turned off`);
+      continue;
+    }
+    if (p.needsKey && !p.hasKey) {
+      bad(`${p.label}: no API key (Settings → Brain & models → Providers)`);
+      continue;
+    }
+    try {
+      const catalog = await h.providerCatalog(p.id);
+      ok(`${p.label}: reachable at ${p.baseUrl} (${catalog.length} models listed)`);
+      for (const m of p.models) {
+        const found = catalog.some((c) => c.id === m.id) || (await h.providerLookup(p.id, m.id));
+        (found ? ok : warn)(`  ${m.id}${found ? "" : ": not in the provider's list (check the id)"}`);
+      }
+    } catch (err: any) {
+      bad(`${p.label}: ${err?.message ?? err}`);
+    }
+  }
   console.log("");
 }
 
-async function models(): Promise<void> {
+async function models(argv: string[]): Promise<void> {
+  const { values } = parseArgs({
+    args: argv,
+    options: { runtime: { type: "string" }, search: { type: "string" }, home: { type: "string", default: defaultHome() } },
+  });
+  if (values.runtime && values.runtime !== "cursor") {
+    const h = new Harness({ home: path.resolve(values.home!), runtimes: [], providerRuntime });
+    const p = h.store.settings.providers.find((x) => x.id === values.runtime);
+    if (!p) throw new Error(`No provider "${values.runtime}". Providers: ${h.store.settings.providers.map((x) => x.id).join(", ") || "(none yet: add one in Settings → Brain & models)"}`);
+    console.log(`Configured on ${p.label}:`);
+    for (const m of p.models) console.log(`  ${m.id.padEnd(44)} ${m.contextWindow ? `${m.contextWindow} tokens` : ""}${m.id === p.defaultModel ? "  (default)" : ""}`);
+    const catalog = await h.providerCatalog(p.id, values.search);
+    console.log(`\n${p.label} catalogue${values.search ? ` matching "${values.search}"` : ""}: ${catalog.length} model(s)`);
+    for (const m of catalog.slice(0, 200)) {
+      const bits = [m.contextWindow ? `${m.contextWindow} ctx` : "", m.concurrencyCost ? `cost ${m.concurrencyCost}` : "", m.vision ? "vision" : ""].filter(Boolean).join(", ");
+      console.log(`  ${m.id.padEnd(44)} ${bits}`);
+    }
+    if (catalog.length > 200) console.log(`  … and ${catalog.length - 200} more (narrow it with --search)`);
+    return;
+  }
   const sdk = await import("@cursor/sdk");
   if (process.env.CURSOR_API_KEY === "") delete process.env.CURSOR_API_KEY;
   const creds = cursorCredentials();
@@ -279,7 +327,7 @@ async function main(): Promise<void> {
     case "doctor":
       return doctor(rest);
     case "models":
-      return models();
+      return models(rest);
     case "say":
       return say(rest);
     case "help":

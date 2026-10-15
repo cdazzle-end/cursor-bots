@@ -1,4 +1,4 @@
-import type { ModelChoice } from "../core/types.ts";
+import type { ModelChoice, ProviderModel } from "../core/types.ts";
 
 /**
  * A runtime is the "brain" behind a bot: it owns the agent loop, the model,
@@ -29,6 +29,10 @@ export interface AgentRuntime {
   /** One-shot text completion for small decisions (group routing). Optional. */
   complete?(prompt: string, opts?: { model?: ModelChoice }): Promise<string>;
   listModels?(): Promise<RuntimeModel[]>;
+  /** Providers: read the service's model catalogue (optionally filtered). */
+  fetchModels?(opts?: { search?: string }): Promise<ProviderModel[]>;
+  /** Providers: look one model up to learn its context window and abilities. */
+  lookupModel?(id: string): Promise<ProviderModel | undefined>;
   dispose?(): Promise<void>;
 }
 

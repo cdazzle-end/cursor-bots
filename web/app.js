@@ -363,7 +363,7 @@ function renderEmpty() {
     ${avatarHtml({ shape: "classic", color: "#ff3b3b" }, 84)}
     <h2>${hasBots ? "Pick a bot or a group" : "Build your team"}</h2>
     <p>Bots are persistent AI teammates with a name, a job, memory and their own chat. They share one computer (the workspace), message each other, and run routines while you're away.</p>
-    ${rt && !rt.ok ? `<div class="banner">${esc(rt.reason)} Restart with the key set, or switch the brain to the demo (“mock”) in Settings → Brain & models to click around first.</div>` : ""}
+    ${rt && !rt.ok ? `<div class="banner">${esc(rt.reason)} ${rt.provider ? "" : "Restart with the key set, add a model provider, "}or switch the default brain in Settings → Brain & models (the demo “mock” brain lets you click around first).</div>` : ""}
     <div class="row">
       <button class="btn primary" id="e-new">Create a bot</button>
       ${hasBots ? "" : '<button class="btn" id="e-starter">Add a starter team</button>'}
@@ -671,7 +671,9 @@ function renderLive() {
       const tools = [...l.tools.values()].slice(-5);
       const head = c.kind === "dm" ? "" : `<div class="who">${avatarHtml(b?.avatar, 22)}<span>${esc(b?.name ?? "")}</span><span>working…</span></div>`;
       const text = l.text.replace(/\n*NO_REPLY\.?\s*$/i, "");
-      return `<div class="msg live" style="margin-top:4px">${head}<div class="bubble">${text ? md(text) : '<span class="typing"><span></span><span></span><span></span></span>'}</div>${
+      // What the turn waits on (e.g. "Waiting for Featherless capacity"), until text arrives.
+      const status = !text && l.status ? `<div class="muted" style="font-size:12.5px;margin-top:4px">${esc(l.status)}</div>` : "";
+      return `<div class="msg live" style="margin-top:4px">${head}<div class="bubble">${text ? md(text) : '<span class="typing"><span></span><span></span><span></span></span>'}${status}</div>${
         tools.length ? `<div class="live-tools">${tools.map((t) => `<div><span class="dot ${t.status}"></span><span>${esc(t.name)}</span><span>${esc(t.summary || "")}</span></div>`).join("")}</div>` : ""
       }</div>`;
     })
@@ -937,18 +939,32 @@ function switchHtml(id, checked) {
   return `<label class="switch"><input type="checkbox" id="${id}" ${checked ? "checked" : ""}><span></span></label>`;
 }
 
-async function loadModels() {
-  if (S.models) return S.models;
-  const res = await api("GET", "/api/models").catch(() => ({ models: [] }));
-  S.models = res.models ?? [];
-  return S.models;
+// Model lists are per brain: Cursor's come from your key, a provider's from its settings.
+S.modelsByRt = {};
+
+async function loadModels(rtId = S.state.settings.runtime) {
+  if (S.modelsByRt[rtId]) return S.modelsByRt[rtId];
+  const res = await api("GET", `/api/models?runtime=${encodeURIComponent(rtId)}`).catch(() => ({ models: [] }));
+  S.modelsByRt[rtId] = res.models ?? [];
+  return S.modelsByRt[rtId];
 }
 
-function modelSelectHtml(id, current, allowDefault = true) {
-  const models = S.models ?? [];
+function providerOf(rtId) {
+  return (S.state.providers ?? []).find((p) => p.id === rtId);
+}
+
+/** The model a brain uses when a bot hasn't picked one. */
+function defaultModelFor(rtId) {
+  const p = providerOf(rtId);
+  if (p) return p.defaultModel || p.models?.[0]?.id || "";
+  return S.state.settings.defaultModel?.id ?? "";
+}
+
+function modelSelectHtml(id, current, allowDefault = true, rtId = S.state.settings.runtime) {
+  const models = S.modelsByRt[rtId] ?? [];
   const ids = new Set(models.map((m) => m.id));
   const opts = [];
-  if (allowDefault) opts.push(`<option value="">Default (${esc(S.state.settings.defaultModel?.id ?? "")})</option>`);
+  if (allowDefault) opts.push(`<option value="">Default (${esc(defaultModelFor(rtId) || "none set")})</option>`);
   for (const m of models) opts.push(`<option value="${esc(m.id)}" ${current === m.id ? "selected" : ""}>${esc(m.displayName || m.id)}</option>`);
   if (current && !ids.has(current)) opts.push(`<option value="${esc(current)}" selected>${esc(current)}</option>`);
   opts.push('<option value="__custom">Other model id…</option>');
@@ -983,6 +999,7 @@ async function renderBotDetails(el, b) {
   const skills = S.state.skills ?? [];
   const connectors = Object.keys(S.state.connectors ?? {});
   const runtimes = S.state.runtimes ?? [];
+  const rtId = b.runtime || S.state.settings.runtime;
   const pendingApprovals = (S.state.approvals ?? []).filter((a) => a.botId === b.id && a.status === "pending");
   const status = b.status?.state === "working" ? `working${b.status.queued ? `, ${b.status.queued} queued` : ""}` : b.status?.state === "error" ? `last run failed` : b.status?.queued ? `${b.status.queued} queued` : "idle";
   el.innerHTML = `<div class="details-head"><span class="muted">Bot details</span><button class="icon-btn" id="d-close">${ICON.close}</button></div>
@@ -1003,8 +1020,8 @@ async function renderBotDetails(el, b) {
       <div class="toggle-row"><span>Pin to top</span>${switchHtml("d-pin", b.pinned)}</div>
       <div class="toggle-row"><span>Hide from sidebar</span>${switchHtml("d-hide", b.hidden)}</div>
       <div class="field">Section<input id="d-section" value="${esc(b.section ?? "")}" placeholder="e.g. Client A"></div>
-      <div class="field">Model ${modelSelectHtml("d-model", b.model?.id)}</div>
-      <div class="field">Brain (runtime)<select id="d-runtime"><option value="">Default (${esc(S.state.settings.runtime)})</option>${runtimes.map((r) => `<option value="${r.id}" ${b.runtime === r.id ? "selected" : ""}>${esc(r.label)}${r.ok ? "" : " — unavailable"}</option>`).join("")}</select></div>
+      <div class="field">Brain<select id="d-runtime"><option value="">Default (${esc(runtimes.find((r) => r.id === S.state.settings.runtime)?.label ?? S.state.settings.runtime)})</option>${runtimes.map((r) => `<option value="${esc(r.id)}" ${b.runtime === r.id ? "selected" : ""}>${esc(r.label)}${r.ok ? "" : " — unavailable"}</option>`).join("")}</select></div>
+      <div class="field">Model ${modelSelectHtml("d-model", (b.modelRuntime ?? "cursor") === rtId ? b.model?.id : undefined, true, rtId)}</div>
     </div>
     ${pendingApprovals.length ? `<div class="d-section"><h4>Waiting for you</h4>${pendingApprovals.map((a) => `<div class="list-row"><div class="grow"><div class="t">${esc(a.command ?? a.title)}</div></div><button class="btn small primary" data-ap="once" data-id="${a.id}">Allow</button><button class="btn small" data-ap="deny" data-id="${a.id}">Deny</button></div>`).join("")}</div>` : ""}
     <div class="d-section"><h4>Routines <button class="btn small" id="d-add-routine">Add routine</button></h4>
@@ -1046,10 +1063,11 @@ async function renderBotDetails(el, b) {
   $("#d-section").onchange = (e) => patch({ section: e.target.value });
   $("#d-model").onchange = (e) => {
     let v = e.target.value;
-    if (v === "__custom") v = prompt("Model id (see `cursor-bots models`):", b.model?.id ?? "") ?? "";
+    if (v === "__custom") v = prompt(providerOf(rtId) ? "Model id on this provider (e.g. Qwen/Qwen3-32B):" : "Model id (see `cursor-bots models`):", b.model?.id ?? "") ?? "";
     patch({ model: v ? { id: v } : null });
   };
-  $("#d-runtime").onchange = (e) => patch({ runtime: e.target.value });
+  // A model id belongs to one brain: switching brains goes back to that brain's default model.
+  $("#d-runtime").onchange = (e) => patch({ runtime: e.target.value, model: null });
   $("#d-add-routine").onclick = () => {
     const input = $("#c-input");
     if (input) {
@@ -1100,7 +1118,7 @@ async function renderBotDetails(el, b) {
     if (!confirm(`Delete ${b.name}? This removes its profile, chat and routines. It can't be undone.`)) return;
     await attempt(() => api("DELETE", `/api/bots/${b.id}`));
   };
-  if (!S.models) loadModels().then(() => S.details && conv(S.current)?.kind === "dm" && !el.contains(document.activeElement) && renderDetails());
+  if (!S.modelsByRt[rtId]) loadModels(rtId).then(() => S.details && conv(S.current)?.kind === "dm" && !el.contains(document.activeElement) && renderDetails());
 }
 
 function routineHtml(r) {
@@ -1399,14 +1417,32 @@ function openSettings(tab = "general") {
         });
       $("#s-save").onclick = () => save({ user: { name: $("#s-name").value, label: $("#s-label").value, avatar }, timezone: $("#s-tz").value });
     } else if (t === "brain") {
-      await loadModels();
-      body.innerHTML = `<div class="field">Default brain for bots<select id="s-rt">${S.state.runtimes.map((r) => `<option value="${r.id}" ${s.runtime === r.id ? "selected" : ""}>${esc(r.label)}${r.ok ? "" : ` — ${esc(r.reason)}`}</option>`).join("")}</select></div>
-        <div class="grid2"><div class="field">Default model ${modelSelectHtml("s-model", s.defaultModel?.id, false)}</div><div class="field">Routing model (picks who answers in groups) ${modelSelectHtml("s-router", s.routerModel?.id, false)}</div></div>
-        ${S.models?.length ? "" : '<div class="muted">Model list appears once a Cursor API key is configured. You can still type a model id (e.g. composer-2.5).</div>'}
+      await loadModels("cursor");
+      const providers = S.state.providers ?? [];
+      const rtLabel = (r) => `${esc(r.label)}${r.ok ? "" : ` — ${esc(r.reason)}`}`;
+      body.innerHTML = `<div class="field">Default brain for bots<select id="s-rt">${S.state.runtimes.map((r) => `<option value="${esc(r.id)}" ${s.runtime === r.id ? "selected" : ""}>${rtLabel(r)}</option>`).join("")}</select></div>
         <div class="field">Un-addressed group messages<select id="s-routing"><option value="llm" ${s.groupRouting === "llm" ? "selected" : ""}>Bots decide (a quick routing model picks one)</option><option value="lead" ${s.groupRouting === "lead" ? "selected" : ""}>Go to the group's lead</option><option value="heuristic" ${s.groupRouting === "heuristic" ? "selected" : ""}>Name match, then lead (no model call)</option></select></div>
-        <div class="toggle-row"><span>Cursor Auto-review classifier for shell/MCP calls (in addition to your rules)</span>${switchHtml("s-ar", s.cursorAutoReview)}</div>
-        <div class="toggle-row"><span>Cursor sandbox for shell commands (needs bubblewrap on Linux)</span>${switchHtml("s-sb", s.cursorSandbox)}</div>
-        <div class="muted">Heads-up: with Auto-review or the sandbox on, the Cursor SDK can't ask you about connector (MCP) tool calls in a local run, so it refuses them. Leave both off if your bots use connected apps such as the browser; your approval rules still apply to shell commands.</div>
+        <div class="d-section"><h4>Model providers <span class="muted" style="font-weight:400">— any OpenAI-compatible API: Featherless, OpenRouter, xAI, Ollama…</span></h4>
+          <div id="s-providers">${
+            providers.length
+              ? providers
+                  .map((p) => {
+                    const rt = S.state.runtimes.find((r) => r.id === p.id);
+                    const status = !p.enabled ? "off" : p.needsKey && !p.hasKey ? "needs an API key" : rt && !rt.ok ? rt.reason : "ready";
+                    return `<div class="list-row"><div class="grow"><div class="t">${esc(p.label)} <span class="muted">(${esc(p.id)})</span></div><div class="s">${esc(p.baseUrl)} · ${p.models.length} model${p.models.length === 1 ? "" : "s"}${p.defaultModel ? ` · default ${esc(p.defaultModel)}` : ""} · ${esc(status)}</div></div><button class="btn small" data-pedit="${esc(p.id)}">Edit</button><button class="btn small" data-ptest="${esc(p.id)}">Test</button><button class="btn small danger" data-pdel="${esc(p.id)}">Remove</button></div>`;
+                  })
+                  .join("")
+              : '<div class="muted">No providers yet. Add one to run bots on models outside Cursor.</div>'
+          }</div>
+          <div class="row" style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px" id="s-presets"></div>
+        </div>
+        <div class="d-section"><h4>Cursor</h4>
+          <div class="grid2"><div class="field">Default model ${modelSelectHtml("s-model", s.defaultModel?.id, false, "cursor")}</div><div class="field">Routing model (when Cursor is the default brain) ${modelSelectHtml("s-router", s.routerModel?.id, false, "cursor")}</div></div>
+          ${S.modelsByRt.cursor?.length ? "" : '<div class="muted">The Cursor model list appears once a Cursor API key is configured. You can still type a model id (e.g. composer-2.5).</div>'}
+          <div class="toggle-row"><span>Cursor Auto-review classifier for shell/MCP calls (in addition to your rules)</span>${switchHtml("s-ar", s.cursorAutoReview)}</div>
+          <div class="toggle-row"><span>Cursor sandbox for shell commands (needs bubblewrap on Linux)</span>${switchHtml("s-sb", s.cursorSandbox)}</div>
+          <div class="muted">Heads-up: with Auto-review or the sandbox on, the Cursor SDK can't ask you about connector (MCP) tool calls in a local run, so it refuses them. Leave both off if your bots use connected apps such as the browser; your approval rules still apply to shell commands. These two switches only affect bots on Cursor.</div>
+        </div>
         <div class="row" style="display:flex;justify-content:flex-end"><button class="btn primary" id="s-save">Save</button></div>`;
       const val = (id) => {
         const v = $(id).value;
@@ -1418,13 +1454,36 @@ function openSettings(tab = "general") {
         // Same model as before: send it whole so its params (the router's fast mode) survive.
         const pick = (id, cur) => (id ? (cur?.id === id ? cur : { id }) : null);
         save({ runtime: $("#s-rt").value, defaultModel: pick(dm, s.defaultModel) ?? undefined, routerModel: pick(rm, s.routerModel), groupRouting: $("#s-routing").value, cursorAutoReview: $("#s-ar").checked, cursorSandbox: $("#s-sb").checked }).then(() => {
-          S.models = null;
+          S.modelsByRt = {};
           refreshState();
         });
       };
+      const presets = await api("GET", "/api/providers").then((r) => r.presets).catch(() => []);
+      $("#s-presets").innerHTML = `<span class="muted" style="align-self:center">Add:</span>${presets.map((pr) => `<button class="btn small" data-padd="${esc(pr.key)}">${esc(pr.label)}</button>`).join("")}`;
+      const redraw = () => refreshState().then(() => show("brain"));
+      $$("[data-padd]", body).forEach(
+        (b) =>
+          (b.onclick = async () => {
+            const created = await attempt(() => api("POST", "/api/providers", { preset: b.dataset.padd }));
+            if (!created) return;
+            await refreshState();
+            openProviderEditor(created.id, () => show("brain"));
+          }),
+      );
+      $$("[data-pedit]", body).forEach((b) => (b.onclick = () => openProviderEditor(b.dataset.pedit, () => show("brain"))));
+      $$("[data-ptest]", body).forEach((b) => (b.onclick = () => testProvider(b.dataset.ptest, b)));
+      $$("[data-pdel]", body).forEach(
+        (b) =>
+          (b.onclick = async () => {
+            const p = providerOf(b.dataset.pdel);
+            const onIt = bots().filter((x) => x.runtime === p?.id).map((x) => x.name);
+            if (!confirm(`Remove ${p?.label}? Its saved API key is deleted.${onIt.length ? ` ${onIt.join(", ")} will move to the default brain.` : ""}`)) return;
+            if (await attempt(() => api("DELETE", `/api/providers/${encodeURIComponent(b.dataset.pdel)}`))) redraw();
+          }),
+      );
     } else if (t === "approvals") {
       const rules = s.approvals.rules;
-      body.innerHTML = `<div class="muted">Bots ask before consequential actions. Shell commands are checked by a Cursor hook installed in the workspace; other actions go through the bot's request_approval tool. “Ask first” wins when rules conflict.</div>
+      body.innerHTML = `<div class="muted">Bots ask before consequential actions. Shell commands are checked by a Cursor hook installed in the workspace (for bots on Cursor) or by the gateway itself (for bots on a model provider); other actions go through the bot's request_approval tool. “Ask first” wins when rules conflict.</div>
         <div class="grid2"><div class="field">Mode<select id="a-mode"><option value="auto" ${s.approvals.mode === "auto" ? "selected" : ""}>Auto: only “ask first” rules stop shell commands</option><option value="ask" ${s.approvals.mode === "ask" ? "selected" : ""}>Ask: every shell command stops unless allowed</option><option value="off" ${s.approvals.mode === "off" ? "selected" : ""}>Off: never stop (not recommended)</option></select></div>
         <div class="field">Background approvals expire after (minutes)<input id="a-exp" type="number" min="1" value="${s.approvals.backgroundExpiryMinutes}"></div></div>
         <div class="field">Seconds a bot waits inline for your answer before ending its turn<input id="a-wait" type="number" min="0" max="120" value="${s.approvals.inlineWaitSeconds}"></div>
@@ -1533,6 +1592,199 @@ const CONNECTOR_PRESETS = {
   fetch: { description: "Fetch web pages as Markdown.", command: "uvx", args: ["mcp-server-fetch"] },
   linear: { description: "Linear issues (remote MCP; sign in to it once in the Cursor app).", type: "http", url: "https://mcp.linear.app/mcp" },
 };
+
+async function testProvider(id, button) {
+  const p = providerOf(id);
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Testing…";
+  }
+  const res = await attempt(() => api("POST", `/api/providers/${encodeURIComponent(id)}/test`));
+  if (button) {
+    button.disabled = false;
+    button.textContent = "Test";
+  }
+  if (!res) return undefined;
+  if (res.ok) toast(`${p?.label ?? id}: ${res.model ?? "model"} answered “${res.reply}” in ${(res.ms / 1000).toFixed(1)}s`);
+  else toast(`${p?.label ?? id}: ${res.error}`, "error", 9000);
+  return res;
+}
+
+/** Edit one model provider: endpoint, key (write-only), limits, tool calling and its models. */
+function openProviderEditor(id, done) {
+  const p0 = providerOf(id);
+  if (!p0) return;
+  let models = (p0.models ?? []).map((x) => ({ ...x }));
+  const m = modal({ title: p0.label, body: "", wide: true, foot: '<button class="btn" id="pe-test">Save and test</button><button class="btn primary" id="pe-save">Save</button>' });
+  const body = $(".modal-body", m.el);
+  const toolOpts = (cur, withDefault) =>
+    [withDefault ? ["", "Provider default"] : null, ["auto", "Auto (native, falls back to text)"], ["native", "Native function calling"], ["prompt", "Text tool calls (for models without function calling)"], ["none", "No tools (chat only)"]]
+      .filter(Boolean)
+      .map(([v, l]) => `<option value="${v}" ${(cur ?? "") === v ? "selected" : ""}>${esc(l)}</option>`)
+      .join("");
+  const modelRow = (x, i) => `<div class="list-row" style="align-items:flex-start"><div class="grow">
+      <div class="t mono">${esc(x.id)}</div>
+      <div class="s" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <label>Context <input type="number" min="1024" data-m="contextWindow" data-i="${i}" value="${x.contextWindow ?? ""}" placeholder="tokens" style="width:90px"></label>
+        <label>Max reply <input type="number" min="64" data-m="maxOutputTokens" data-i="${i}" value="${x.maxOutputTokens ?? ""}" placeholder="tokens" style="width:80px"></label>
+        <label>Cost <input type="number" min="1" data-m="concurrencyCost" data-i="${i}" value="${x.concurrencyCost ?? ""}" placeholder="1" style="width:50px"></label>
+        <label><input type="checkbox" data-m="vision" data-i="${i}" ${x.vision ? "checked" : ""}> images</label>
+        <label>Tools <select data-m="toolMode" data-i="${i}">${toolOpts(x.toolMode, true)}</select></label>
+      </div>
+      <details><summary class="muted">Extra request fields (JSON)</summary><textarea class="mono" rows="2" data-m="extraBody" data-i="${i}" placeholder='{"chat_template_kwargs": {"enable_thinking": false}}'>${esc(x.extraBody ? JSON.stringify(x.extraBody) : "")}</textarea></details>
+    </div><button class="btn small danger" data-mdel="${i}" title="Remove">✕</button></div>`;
+  // Keep edits in the model rows when the list is redrawn.
+  const syncModels = () => {
+    $$("[data-m]", body).forEach((el) => {
+      const x = models[Number(el.dataset.i)];
+      if (!x) return;
+      const k = el.dataset.m;
+      if (k === "vision") x.vision = el.checked || undefined;
+      else if (k === "toolMode") x.toolMode = el.value || undefined;
+      else if (k === "extraBody") x.extraBody = el.value.trim() || undefined;
+      else x[k] = el.value === "" ? undefined : Number(el.value);
+    });
+  };
+  const modelChoices = (cur, blank) => `${blank ? `<option value="">${esc(blank)}</option>` : ""}${models.map((x) => `<option value="${esc(x.id)}" ${cur === x.id ? "selected" : ""}>${esc(x.label || x.id)}</option>`).join("")}`;
+  const drawModels = () => {
+    $("#pe-models", body).innerHTML = models.length ? models.map(modelRow).join("") : '<div class="muted">No models yet: add one by id or search the catalogue.</div>';
+    const def = $("#pe-default", body).value || providerOf(id)?.defaultModel || models[0]?.id;
+    const router = $("#pe-router", body).value || providerOf(id)?.routerModel || "";
+    $("#pe-default", body).innerHTML = modelChoices(def, models.length ? "" : "Add a model first");
+    $("#pe-router", body).innerHTML = modelChoices(router, "Same as the default model");
+    $$("[data-mdel]", body).forEach(
+      (b) =>
+        (b.onclick = () => {
+          syncModels();
+          models.splice(Number(b.dataset.mdel), 1);
+          drawModels();
+        }),
+    );
+  };
+  const addModel = (x) => {
+    syncModels();
+    if (models.some((y) => y.id === x.id)) return toast(`${x.id} is already listed`);
+    models.push(x);
+    drawModels();
+  };
+  const p = p0;
+  body.innerHTML = `<div class="grid2"><div class="field">Name<input id="pe-label" value="${esc(p.label)}"></div><div class="field">Base URL<input id="pe-url" value="${esc(p.baseUrl)}" placeholder="https://api.example.com/v1"></div></div>
+    <div class="field">API key <span class="muted" id="pe-key-state">${p.hasKey ? `saved${p.keySource === "environment" ? ` (from ${esc(p.keyEnv ?? "the environment")})` : ""}` : p.needsKey ? "not set yet" : "not needed for a local server"}</span>
+      <div class="row" style="display:flex;gap:6px"><input id="pe-key" type="password" autocomplete="off" placeholder="${p.hasKey ? "Paste a new key to replace the saved one" : "Paste your API key"}" style="flex:1"><button class="btn small" id="pe-key-save">Save key</button><button class="btn small danger" id="pe-key-del" ${p.keySource === "saved" ? "" : "hidden"}>Remove key</button></div>
+      <div class="muted">Stored encrypted on this computer, never shown again, and kept away from bots (they can't read it with any tool).</div></div>
+    <div class="grid2">
+      <div class="field">Concurrency: requests (or plan units) at once<input id="pe-conc" type="number" min="1" value="${p.maxConcurrency}"></div>
+      <div class="field">Tool calling<select id="pe-tools">${toolOpts(p.toolMode, false)}</select></div>
+      <div class="field">Reply-length field<select id="pe-mtp"><option value="max_tokens" ${p.maxTokensParam !== "max_completion_tokens" ? "selected" : ""}>max_tokens (most providers)</option><option value="max_completion_tokens" ${p.maxTokensParam === "max_completion_tokens" ? "selected" : ""}>max_completion_tokens (OpenAI, xAI, Groq)</option></select></div>
+      <div class="field">Context window when a model doesn't say (tokens)<input id="pe-ctx" type="number" min="1024" value="${p.defaultContextWindow ?? ""}" placeholder="32768"></div>
+    </div>
+    <div class="toggle-row"><span>Enabled</span>${switchHtml("pe-enabled", p.enabled)}</div>
+    <div class="d-section"><h4>Models</h4>
+      <div id="pe-models"></div>
+      <div class="row" style="display:flex;gap:6px;margin-top:8px"><input id="pe-add-id" placeholder="Model id, e.g. Qwen/Qwen3-32B" style="flex:1"><button class="btn small" id="pe-add">Add by id</button></div>
+      <div class="row" style="display:flex;gap:6px;margin-top:6px"><input id="pe-search" placeholder="Search the provider's catalogue (e.g. qwen3, kimi, llama)" style="flex:1"><button class="btn small" id="pe-browse">Search</button></div>
+      <div id="pe-catalog" style="max-height:260px;overflow:auto"></div>
+      <div class="grid2"><div class="field">Default model<select id="pe-default"></select></div><div class="field">Routing model (when this is the default brain)<select id="pe-router"></select></div></div>
+    </div>
+    <details><summary>Advanced</summary>
+      <div class="field">Extra request headers (JSON; not for the key)<textarea id="pe-headers" class="mono" rows="3">${esc(p.headers ? JSON.stringify(p.headers, null, 2) : "")}</textarea></div>
+      <div class="field">Environment variable to read the key from when none is saved<input id="pe-env" value="${esc(p.keyEnv ?? "")}" placeholder="FEATHERLESS_API_KEY"></div>
+    </details>`;
+  drawModels();
+  const collect = () => {
+    syncModels();
+    let headers;
+    const ht = $("#pe-headers", body).value.trim();
+    if (ht) {
+      try {
+        headers = JSON.parse(ht);
+      } catch {
+        throw new Error("Extra request headers must be JSON, e.g. {\"X-Title\": \"My team\"}");
+      }
+    }
+    return {
+      label: $("#pe-label", body).value,
+      baseUrl: $("#pe-url", body).value,
+      maxConcurrency: Number($("#pe-conc", body).value) || 1,
+      toolMode: $("#pe-tools", body).value,
+      maxTokensParam: $("#pe-mtp", body).value,
+      defaultContextWindow: $("#pe-ctx", body).value ? Number($("#pe-ctx", body).value) : null,
+      enabled: $("#pe-enabled", body).checked,
+      headers: headers ?? null,
+      keyEnv: $("#pe-env", body).value.trim() || null,
+      defaultModel: $("#pe-default", body).value || null,
+      routerModel: $("#pe-router", body).value || null,
+      models,
+    };
+  };
+  const saveAll = async () => {
+    const saved = await attempt(async () => api("PATCH", `/api/providers/${encodeURIComponent(id)}`, collect()));
+    if (!saved) return false;
+    await refreshState();
+    S.modelsByRt = {};
+    return true;
+  };
+  $("#pe-save", m.el).onclick = async () => {
+    if (await saveAll()) {
+      toast("Saved");
+      m.close();
+      done?.();
+    }
+  };
+  $("#pe-test", m.el).onclick = async (e) => {
+    if (await saveAll()) await testProvider(id, e.target);
+    e.target.textContent = "Save and test";
+  };
+  $("#pe-key-save", body).onclick = async () => {
+    const v = $("#pe-key", body).value.trim();
+    if (!v) return toast("Paste the key first", "error");
+    if (!(await attempt(() => api("PUT", `/api/providers/${encodeURIComponent(id)}/key`, { value: v })))) return;
+    $("#pe-key", body).value = "";
+    $("#pe-key-state", body).textContent = "saved";
+    $("#pe-key-del", body).hidden = false;
+    await refreshState();
+    toast("Key saved");
+  };
+  $("#pe-key-del", body).onclick = async () => {
+    if (!confirm("Remove the saved key?")) return;
+    if (!(await attempt(() => api("DELETE", `/api/providers/${encodeURIComponent(id)}/key`)))) return;
+    $("#pe-key-state", body).textContent = "not set";
+    $("#pe-key-del", body).hidden = true;
+    await refreshState();
+  };
+  $("#pe-add", body).onclick = async () => {
+    const mid = $("#pe-add-id", body).value.trim();
+    if (!mid) return;
+    // Save the URL first so the lookup goes to the right place.
+    const found = await api("GET", `/api/providers/${encodeURIComponent(id)}/lookup?model=${encodeURIComponent(mid)}`).catch(() => null);
+    if (found?.model) addModel(found.model);
+    else {
+      addModel({ id: mid });
+      toast("Couldn't look that model up; added it as typed. Fill in its context window.", "info", 6000);
+    }
+    $("#pe-add-id", body).value = "";
+  };
+  const browse = async () => {
+    const q = $("#pe-search", body).value.trim();
+    const out = $("#pe-catalog", body);
+    out.innerHTML = '<div class="muted">Searching…</div>';
+    const res = await attempt(() => api("GET", `/api/providers/${encodeURIComponent(id)}/catalog?search=${encodeURIComponent(q)}`));
+    const list = (res?.models ?? []).slice(0, 80);
+    out.innerHTML = list.length
+      ? list
+          .map(
+            (x, i) =>
+              `<div class="list-row"><div class="grow"><div class="t mono">${esc(x.id)}</div><div class="s">${[x.contextWindow ? `${x.contextWindow} tokens` : "", x.concurrencyCost ? `cost ${x.concurrencyCost}` : "", x.vision ? "images" : "", x.toolUse ? "tool use" : ""].filter(Boolean).join(" · ")}</div></div><button class="btn small" data-cadd="${i}">Add</button></div>`,
+          )
+          .join("") + ((res?.models ?? []).length > 80 ? '<div class="muted">More results: narrow the search.</div>' : "")
+      : '<div class="muted">Nothing found (check the key and URL, or search for something else).</div>';
+    $$("[data-cadd]", out).forEach((b) => (b.onclick = () => addModel({ ...list[Number(b.dataset.cadd)] })));
+  };
+  $("#pe-browse", body).onclick = browse;
+  $("#pe-search", body).onkeydown = (e) => {
+    if (e.key === "Enter") browse();
+  };
+}
 
 function openConnectors() {
   const m = modal({ title: "Connect apps", body: "", wide: true });
@@ -1880,6 +2132,14 @@ function handleEvent(ev) {
       }
       break;
     }
+    case "run.status": {
+      const l = S.live[ev.botId];
+      if (l && l.runId === ev.runId) {
+        l.status = ev.status;
+        if (ev.convId === S.current) scheduleLive();
+      }
+      break;
+    }
     case "run.tool": {
       const l = S.live[ev.botId];
       if (l && l.runId === ev.runId) {
@@ -1915,6 +2175,10 @@ function handleEvent(ev) {
       break;
     case "skills.updated":
     case "connectors.updated":
+      refreshState();
+      break;
+    case "providers.updated":
+      S.modelsByRt = {};
       refreshState();
       break;
     case "notice":

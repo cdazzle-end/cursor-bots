@@ -13,6 +13,8 @@ export type HarnessEvent =
   | { type: "run.delta"; botId: string; convId: string; runId: string; text: string }
   | { type: "run.thinking"; botId: string; convId: string; runId: string; text: string }
   | { type: "run.tool"; botId: string; convId: string; runId: string; item: unknown }
+  /** What a running turn is waiting on (e.g. a provider's capacity), shown in the typing bubble. */
+  | { type: "run.status"; botId: string; convId: string; runId: string; status: string }
   | { type: "run.finished"; botId: string; convId: string; runId: string; status: string; error?: string }
   | { type: "approval.updated"; approval: unknown }
   | { type: "secretRequest.updated"; request: unknown }
@@ -21,6 +23,7 @@ export type HarnessEvent =
   | { type: "settings.updated"; settings: unknown }
   | { type: "skills.updated" }
   | { type: "connectors.updated" }
+  | { type: "providers.updated" }
   | { type: "notice"; level: "info" | "warn" | "error"; text: string; botId?: string };
 
 export interface BotStatus {

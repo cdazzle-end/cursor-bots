@@ -330,6 +330,8 @@ export interface ProviderConfig {
   routerModel?: string;
   /** Context window assumed for models that don't say. */
   defaultContextWindow?: number;
+  /** Environment variable to read the key from (once, at startup) when none is stored. */
+  keyEnv?: string;
   models: ProviderModel[];
   createdAt: number;
   updatedAt: number;

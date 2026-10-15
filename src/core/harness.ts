@@ -22,6 +22,7 @@ import type {
   Id,
   Message,
   ModelChoice,
+  ProviderConfig,
   Routine,
   RoutineRun,
   SecretRequest,
@@ -32,6 +33,7 @@ import type {
 } from "./types.ts";
 import { colorFor, hostTimezone, mimeFor, newId, oneLine, readJson, resolveInside, slugify, stripMarkdown, writeJson } from "./util.ts";
 import { insideAny } from "./guard.ts";
+import { cleanProvider, fromPreset, isLocalUrl, providerKeyName } from "./providers.ts";
 import { ensureBotFolder, prepareWorkspace, type GateConfig } from "./workspace.ts";
 import type { AgentRuntime, McpServerSpec, RunOutcome } from "../runtimes/types.ts";
 
@@ -48,7 +50,18 @@ const RESERVED_HANDLES = new Set(["user", "me", "everyone", "all", "here", "boss
 export interface HarnessOptions {
   home: string;
   runtimes: AgentRuntime[];
+  /** Builds the runtime for a model provider (the CLI passes the OpenAI-compatible runtime; tests pass fakes). */
+  providerRuntime?: ProviderRuntimeFactory;
 }
+
+export type ProviderRuntimeFactory = (deps: {
+  /** The provider's live config. */
+  provider: () => ProviderConfig;
+  /** Its API key, if one is stored (or came from its environment variable). */
+  apiKey: () => string | undefined;
+  /** Where its transcripts go (state/agents). */
+  transcriptDir: string;
+}) => AgentRuntime;
 
 export interface BotInput {
   name: string;
@@ -94,6 +107,10 @@ export class Harness {
   readonly providerKeys: SecretVault;
   /** Provider keys that came from environment variables (removed from bots' child environments). */
   private providerKeyEnvNames = new Set<string>();
+  /** Keys read from those environment variables, by provider id. */
+  private envProviderKeys = new Map<Id, string>();
+  private providerFactory?: ProviderRuntimeFactory;
+  private providerRuntimes = new Map<Id, AgentRuntime>();
   readonly gateToken: string;
   /** Bearer token for the Team MCP endpoint (/mcp) that outside agents use. */
   readonly mcpToken: string;
@@ -119,6 +136,7 @@ export class Harness {
   constructor(opts: HarnessOptions) {
     this.store = new Store(opts.home);
     for (const rt of opts.runtimes) this.runtimes.set(rt.id, rt);
+    this.providerFactory = opts.providerRuntime;
     this.skills = new SkillLibrary(this.store.paths.workspace, this.store.paths.skills);
     this.vault = new SecretVault(this.store.paths);
     this.providerKeys = new SecretVault({
@@ -144,6 +162,7 @@ export class Harness {
         if (dm) this.postMessage({ convId: dm.id, author: { kind: "bot", id: botId }, kind: "notice", text });
       },
     });
+    this.syncProviders();
   }
 
   // ------------------------------------------------------------------ lifecycle
@@ -230,6 +249,167 @@ export class Harness {
     const ok = rt.available();
     if (!ok.ok) throw new Error(`Runtime "${rt.id}" is not available: ${ok.reason}`);
     return rt;
+  }
+
+  // ------------------------------------------------------------------ model providers
+
+  /** Make the runtimes match settings.providers: add new ones, drop removed ones. */
+  syncProviders(): void {
+    const ids = new Set(this.store.settings.providers.map((p) => p.id));
+    for (const [id, rt] of this.providerRuntimes) {
+      if (ids.has(id)) continue;
+      this.providerRuntimes.delete(id);
+      this.runtimes.delete(id);
+      void rt.dispose?.();
+    }
+    for (const p of this.store.settings.providers) {
+      // A key in an environment variable is read once and taken out of the environment bots inherit.
+      const fromEnv = p.keyEnv ? process.env[p.keyEnv] : undefined;
+      if (p.keyEnv && fromEnv) {
+        this.envProviderKeys.set(p.id, fromEnv);
+        this.providerKeyEnvNames.add(p.keyEnv);
+        delete process.env[p.keyEnv];
+      }
+      if (!this.providerFactory || this.providerRuntimes.has(p.id) || this.runtimes.has(p.id)) continue;
+      const id = p.id;
+      const rt = this.providerFactory({
+        provider: () => this.store.settings.providers.find((x) => x.id === id) ?? p,
+        apiKey: () => this.providerKey(id),
+        transcriptDir: this.store.paths.agents,
+      });
+      this.providerRuntimes.set(id, rt);
+      this.runtimes.set(id, rt);
+    }
+  }
+
+  private providerKey(id: Id): string | undefined {
+    const name = providerKeyName(id);
+    return this.providerKeys.resolve([name])[name] || this.envProviderKeys.get(id);
+  }
+
+  provider(id: Id): ProviderConfig {
+    const p = this.store.settings.providers.find((x) => x.id === id);
+    if (!p) throw new Error("No such provider");
+    return p;
+  }
+
+  /** Providers as the UI sees them: config plus whether a key is set (never the key). */
+  describeProviders() {
+    return this.store.settings.providers.map((p) => ({
+      ...p,
+      hasKey: this.providerKeys.has(providerKeyName(p.id)) || this.envProviderKeys.has(p.id),
+      keySource: this.providerKeys.has(providerKeyName(p.id)) ? "saved" : this.envProviderKeys.has(p.id) ? "environment" : undefined,
+      needsKey: !isLocalUrl(p.baseUrl),
+    }));
+  }
+
+  private providersChanged(): void {
+    this.store.saveSettings();
+    this.syncProviders();
+    this.bus.emit({ type: "settings.updated", settings: this.store.settings });
+    this.bus.emit({ type: "providers.updated" });
+  }
+
+  createProvider(input: Record<string, any>): ProviderConfig {
+    const base = input?.preset ? { ...fromPreset(String(input.preset)), ...stripUndefined(input) } : input;
+    const taken = new Set([...this.runtimes.keys(), ...this.store.settings.providers.map((p) => p.id)]);
+    const p = cleanProvider(base, undefined, taken);
+    this.store.settings.providers.push(p);
+    this.providersChanged();
+    return p;
+  }
+
+  updateProvider(id: Id, patch: Record<string, any>): ProviderConfig {
+    const list = this.store.settings.providers;
+    const i = list.findIndex((p) => p.id === id);
+    if (i < 0) throw new Error("No such provider");
+    const before = list[i]!;
+    const next = cleanProvider(patch, before, new Set());
+    list[i] = next;
+    this.providersChanged();
+    // Another endpoint is another service: start bots on it with a fresh context.
+    if (next.baseUrl !== before.baseUrl) {
+      for (const b of this.store.bots.values()) if ((b.runtime || this.store.settings.runtime) === id) void this.runners.get(b.id)?.resetSession();
+    }
+    return next;
+  }
+
+  /** Remove a provider. Bots that ran on it move to the default brain and are told so. */
+  async deleteProvider(id: Id): Promise<void> {
+    const p = this.provider(id);
+    this.store.settings.providers = this.store.settings.providers.filter((x) => x.id !== id);
+    if (this.store.settings.runtime === id) this.store.settings.runtime = this.runtimes.has("cursor") ? "cursor" : [...this.runtimes.keys()].find((k) => k !== id) ?? "cursor";
+    this.providerKeys.remove(providerKeyName(id));
+    this.envProviderKeys.delete(id);
+    for (const b of this.store.bots.values()) {
+      const onIt = (b.runtime || "") === id;
+      if (onIt) {
+        b.runtime = undefined;
+        if (b.modelRuntime === id) {
+          b.model = undefined;
+          b.modelRuntime = undefined;
+        }
+        await this.runners.get(b.id)?.resetSession();
+        const dm = this.store.dmFor(b.id);
+        if (dm) this.postNotice(dm.id, `${p.label} was removed, so ${b.name} now runs on the default brain. Its memory is kept; its conversation context starts fresh.`);
+        this.bus.emit({ type: "bot.updated", bot: this.describeBot(b) });
+      }
+    }
+    this.store.saveBots();
+    this.providersChanged();
+  }
+
+  setProviderKey(id: Id, value: string): void {
+    const p = this.provider(id);
+    const v = String(value ?? "").trim();
+    if (!v) throw new Error("Paste the API key.");
+    if (v.length > 4000 || /\s/.test(v)) throw new Error("That doesn't look like an API key.");
+    this.providerKeys.set(providerKeyName(id), v, `API key for ${p.label}`);
+    this.providersChanged();
+  }
+
+  clearProviderKey(id: Id): void {
+    this.provider(id);
+    this.providerKeys.remove(providerKeyName(id));
+    this.providersChanged();
+  }
+
+  private providerRuntime(id: Id): AgentRuntime {
+    this.provider(id);
+    const rt = this.runtimes.get(id);
+    if (!rt) throw new Error("This provider isn't loaded (no provider runtime is configured).");
+    return rt;
+  }
+
+  async providerCatalog(id: Id, search?: string) {
+    const rt = this.providerRuntime(id);
+    if (!rt.fetchModels) return [];
+    return rt.fetchModels({ search: search?.trim() || undefined });
+  }
+
+  async providerLookup(id: Id, model: string) {
+    const rt = this.providerRuntime(id);
+    return rt.lookupModel ? rt.lookupModel(model) : undefined;
+  }
+
+  /** Send a tiny prompt to check the key, the URL and the default model. */
+  async testProvider(id: Id): Promise<{ ok: boolean; reply?: string; error?: string; ms: number; model?: string }> {
+    const rt = this.providerRuntime(id);
+    const p = this.provider(id);
+    const started = Date.now();
+    const avail = rt.available();
+    if (!avail.ok) return { ok: false, error: avail.reason, ms: 0 };
+    if (!rt.complete) return { ok: false, error: "This brain can't run a test prompt.", ms: 0 };
+    const model = p.defaultModel || p.models[0]?.id;
+    try {
+      const reply = await Promise.race([
+        rt.complete("Reply with the single word OK.", { model: model ? { id: model } : undefined }),
+        new Promise<string>((_, reject) => setTimeout(() => reject(new Error("No answer within 90 seconds (a cold model can take longer to load).")), 90_000)),
+      ]);
+      return { ok: true, reply: oneLine(reply, 200), ms: Date.now() - started, model };
+    } catch (err) {
+      return { ok: false, error: String((err as Error)?.message ?? err), ms: Date.now() - started, model };
+    }
   }
 
   /** The model a bot uses on a runtime: its own pick if made for that runtime, else the runtime's default. */
@@ -1040,8 +1220,10 @@ export class Harness {
       (conv.lead ? `Lead: @${this.store.bots.get(conv.lead)?.handle}\n` : "") +
       `Recent messages:\n${recent || "(none)"}\n\n<message>${msg.text}</message>\n\nCandidates:\n${candidates}\n\n` +
       `Answer with only the handle (without @) of the one teammate who should respond, or "everyone" if each of them must respond.`;
+    // A provider picks its own routing model (its routerModel or default); Cursor uses settings.routerModel.
+    const isProvider = this.store.settings.providers.some((p) => p.id === rt.id);
     const answer = await Promise.race([
-      rt.complete(prompt, { model: this.store.settings.routerModel }),
+      rt.complete(prompt, { model: isProvider ? undefined : this.store.settings.routerModel }),
       new Promise<string>((_, reject) => setTimeout(() => reject(new Error("routing timeout")), 25_000)),
     ]);
     const a = answer.toLowerCase();
@@ -1744,11 +1926,17 @@ export class Harness {
       connectors: Object.fromEntries(
         Object.entries(s.connectors).map(([k, c]) => [k, { ...c, env: c.env ? Object.fromEntries(Object.keys(c.env).map((e) => [e, "•••"])) : undefined, headers: c.headers ? Object.fromEntries(Object.keys(c.headers).map((h) => [h, "•••"])) : undefined }]),
       ),
-      runtimes: [...this.runtimes.values()].map((r) => ({ id: r.id, label: r.label, ...r.available() })),
+      runtimes: [...this.runtimes.values()].map((r) => ({ id: r.id, label: r.label, provider: this.providerRuntimes.has(r.id), ...r.available() })),
+      providers: this.describeProviders(),
       workspace: s.paths.workspace,
       home: s.paths.home,
       mcpToken: this.mcpToken,
       avatarShapes: AVATAR_SHAPES,
     };
   }
+}
+
+/** Drop undefined fields so a preset's values aren't overwritten by missing ones. */
+function stripUndefined<T extends Record<string, unknown>>(o: T): Partial<T> {
+  return Object.fromEntries(Object.entries(o ?? {}).filter(([, v]) => v !== undefined)) as Partial<T>;
 }

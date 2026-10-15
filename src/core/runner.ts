@@ -411,6 +411,8 @@ export class BotRunner {
             if (prev && prev.summary && !item.summary) item.summary = prev.summary;
             state.activity.set(ev.callId, item);
             h.bus.emit({ type: "run.tool", botId: bot.id, convId: conv.id, runId: state.runId, item });
+          } else if (ev.type === "status") {
+            h.bus.emit({ type: "run.status", botId: bot.id, convId: conv.id, runId: state.runId, status: ev.status });
           } else if (ev.type === "summary") {
             // The runtime compacted its context; re-send identity and memory next turn.
             this.needIdentity = true;
