@@ -40,12 +40,42 @@ if (mode === "tool") {
   };
   const roots = [...new Set((cfg.protect ?? []).flatMap((p) => [path.resolve(p), real(path.resolve(p))]))];
   const cwd = input.cwd || (input.workspace_roots ?? [])[0] || process.cwd();
-  const ws = real(path.resolve(cfg.workspace || cwd));
-  const inside = (abs) => roots.some((r) => abs === r || abs.startsWith(r + path.sep));
+  // The workspace as configured and as it really is (the home folder may sit behind a symlink).
+  const wsGiven = path.resolve(cfg.workspace || cwd);
+  const wss = [...new Set([wsGiven, real(wsGiven)])];
+  // "a is b or below b" (careful with "/", whose children don't start with "//").
+  const under = (a, b) => a === b || a.startsWith(b.endsWith(path.sep) ? b : b + path.sep);
+  const inWs = (p) => wss.some((w) => under(p, w));
+  const inside = (abs) => roots.some((r) => under(abs, r));
   // Search and listing tools walk directories: a target that contains protected state
   // outside the workspace (e.g. a link to the home folder) is as bad as one inside it.
-  const walks = /^(Grep|Glob|List|LS)$/.test(String(input.tool_name ?? ""));
-  const contains = (abs) => roots.some((r) => !(r === ws || r.startsWith(ws + path.sep)) && r.startsWith(abs + path.sep));
+  const tool = String(input.tool_name ?? "");
+  const walks = /^(Grep|Glob|List|LS)$/.test(tool);
+  const contains = (abs) => roots.some((r) => !inWs(r) && r !== abs && under(r, abs));
+  // Grep runs ripgrep with --follow, so a symlink anywhere under the searched folder can lead
+  // into the gateway's state. Look for one (skipping what .cursorignore hides from ripgrep too).
+  const leakingLink = (dir) => {
+    const stack = [dir];
+    let seen = 0;
+    while (stack.length) {
+      let entries;
+      const d = stack.pop();
+      try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { continue; }
+      for (const e of entries) {
+        if (++seen > 200000) return "(too many files to check)";
+        const p = path.join(d, e.name);
+        if (e.isSymbolicLink()) {
+          // Resolve the link's own target (it may not exist yet), then any links along that path.
+          let r;
+          try { r = real(path.resolve(path.dirname(p), fs.readlinkSync(p))); } catch { r = real(p); }
+          if (inside(r) || contains(r)) return p;
+        } else if (e.isDirectory() && e.name !== "node_modules" && e.name !== ".browser") {
+          stack.push(p);
+        }
+      }
+    }
+    return undefined;
+  };
   const hits = [];
   const visit = (v) => {
     if (typeof v === "string") {
@@ -59,6 +89,15 @@ if (mode === "tool") {
     }
   };
   visit(input.tool_input);
+  if (!hits.length && tool === "Grep") {
+    const ti = input.tool_input ?? {};
+    const target = [ti.path, ti.file_path, ti.target_directory, ti.directory].find((x) => typeof x === "string" && x);
+    const dir = path.resolve(cwd, target ?? ".");
+    let isDir = false;
+    try { isDir = fs.statSync(dir).isDirectory(); } catch {}
+    const link = isDir ? leakingLink(dir) : undefined;
+    if (link) hits.push(link);
+  }
   if (hits.length) {
     done({
       permission: "deny",
@@ -122,10 +161,28 @@ export function prepareWorkspace(paths: HomePaths, gate: GateConfig, opts: { onl
   const agentsMd = path.join(paths.workspace, "AGENTS.md");
   if (!fs.existsSync(agentsMd)) writeFileAtomic(agentsMd, DEFAULT_AGENTS_MD);
   // Browser profiles hold thousands of files; keep them out of Cursor's workspace scans and search.
+  // (The gate skips the same folders when it checks a search for symlinks, so these two lines must stay.)
   const ignore = path.join(paths.workspace, ".cursorignore");
-  if (!fs.existsSync(ignore)) writeFileAtomic(ignore, "# Managed by Cursor Bots; add your own patterns below.\n.browser/\n**/node_modules/\n");
+  let ignoreText = "";
+  try {
+    ignoreText = fs.readFileSync(ignore, "utf8");
+  } catch {
+    ignoreText = "# Managed by Cursor Bots; add your own patterns below.\n";
+  }
+  const lines = ignoreText.split(/\r?\n/);
+  const missing = [".browser/", "**/node_modules/"].filter((l) => !lines.includes(l));
+  if (missing.length) writeFileAtomic(ignore, `${ignoreText.replace(/\n*$/, "\n")}${missing.join("\n")}\n`);
   writeIfChanged(path.join(paths.rulesDir, "cursor-bots.mdc"), HARNESS_MANUAL, quick);
   ensureSearchIgnore(paths.workspace);
+  // If a search ever does wander into the gateway's own folders, ripgrep skips everything there.
+  for (const dir of [paths.state, paths.cursorStore, paths.logs, paths.hooksDir]) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      writeIfChanged(path.join(dir, ".ignore"), "*\n", quick);
+    } catch {
+      // Best effort.
+    }
+  }
 
   const gateFile = path.join(paths.hooksDir, "cursor-bots-gate.mjs");
   writeIfChanged(gateFile, gateScript(gate), quick);

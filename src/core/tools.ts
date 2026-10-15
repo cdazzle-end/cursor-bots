@@ -372,6 +372,7 @@ const TOOLS: ToolSpec[] = [
         origin,
         waitSeconds: h.store.settings.approvals.inlineWaitSeconds * 2,
         resume: h.resumeFor(state.wake),
+        active: () => !state.cancelled,
       });
       if (res.permission === "allow") return "Approved. Go ahead with exactly what you described.";
       return res.reason === "pending" ? res.message : { text: res.message, isError: true };
@@ -430,6 +431,7 @@ const TOOLS: ToolSpec[] = [
         origin,
         waitSeconds: h.store.settings.approvals.inlineWaitSeconds,
         resume: h.resumeFor(state.wake),
+        active: () => !state.cancelled,
       });
       if (gate.permission === "deny") return { text: gate.message, isError: gate.reason !== "pending" };
       let cwd = h.store.paths.workspace;

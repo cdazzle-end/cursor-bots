@@ -1450,6 +1450,7 @@ export class Harness {
       ...["mcp.json", "mcp-approvals.json", "cli.json", "cli-config.json", "permissions.json", "sandbox.json"].map((f) => path.join(dotCursor, f)),
       // Keeps the gateway's secret files out of searches that follow symlinks.
       path.join(p.workspace, ".rgignore"),
+      path.join(p.workspace, ".cursorignore"),
     ];
   }
 
@@ -1465,8 +1466,12 @@ export class Harness {
       }
     }
     t = t.replace(/^~(?=$|[\\/])/, os.homedir()).replace(/^(\$\{HOME\}|\$HOME)(?=$|[\\/])/, os.homedir());
-    const abs = path.resolve(this.store.paths.workspace, t);
-    const candidates = [abs, realPrefix(abs)];
+    // The SDK resolves a relative working directory against this process's cwd, not the workspace: check both.
+    const bases = path.isAbsolute(t) ? [this.store.paths.workspace] : [this.store.paths.workspace, process.cwd()];
+    const candidates = bases.flatMap((b) => {
+      const abs = path.resolve(b, t);
+      return [abs, realPrefix(abs)];
+    });
     return this.protectedPaths().some((root) => {
       const roots = [root, realPrefix(root)];
       return candidates.some((c) => roots.some((r) => c === r || c.startsWith(r + path.sep)));
@@ -1486,11 +1491,15 @@ export class Harness {
     if (/\b(secret\.key|secrets\.vault|ui\.token|mcp\.token|gate\.token|cursor-store|cursor-bots-gate|cursor-bots\.mdc)\b/.test(cmd)) return true;
     // Relative to the workspace (the bots' cwd); another project's .cursor folder is fine to touch.
     if (/(^|[\s'"=:(;&|]|\.\/)\.cursor\/(hooks\b|hooks\.json|mcp\.json|mcp-approvals\.json|cli\.json|cli-config\.json|permissions\.json|sandbox\.json)/.test(cmd)) return true;
-    if (/(^|[\s'"=:(;&|]|\.\/)\.rgignore\b/.test(cmd)) return true;
+    if (/(^|[\s'"=:(;&|]|\.\/)\.(rgignore|cursorignore)\b/.test(cmd)) return true;
     if (/\.\.\/+(state|settings\.json|connectors\.json)\b/.test(cmd)) return true;
     // The gateway's port with any host in front (loopback spellings, the address it's bound to, a LAN IP).
     if (this.gatewayPort && new RegExp(`[\\w\\]]:${this.gatewayPort}(?!\\d)`).test(cmd)) return true;
-    if (this.gatewayHost && !["127.0.0.1", "localhost", "::1", "0.0.0.0", "::"].includes(this.gatewayHost) && cmd.includes(this.gatewayHost)) return true;
+    if (this.gatewayHost && !["127.0.0.1", "localhost", "::1", "0.0.0.0", "::"].includes(this.gatewayHost)) {
+      // The bound address as a whole token (192.168.1.5, not 192.168.1.50), on the gateway's port.
+      const host = this.gatewayHost.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (new RegExp(`(?<![\\w.:-])\\[?${host}\\]?:${this.gatewayPort}(?!\\d)`).test(cmd)) return true;
+    }
     return false;
   }
 
@@ -1530,6 +1539,7 @@ export class Harness {
       origin: cur && ["user", "approval", "system"].includes(cur.wake.source) ? "foreground" : "background",
       waitSeconds: this.store.settings.approvals.inlineWaitSeconds,
       resume: cur ? this.resumeFor(cur.wake) : undefined,
+      active: cur ? () => !cur.cancelled : undefined,
     });
     if (res.permission === "allow") return { permission: "allow" };
     return {

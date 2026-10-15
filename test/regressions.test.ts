@@ -789,3 +789,70 @@ test("chat markdown: a deeper-indented ``` inside code is content; inline ``` co
   assert.equal(renderMarkdown("```python\n" + py + "\n```"), `<pre><code>${py.replace(/>/g, "&gt;").replace(/"/g, "&quot;")}</code></pre>`);
   assert.equal(renderMarkdown("- item\n  ```npm i``` to install\n- two"), "<ul><li>item ``<code>npm i</code>`` to install</li><li>two</li></ul>");
 });
+
+test("stopping a bot while it waits on an approval card: your later decision wakes it and keeps the grant", async () => {
+  const { h, cleanup } = await makeHarness({ settings: (x) => (x.store.settings.approvals.inlineWaitSeconds = 3) });
+  try {
+    const bot = h.createBot({ name: "Mailer" });
+    const dm = h.store.dmFor(bot.id)!;
+    await h.postUserMessage(dm.id, { text: '[[tool request_approval {"action":"Send the newsletter"}]] [[reply sent it]]' });
+    await until(() => h.approvals.pendingFor(bot.id).length === 1);
+    await h.postUserMessage(dm.id, { text: "stop" });
+    await until(() => h.runner(bot.id).status().state !== "working");
+    const before = texts(h, dm.id).filter((t) => t.startsWith("@mailer")).length;
+    const a = h.decideApproval(h.approvals.pendingFor(bot.id)[0]!.id, "once");
+    await settle(h);
+    assert.equal(texts(h, dm.id).filter((t) => t.startsWith("@mailer")).length, before + 1, "the decision woke the bot");
+    assert.notEqual(h.store.approvals.get(a.id)!.consumed, true, "the stopped turn didn't use up the grant");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("a home folder behind a symlink: bots can still search their workspace", async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "cb-linkhome-"));
+  fs.mkdirSync(path.join(base, "real"));
+  fs.symlinkSync(path.join(base, "real"), path.join(base, "home"));
+  const h = new Harness({ home: path.join(base, "home"), runtimes: [new MockRuntime({ chunkDelayMs: 0 })] });
+  h.store.settings.runtime = "mock";
+  await h.start({ gatewayUrl: "http://127.0.0.1:1" });
+  try {
+    const ws = h.store.paths.workspace;
+    const gate = path.join(h.store.paths.hooksDir, "cursor-bots-gate.mjs");
+    const { spawnSync } = await import("node:child_process");
+    const run = (input: unknown) => JSON.parse(spawnSync(process.execPath, [gate, "tool"], { input: JSON.stringify(input), cwd: ws }).stdout.toString()).permission;
+    assert.equal(run({ cwd: ws, tool_name: "Grep", tool_input: { pattern: "x", path: "." } }), "allow");
+    assert.equal(run({ cwd: ws, tool_name: "List", tool_input: { path: ws } }), "allow");
+    assert.equal(run({ cwd: ws, tool_name: "Read", tool_input: { path: "../state/settings.json" } }), "deny");
+  } finally {
+    await h.stop();
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("shell gate: the bound LAN address is matched as a whole host on the gateway's port", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cb-lan-"));
+  const h = new Harness({ home, runtimes: [new MockRuntime({ chunkDelayMs: 0 })] });
+  h.store.settings.runtime = "mock";
+  await h.start({ gatewayUrl: "http://192.168.1.5:4777" });
+  try {
+    assert.ok(h.touchesHarness("curl -s http://192.168.1.5:4777/api/state"));
+    assert.ok(h.touchesHarness("curl -s http://localhost:4777/api/state"));
+    for (const cmd of ["ssh deploy@192.168.1.50 uptime", "ping -c1 192.168.1.57", "curl http://192.168.1.5:3000/"]) assert.ok(!h.touchesHarness(cmd), cmd);
+  } finally {
+    await h.stop();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("shell gate: a relative working directory is checked where the SDK would run it, too", async () => {
+  const { h, cleanup } = await makeHarness();
+  try {
+    // The SDK resolves a relative workingDirectory against the gateway's own cwd.
+    const rel = path.relative(process.cwd(), h.store.paths.state);
+    assert.equal((await h.gateShell({ command: "cat *", cwd: rel })).permission, "deny");
+    assert.equal((await h.gateShell({ command: "ls", cwd: "bots" })).permission, "allow");
+  } finally {
+    await cleanup();
+  }
+});

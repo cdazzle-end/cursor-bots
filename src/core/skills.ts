@@ -60,7 +60,11 @@ export function parseFrontmatter(md: string): { data: Record<string, string>; bo
   const data: Record<string, string> = {};
   for (const { key, lines } of frontmatterEntries(m[1]!).entries) {
     const first = /^[A-Za-z0-9_-]+:\s*(.*)$/.exec(lines[0]!)![1]!.trim();
-    const rest = lines.slice(1).map((l) => l.trim());
+    // A value's own lines are indented (or "- item"); a "#" at column 0 is always a comment.
+    const rest = lines
+      .slice(1)
+      .filter((l) => !l.startsWith("#"))
+      .map((l) => l.trim());
     const block = /^([>|])[-+]?$/.exec(first);
     if (block) {
       // YAML block scalar: ">" folds lines into one, "|" keeps them.

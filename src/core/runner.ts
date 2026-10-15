@@ -118,6 +118,8 @@ export class BotRunner {
     if (cur && !cur.cancelled && match(cur.wake)) {
       cur.cancelled = true;
       stopped = true;
+      // A tool waiting inline on an approval card returns now instead of holding the turn open.
+      this.h.approvals.releaseStopped();
       try {
         await cur.run?.cancel();
       } catch {

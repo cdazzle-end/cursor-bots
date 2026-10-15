@@ -30,7 +30,8 @@ export class ApprovalService {
   private store: Store;
   private bus: EventBus;
   private host: ApprovalHost;
-  private waiters = new Map<Id, Array<(a: Approval) => void>>();
+  /** Turns waiting inline for a decision. `active` says whether that turn is still running. */
+  private waiters = new Map<Id, Array<{ done: (a: Approval | undefined) => void; active?: () => boolean }>>();
   private sweep?: NodeJS.Timeout;
 
   constructor(store: Store, bus: EventBus, host: ApprovalHost) {
@@ -117,24 +118,41 @@ export class ApprovalService {
     return approval;
   }
 
-  /** Wait up to `seconds` for a decision. Returns the approval in whatever state it is then. */
-  waitFor(id: Id, seconds: number): Promise<Approval> {
+  /**
+   * Wait up to `seconds` for a decision. Returns the approval in whatever state
+   * it is then, or undefined if the decision arrived after the waiting turn was
+   * stopped (that decision wakes the bot afresh instead).
+   */
+  waitFor(id: Id, seconds: number, active?: () => boolean): Promise<Approval | undefined> {
     const a = this.store.approvals.get(id);
-    if (!a || a.status !== "pending" || seconds <= 0) return Promise.resolve(a!);
+    if (!a || a.status !== "pending" || seconds <= 0) return Promise.resolve(a);
     return new Promise((resolve) => {
-      const done = (x: Approval) => {
-        clearTimeout(timer);
-        resolve(x);
+      const entry = {
+        done: (x: Approval | undefined) => {
+          clearTimeout(timer);
+          resolve(x);
+        },
+        active,
       };
       const timer = setTimeout(() => {
         const list = this.waiters.get(id) ?? [];
-        this.waiters.set(id, list.filter((f) => f !== done));
-        resolve(this.store.approvals.get(id)!);
+        this.waiters.set(id, list.filter((w) => w !== entry));
+        resolve(this.store.approvals.get(id));
       }, seconds * 1000);
       const list = this.waiters.get(id) ?? [];
-      list.push(done);
+      list.push(entry);
       this.waiters.set(id, list);
     });
+  }
+
+  /** Let go of waits whose turn was stopped, so the turn can end now; a later decision wakes the bot. */
+  releaseStopped(): void {
+    for (const [id, list] of this.waiters) {
+      const keep = list.filter((w) => !w.active || w.active());
+      for (const w of list) if (!keep.includes(w)) w.done(undefined);
+      if (keep.length) this.waiters.set(id, keep);
+      else this.waiters.delete(id);
+    }
   }
 
   decide(id: Id, decision: "once" | "always" | "deny"): Approval {
@@ -159,13 +177,16 @@ export class ApprovalService {
     }
     this.store.saveApprovals();
     this.bus.emit({ type: "approval.updated", approval: a });
-    const waiters = this.waiters.get(id);
+    const waiters = this.waiters.get(id) ?? [];
     this.waiters.delete(id);
-    if (waiters?.length) {
+    const live = waiters.filter((w) => !w.active || w.active());
+    // A turn you stopped while it waited is released without the decision (and uses no grant).
+    for (const w of waiters) if (!live.includes(w)) w.done(undefined);
+    if (live.length) {
       // The bot is still waiting inline; it continues with the decision.
-      for (const w of waiters) w(a);
+      for (const w of live) w.done(a);
     } else {
-      // The bot already ended its turn (or the gateway restarted): wake it with the decision.
+      // The bot already ended its turn (or was stopped, or the gateway restarted): wake it with the decision.
       this.host.onDeferredDecision(a);
     }
     return a;
@@ -198,6 +219,8 @@ export class ApprovalService {
     waitSeconds: number;
     /** The bot's turn context, so a later decision wakes it where it was working. */
     resume?: ResumeContext;
+    /** False once the asking turn was stopped; a decision then wakes the bot instead of reaching the dead turn. */
+    active?: () => boolean;
   }): Promise<GateResult> {
     if (this.evaluate(input.kind, input.subject) === "allow") return { permission: "allow" };
     const grant = this.consumeGrant(input.botId, input.subject);
@@ -212,7 +235,11 @@ export class ApprovalService {
       origin: input.origin,
       resume: input.resume,
     });
-    const decided = await this.waitFor(approval.id, input.waitSeconds);
+    const decided = (await this.waitFor(approval.id, input.waitSeconds, input.active)) ?? approval;
+    if (decided.status === "allowed" && input.active && !input.active()) {
+      // Decided after this turn was stopped: the decision wakes the bot afresh and keeps its grant.
+      return { permission: "deny", approvalId: decided.id, reason: "pending", message: "This turn was stopped." };
+    }
     if (decided.status === "allowed") {
       if (decided.decision === "once") {
         decided.consumed = true;
@@ -247,7 +274,7 @@ export class ApprovalService {
         this.bus.emit({ type: "approval.updated", approval: a });
         const waiters = this.waiters.get(a.id);
         this.waiters.delete(a.id);
-        for (const w of waiters ?? []) w(a);
+        for (const w of waiters ?? []) w.done(a);
       }
     }
   }

@@ -962,7 +962,10 @@ function renderDetails() {
     el.hidden = true;
     return;
   }
-  if (el.contains(document.activeElement) && !el.hidden && el.dataset.conv === c.id) return;
+  // Don't redraw under your cursor while you type; a clicked switch or button doesn't count.
+  const ae = document.activeElement;
+  const typing = ae && el.contains(ae) && ae.matches("textarea, select, [contenteditable], input:not([type=checkbox]):not([type=radio]):not([type=button])");
+  if (typing && !el.hidden && el.dataset.conv === c.id) return;
   el.hidden = false;
   el.dataset.conv = c.id;
   if (c.kind === "dm") return renderBotDetails(el, bot(c.members[0]));
@@ -1116,7 +1119,6 @@ function routineHtml(r) {
 function bindRoutines(el) {
   $$(".routine", el).forEach((box) => {
     const id = box.dataset.routine;
-    const r = (S.state.routines ?? []).find((x) => x.id === id);
     $(`#rt-${id}`, box).onchange = (e) => attempt(() => api("PATCH", `/api/routines/${id}`, { enabled: e.target.checked }));
   });
   $$("[data-rtest]", el).forEach(
@@ -1136,8 +1138,11 @@ function bindRoutines(el) {
       }),
   );
   $$("[data-rhook]", el).forEach((b) => {
-    const r = (S.state.routines ?? []).find((x) => x.id === b.dataset.rhook);
-    b.onclick = () => attempt(() => api("PATCH", `/api/routines/${r.id}`, { webhook: !r.webhookKey }));
+    // Look the routine up at click time: the list is replaced on every update.
+    b.onclick = () => {
+      const r = (S.state.routines ?? []).find((x) => x.id === b.dataset.rhook);
+      if (r) return attempt(() => api("PATCH", `/api/routines/${r.id}`, { webhook: !r.webhookKey }));
+    };
   });
   $$("[data-redit]", el).forEach((b) => (b.onclick = () => openRoutineEditor((S.state.routines ?? []).find((x) => x.id === b.dataset.redit))));
   $$("[data-copytext]", el).forEach(

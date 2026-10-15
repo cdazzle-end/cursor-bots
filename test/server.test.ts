@@ -138,7 +138,19 @@ test("the installed Cursor hook script maps sessions to bots and gates shell com
     fs.symlinkSync("..", path.join(ws, "up"));
     assert.equal((await runHook("tool", { cwd: ws, tool_name: "Read", tool_input: { path: "up/state/ui.token" } })).permission, "deny");
     assert.equal((await runHook("tool", { cwd: ws, tool_name: "Grep", tool_input: { pattern: "token", path: "up" } })).permission, "deny");
+    // ripgrep follows links inside the folder it searches, so a link out of the workspace blocks searching it...
+    assert.equal((await runHook("tool", { cwd: ws, tool_name: "Grep", tool_input: { pattern: "token", path: "." } })).permission, "deny");
+    fs.unlinkSync(path.join(ws, "up"));
     assert.equal((await runHook("tool", { cwd: ws, tool_name: "Grep", tool_input: { pattern: "token", path: "." } })).permission, "allow");
+    // ...and so does a link straight at one of the gateway's files, even one that doesn't exist yet.
+    fs.mkdirSync(path.join(ws, "proj", "deep"), { recursive: true });
+    fs.symlinkSync(path.join(s.h.store.paths.state, "not-yet.token"), path.join(ws, "proj", "deep", "tok"));
+    assert.equal((await runHook("tool", { cwd: ws, tool_name: "Grep", tool_input: { pattern: "token" } })).permission, "deny");
+    fs.unlinkSync(path.join(ws, "proj", "deep", "tok"));
+    fs.symlinkSync("/", path.join(ws, "root"));
+    assert.equal((await runHook("tool", { cwd: ws, tool_name: "Grep", tool_input: { pattern: "token", path: "." } })).permission, "deny", "a link to /");
+    fs.unlinkSync(path.join(ws, "root"));
+    fs.symlinkSync("..", path.join(ws, "up"));
     assert.equal((await runHook("tool", { cwd: ws, tool_name: "List", tool_input: { path: s.h.store.paths.state } })).permission, "deny");
     assert.match(hooks.hooks.preToolUse[0].matcher, /List/);
 
