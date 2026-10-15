@@ -568,10 +568,17 @@ test("Cursor credentials: an expired stored login and an empty CURSOR_API_KEY ar
     assert.equal(cursorCredentials(), undefined);
     fs.mkdirSync(path.join(fakeHome, ".cursor", "sdk"), { recursive: true });
     const auth = path.join(fakeHome, ".cursor", "sdk", "auth.json");
-    fs.writeFileSync(auth, JSON.stringify({ version: 1, apiKey: "key_x", apiKeyExpiresAtMs: Date.now() - 86400_000 }));
+    // The shape Cursor.auth.login() stores.
+    const login = (extra: object) => JSON.stringify({ version: 1, backendUrl: "https://api2.cursor.sh", apiKey: "key_x", createdAtMs: Date.now(), ...extra });
+    fs.writeFileSync(auth, login({ apiKeyExpiresAtMs: Date.now() - 86400_000 }));
     assert.equal(cursorCredentials(), "expired");
-    fs.writeFileSync(auth, JSON.stringify({ version: 1, apiKey: "key_x", apiKeyExpiresAtMs: Date.now() + 86400_000 }));
+    fs.writeFileSync(auth, login({ apiKeyExpiresAtMs: Date.now() + 86400_000 }));
     assert.equal(cursorCredentials(), "login");
+    fs.writeFileSync(auth, login({ backendUrl: "https://other.example" }));
+    assert.equal(cursorCredentials(), undefined, "a login for another backend isn't used by the SDK");
+    fs.writeFileSync(auth, JSON.stringify({ apiKey: "key_x" }));
+    assert.equal(cursorCredentials(), undefined, "neither is a file in another shape");
+    fs.writeFileSync(auth, login({}));
     process.env.CURSOR_API_KEY = "";
     assert.equal(cursorCredentials(), "login", "an empty key doesn't count");
   } finally {
@@ -628,4 +635,157 @@ test("chat markdown: code fences inside numbered steps stay code blocks", async 
     renderMarkdown("1. Install:\n\n   ```bash\n   npm install\n   npm run build\n   ```\n\n2. Start it:"),
     '<ol><li>Install:</li></ol><pre><code>npm install\nnpm run build</code></pre><ol start="2"><li>Start it:</li></ol>',
   );
+});
+
+// ------------------------------------------------------------------ third review round
+
+test("searches can't reach the gateway's keys through a symlink in the workspace", async () => {
+  const { h, cleanup } = await makeHarness();
+  try {
+    const ignore = fs.readFileSync(path.join(h.store.paths.workspace, ".rgignore"), "utf8");
+    for (const name of ["ui.token", "secret.key", "secrets.vault", "gate.token", "mcp.token"]) assert.match(ignore, new RegExp(`^${name.replace(".", "\\.")}$`, "m"));
+    // Bots can't edit it, and a heal puts it back while keeping your own lines.
+    assert.ok(h.protectedPaths().includes(path.join(h.store.paths.workspace, ".rgignore")));
+    assert.ok(h.touchesHarness("echo > .rgignore"));
+    assert.ok(!h.touchesHarness("cat other-project/.rgignore"));
+    fs.writeFileSync(path.join(h.store.paths.workspace, ".rgignore"), "dist/\n");
+    h.healWorkspace();
+    const healed = fs.readFileSync(path.join(h.store.paths.workspace, ".rgignore"), "utf8");
+    assert.match(healed, /^ui\.token$/m);
+    assert.match(healed, /^dist\/$/m);
+    // With the SDK's own ripgrep and flags, a link to the home folder finds nothing secret.
+    const rg = path.join(process.cwd(), "node_modules", "@cursor", `sdk-${process.platform}-${process.arch}`, "bin", "rg");
+    if (fs.existsSync(rg)) {
+      fs.writeFileSync(path.join(h.store.paths.state, "ui.token"), "needle-token-value");
+      fs.symlinkSync("..", path.join(h.store.paths.workspace, "up"));
+      const { spawnSync } = await import("node:child_process");
+      const out = spawnSync(rg, ["--no-config", "--color=never", "--hidden", "--follow", "--regexp", "needle", "--", "."], { cwd: h.store.paths.workspace }).stdout.toString();
+      assert.ok(!out.includes("needle-token-value"), out);
+    }
+  } finally {
+    await cleanup();
+  }
+});
+
+test("shell gate: a working directory spelled with ~ or file:// is resolved like the SDK does", async () => {
+  const { h, cleanup } = await makeHarness();
+  const realHome = process.env.HOME;
+  process.env.HOME = path.dirname(h.store.paths.home);
+  try {
+    const rel = path.relative(os.homedir(), h.store.paths.state);
+    for (const cwd of [`~/${rel}`, `$HOME/${rel}`, `file://${h.store.paths.state}`]) {
+      assert.equal((await h.gateShell({ command: "cat *", cwd })).permission, "deny", cwd);
+    }
+    assert.equal((await h.gateShell({ command: "ls", cwd: `~/${path.relative(os.homedir(), h.store.paths.workspace)}` })).permission, "allow");
+    // Another project's Cursor config is fine to work on from the shell.
+    assert.ok(!h.touchesHarness("cp templates/mcp.json ~/code/myapp/.cursor/mcp.json"));
+    assert.ok(!h.touchesHarness("cat ~/code/app/.cursor/hooks.json"));
+    // (A bare relative .cursor/... is read as the workspace's own, which is where bots run.)
+    assert.ok(h.touchesHarness("rm .cursor/hooks.json"));
+    assert.ok(h.touchesHarness("cat ./.cursor/mcp.json"));
+  } finally {
+    process.env.HOME = realHome;
+    await cleanup();
+  }
+});
+
+test("a '>' in a bot's name doesn't stop the gate from learning which bot owns a conversation", async () => {
+  const { h, mock, cleanup } = await makeHarness();
+  try {
+    const bot = h.createBot({ name: "Build > Deploy" });
+    await h.postUserMessage(h.store.dmFor(bot.id)!.id, { text: "hi" });
+    await settle(h);
+    const prompt = [...mock.sessions.values()][0]!.prompts[0]!;
+    assert.match(prompt, /<you name="Build &gt; Deploy" handle="@build-deploy">/);
+    h.learnHookSession("conv-x", prompt.slice(0, 400));
+    assert.equal((h as any).hookSessions.get("conv-x"), bot.id);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("an approval decided after 'stop' in the requester's chat still delivers the helper's answer", async () => {
+  const { h, cleanup } = await makeHarness();
+  try {
+    const alpha = h.createBot({ name: "Alpha" });
+    const beta = h.createBot({ name: "Beta" });
+    const dm = h.store.dmFor(alpha.id)!;
+    const ask = nested('[[tool request_approval {"action":"Deploy the site"}]] [[reply waiting for approval]]');
+    await h.postUserMessage(dm.id, { text: `[[tool send_message {"to":"@beta","text":"${ask}"}]] [[reply asked beta]]` });
+    await settle(h);
+    await h.postUserMessage(dm.id, { text: "stop" });
+    await settle(h);
+    const updates = () => texts(h, dm.id).filter((t) => /Update from my teammate: @beta replied/.test(t)).length;
+    const before = updates();
+    h.decideApproval(h.approvals.pendingFor(beta.id)[0]!.id, "once");
+    await settle(h);
+    assert.equal(updates(), before + 1);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("'stop' survives a restart: a reply to a stopped chat doesn't come back afterwards", async () => {
+  const { h, home } = await makeHarness();
+  const alpha = h.createBot({ name: "Alpha" });
+  const beta = h.createBot({ name: "Beta" });
+  const gamma = h.createBot({ name: "Gamma" });
+  const crew = h.createGroup({ title: "Crew", members: [alpha.id, beta.id] });
+  const forGamma = nested("[[sleep 3000]] [[reply gamma review done]]");
+  const forBeta = nested(`[[tool send_message {"to":"@gamma","text":"${forGamma}"}]] [[reply asked gamma]]`);
+  await h.postUserMessage(h.store.dmFor(alpha.id)!.id, { text: `[[tool send_message {"to":"#crew","text":"@beta ${forBeta}"}]] [[reply posted]]` });
+  await until(() => h.runner(gamma.id).status().state === "working" && h.runner(beta.id).status().state !== "working");
+  await h.postUserMessage(crew.id, { text: "stop" });
+  await h.stop();
+  const h2 = await restart(home);
+  try {
+    await settle(h2);
+    const msgs = h2.store.messages(crew.id);
+    const stoppedAt = msgs.findIndex((m) => m.kind === "notice" && /^Stopped/.test(m.text));
+    assert.ok(stoppedAt >= 0, "the stop reached Gamma's work for #crew");
+    assert.ok(!msgs.slice(stoppedAt).some((m) => m.author.kind === "bot"), "nothing posts in #crew after the stop, even across a restart");
+  } finally {
+    await h2.stop();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("cron spacing respects the day fields: weekly and monthly schedules pass large minimums", async () => {
+  const { validateCron } = await import("../src/core/scheduler.ts");
+  assert.equal(validateCron("0 9 * * 1", "UTC", 2880), undefined);
+  assert.equal(validateCron("0 9 1 * *", "UTC", 10080), undefined);
+  assert.ok(validateCron("0 9 * * *", "UTC", 2880), "daily is closer than two days");
+  assert.ok(validateCron("0 9 * * 1,2", "UTC", 2880), "Monday then Tuesday is one day apart");
+  assert.equal(validateCron("0,58 0,23 * * 1", "UTC", 5), undefined, "only Mondays: 23:58 is never followed by 00:00");
+  assert.ok(validateCron("0,58 0,23 * * 1,2", "UTC", 5), "Monday 23:58 then Tuesday 00:00");
+  assert.equal(validateCron("0 0,23 * * 5", "UTC", 120), undefined);
+});
+
+test("skill frontmatter: a comment belongs to the key below it", async () => {
+  const { h, cleanup } = await makeHarness();
+  try {
+    const dir = path.join(h.skills.root, "notes");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "SKILL.md"),
+      "---\nname: notes\ndescription: >\n  Take meeting notes\n  after calls.\n# License below is required by legal\nlicense: MIT\n# maintained by ops\n---\n\n# Notes\n",
+    );
+    const info = h.skills.find("notes")!;
+    assert.equal(info.description, "Take meeting notes after calls.");
+    h.skills.save({ name: "notes", description: info.description, body: "# Notes\n\nNew" });
+    const md = fs.readFileSync(path.join(dir, "SKILL.md"), "utf8");
+    assert.match(md, /^# License below is required by legal\nlicense: MIT$/m);
+    assert.match(md, /^# maintained by ops$/m);
+    assert.equal(h.skills.find("notes")!.description, "Take meeting notes after calls.");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("chat markdown: a deeper-indented ``` inside code is content; inline ``` code stays in its list item", async () => {
+  const mdPath = "../web/markdown.js";
+  const { renderMarkdown } = (await import(mdPath)) as { renderMarkdown: (s: string) => string };
+  const py = 'def add(a, b):\n    """Add.\n\n    ```\n    >>> add(1, 2)\n    ```\n    """\n    return a + b';
+  assert.equal(renderMarkdown("```python\n" + py + "\n```"), `<pre><code>${py.replace(/>/g, "&gt;").replace(/"/g, "&quot;")}</code></pre>`);
+  assert.equal(renderMarkdown("- item\n  ```npm i``` to install\n- two"), "<ul><li>item ``<code>npm i</code>`` to install</li><li>two</li></ul>");
 });

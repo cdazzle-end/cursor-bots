@@ -51,9 +51,18 @@ export interface CursorRuntimeOptions {
 export function cursorCredentials(apiKey?: string): "key" | "login" | "expired" | undefined {
   if (apiKey || process.env.CURSOR_API_KEY) return "key";
   try {
+    // The same checks the SDK applies before it uses a stored login.
     const auth = JSON.parse(fs.readFileSync(path.join(os.homedir(), ".cursor", "sdk", "auth.json"), "utf8"));
-    if (typeof auth?.apiKey !== "string" || !auth.apiKey) return undefined;
-    return typeof auth.apiKeyExpiresAtMs === "number" && auth.apiKeyExpiresAtMs <= Date.now() ? "expired" : "login";
+    const backend = (process.env.CURSOR_BACKEND_URL ?? "https://api2.cursor.sh").replace(/\/+$/, "");
+    const valid =
+      auth?.version === 1 &&
+      typeof auth.apiKey === "string" &&
+      auth.apiKey &&
+      typeof auth.backendUrl === "string" &&
+      typeof auth.createdAtMs === "number" &&
+      (auth.apiKeyExpiresAtMs === undefined || typeof auth.apiKeyExpiresAtMs === "number");
+    if (!valid || auth.backendUrl !== backend) return undefined;
+    return auth.apiKeyExpiresAtMs !== undefined && auth.apiKeyExpiresAtMs <= Date.now() ? "expired" : "login";
   } catch {
     return undefined;
   }

@@ -50,7 +50,9 @@ export function renderMarkdown(src, ctx) {
     const fence = /^(\s*)(`{3,})[^`]*$/.exec(line);
     if (fence) {
       flush();
-      const close = new RegExp(`^\\s*\`{${fence[2].length},}\\s*$`);
+      // Like CommonMark: the closing fence may be indented up to 3 spaces past the opener, no more
+      // (a deeper ``` line, e.g. an example inside a docstring, is part of the code).
+      const close = new RegExp(`^ {0,${fence[1].length + 3}}\`{${fence[2].length},}\\s*$`);
       const indent = new RegExp(`^ {0,${fence[1].length}}`);
       const buf = [];
       i++;
@@ -71,7 +73,7 @@ export function renderMarkdown(src, ctx) {
       const ordered = /^\s*\d+[.)]\s+/.test(line);
       const itemRe = ordered ? /^\s*\d+[.)]\s+/ : /^\s*[-*+]\s+/;
       // A code fence ends the list item, so the fence handler renders it as a block (not folded into the text).
-      const isContinuation = (l) => /^\s{2,}\S/.test(l) && !/^\s*([-*+]|\d+[.)])\s+/.test(l) && !/^\s*`{3,}/.test(l);
+      const isContinuation = (l) => /^\s{2,}\S/.test(l) && !/^\s*([-*+]|\d+[.)])\s+/.test(l) && !/^\s*`{3,}[^`]*$/.test(l);
       const nextNonBlank = (from) => {
         let j = from;
         while (j < lines.length && /^\s*$/.test(lines[j])) j++;

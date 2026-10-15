@@ -17,7 +17,7 @@ import { formatLocalTime, shortTime, slugify, truncate } from "./util.ts";
 
 /** Attribute values come from names you and bots choose; keep a quote from breaking the tag. */
 function attr(v: string): string {
-  return v.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+  return v.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 export function groupTag(c: Conversation): string {

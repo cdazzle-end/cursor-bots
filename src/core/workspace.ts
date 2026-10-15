@@ -125,6 +125,7 @@ export function prepareWorkspace(paths: HomePaths, gate: GateConfig, opts: { onl
   const ignore = path.join(paths.workspace, ".cursorignore");
   if (!fs.existsSync(ignore)) writeFileAtomic(ignore, "# Managed by Cursor Bots; add your own patterns below.\n.browser/\n**/node_modules/\n");
   writeIfChanged(path.join(paths.rulesDir, "cursor-bots.mdc"), HARNESS_MANUAL, quick);
+  ensureSearchIgnore(paths.workspace);
 
   const gateFile = path.join(paths.hooksDir, "cursor-bots-gate.mjs");
   writeIfChanged(gateFile, gateScript(gate), quick);
@@ -152,6 +153,35 @@ export function prepareWorkspace(paths: HomePaths, gate: GateConfig, opts: { onl
   tool.unshift({ command: "node .cursor/hooks/cursor-bots-gate.mjs tool", matcher: "Read|Write|Edit|Delete|Grep|Glob|List|LS", timeout: 10 });
   cfg.hooks.preToolUse = tool;
   writeIfChanged(paths.hooksJson, JSON.stringify(cfg, null, 2) + "\n", quick);
+}
+
+const IGNORE_START = "# >>> Cursor Bots (managed): keep the gateway's keys and tokens out of searches";
+const IGNORE_END = "# <<< Cursor Bots";
+/** The gateway's secret files by name, so a search can't reach them through a symlink in the workspace. */
+export const SEARCH_IGNORED = ["ui.token", "gate.token", "mcp.token", "secret.key", "secrets.vault", "connectors.json", "cursor-store/"];
+
+/**
+ * Cursor's Grep and List tools run ripgrep with --follow, so a symlink inside
+ * the workspace can lead a search into the gateway's state. ripgrep always
+ * honors .rgignore, matched against the path as walked, so naming the secret
+ * files keeps them out wherever the link points. Lines you add outside the
+ * managed block are kept.
+ */
+function ensureSearchIgnore(workspace: string): void {
+  const file = path.join(workspace, ".rgignore");
+  let current = "";
+  try {
+    current = fs.readFileSync(file, "utf8");
+  } catch {
+    // Missing: create it.
+  }
+  const block = [IGNORE_START, ...SEARCH_IGNORED, IGNORE_END].join("\n");
+  if (current.includes(block)) return;
+  const start = current.indexOf(IGNORE_START);
+  const end = current.indexOf(IGNORE_END);
+  const rest = start >= 0 && end > start ? current.slice(0, start) + current.slice(end + IGNORE_END.length) : current;
+  const others = rest.trim();
+  writeFileAtomic(file, `${block}\n${others ? `\n${others}\n` : ""}`);
 }
 
 export function ensureBotFolder(paths: HomePaths, handle: string): string {

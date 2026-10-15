@@ -84,14 +84,14 @@ async function start(argv: string[]): Promise<void> {
   });
   // The approval hook must reach the gateway at an address it really listens on;
   // if it can't connect it assumes the gateway is off and lets commands through.
+  // Checked before start(), which restores queued work: no bot may run while the hook can't reach us.
   const gatewayUrl = boundUrl(server.address() as AddressInfo);
-  await h.start({ gatewayUrl });
   if (!(await gateReachable(gatewayUrl, h.gateToken))) {
     console.error(`\n  ✖ The approval hook can't reach the gateway at ${gatewayUrl}. Start with a --host this machine can connect to (e.g. 127.0.0.1).\n`);
     server.close();
-    await h.stop().catch(() => {});
     process.exit(1);
   }
+  await h.start({ gatewayUrl });
   if (values.starter) createStarterTeam(h);
 
   const rt = h.runtimes.get(h.store.settings.runtime);

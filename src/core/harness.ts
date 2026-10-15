@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { ApprovalService } from "./approvals.ts";
 import { EventBus } from "./events.ts";
 import { emptyMemory } from "./memory.ts";
@@ -319,13 +320,22 @@ export class Harness {
     const running: Array<{ botId: Id; wake: WakeEvent }> = [];
     for (const r of this.runners.values()) {
       queue.push(...r.queue);
-      if (r.current) running.push({ botId: r.botId, wake: r.current.wake });
+      // A turn you stopped isn't "interrupted" by a restart; it was already stopped.
+      if (r.current && !r.current.cancelled) running.push({ botId: r.botId, wake: r.current.wake });
     }
-    writeJson(this.queueFile, { queue, running });
+    // "stop" must still win after a restart, so its bookkeeping is saved too.
+    writeJson(this.queueFile, { queue, running, stopGens: Object.fromEntries(this.stopGens), stoppedChains: [...this.stoppedChains] });
   }
 
   private restoreQueue(): void {
-    const saved = readJson<{ queue: WakeEvent[]; running: Array<{ botId: Id; wake: WakeEvent }> }>(this.queueFile, { queue: [], running: [] });
+    const saved = readJson<{
+      queue: WakeEvent[];
+      running: Array<{ botId: Id; wake: WakeEvent }>;
+      stopGens?: Record<Id, number>;
+      stoppedChains?: Id[];
+    }>(this.queueFile, { queue: [], running: [] });
+    for (const [convId, gen] of Object.entries(saved.stopGens ?? {})) if (Number.isFinite(gen)) this.stopGens.set(convId, Math.max(this.stopGen(convId), gen));
+    for (const id of saved.stoppedChains ?? []) this.stoppedChains.add(id);
     const queued = (saved.queue ?? []).filter((w) => this.store.bots.has(w.botId) && this.store.conversations.has(w.convId));
     this.restoring = true;
     try {
@@ -392,7 +402,8 @@ export class Harness {
    */
   chargeChainTurn(wake: WakeEvent, convId: Id): number | undefined {
     const now = Date.now();
-    this.pruneChains();
+    // The turn starting now has left the queue but isn't current yet; keep its chain.
+    this.pruneChains(wake.chain.id);
     const entry = this.chainTurns.get(wake.chain.id) ?? { turns: 0, at: now, notified: false };
     entry.turns += 1;
     entry.at = now;
@@ -418,11 +429,11 @@ export class Harness {
   }
 
   /** Forget chains that have been idle for hours (nothing queued or running uses them). */
-  private pruneChains(): void {
+  private pruneChains(keep?: Id): void {
     const now = Date.now();
     if (now - this.lastChainPrune < 10 * 60_000) return;
     this.lastChainPrune = now;
-    const live = new Set<Id>();
+    const live = new Set<Id>(keep ? [keep] : []);
     for (const r of this.runners.values()) {
       for (const w of r.queue) live.add(w.chain.id);
       if (r.current) live.add(r.current.wake.chain.id);
@@ -989,9 +1000,14 @@ export class Harness {
     const chains = new Set<Id>();
     for (const [chainId, origin] of this.chainOrigin) if (origin.convId === convId) chains.add(chainId);
     for (const c of chains) this.stoppedChains.add(c);
+    // Work a teammate does for a bot in this conversation would answer into it: stop that too.
+    const answersHere = (route: ReplyRoute | undefined): boolean => {
+      for (let r = route; r; r = r.upstream) if (r.convId === convId) return true;
+      return false;
+    };
     let any = false;
     for (const r of this.runners.values()) {
-      if (await r.stopWhere((w) => w.convId === convId || chains.has(w.chain.id))) any = true;
+      if (await r.stopWhere((w) => w.convId === convId || chains.has(w.chain.id) || answersHere(w.replyTo))) any = true;
     }
     return any;
   }
@@ -1352,13 +1368,19 @@ export class Harness {
       botId,
       convId,
       allowSilence: false,
-      replyTo: resume?.replyTo,
+      replyTo: this.renewRoute(resume?.replyTo),
       // Your decision is a new action: a fresh chain (so an earlier "stop" or a spent budget doesn't swallow it)
       // that still starts where the original work did, so "stop" there reaches it.
       chain: resume ? { ...this.newChain(resume.chain.originConvId ?? convId), depth: resume.chain.depth } : this.newChain(convId),
       createdAt: Date.now(),
       ...extra,
     });
+  }
+
+  /** Your decision is a new action for the whole delivery path: stamp each route with today's stop generation. */
+  private renewRoute(route: ReplyRoute | undefined): ReplyRoute | undefined {
+    if (!route) return undefined;
+    return { ...route, stopGen: this.stopGen(route.convId), upstream: this.renewRoute(route.upstream) };
   }
 
   private onApprovalDecided(a: Approval): void {
@@ -1426,12 +1448,24 @@ export class Harness {
       p.hooksJson,
       path.join(p.rulesDir, "cursor-bots.mdc"),
       ...["mcp.json", "mcp-approvals.json", "cli.json", "cli-config.json", "permissions.json", "sandbox.json"].map((f) => path.join(dotCursor, f)),
+      // Keeps the gateway's secret files out of searches that follow symlinks.
+      path.join(p.workspace, ".rgignore"),
     ];
   }
 
   /** True if a path (after following symlinks) is one of the protected paths or inside one. */
   private insideProtected(target: string): boolean {
-    const abs = path.resolve(this.store.paths.workspace, target);
+    // Spell the path out the way the SDK does before it spawns the shell (~, $HOME, file:// URLs).
+    let t = target.trim();
+    if (t.startsWith("file://")) {
+      try {
+        t = fileURLToPath(t);
+      } catch {
+        // Not a usable URL; check it as written.
+      }
+    }
+    t = t.replace(/^~(?=$|[\\/])/, os.homedir()).replace(/^(\$\{HOME\}|\$HOME)(?=$|[\\/])/, os.homedir());
+    const abs = path.resolve(this.store.paths.workspace, t);
     const candidates = [abs, realPrefix(abs)];
     return this.protectedPaths().some((root) => {
       const roots = [root, realPrefix(root)];
@@ -1450,7 +1484,9 @@ export class Harness {
     const cmd = command.replace(/(^|[\s=:'"(])~(?=\/)/g, `$1${home}`).replace(/\$\{HOME\}|\$HOME\b/g, home);
     if (this.protectedPaths().some((p) => cmd.includes(p))) return true;
     if (/\b(secret\.key|secrets\.vault|ui\.token|mcp\.token|gate\.token|cursor-store|cursor-bots-gate|cursor-bots\.mdc)\b/.test(cmd)) return true;
-    if (/\.cursor\/(hooks\b|hooks\.json|mcp\.json|mcp-approvals\.json|cli\.json|cli-config\.json|permissions\.json|sandbox\.json)/.test(cmd)) return true;
+    // Relative to the workspace (the bots' cwd); another project's .cursor folder is fine to touch.
+    if (/(^|[\s'"=:(;&|]|\.\/)\.cursor\/(hooks\b|hooks\.json|mcp\.json|mcp-approvals\.json|cli\.json|cli-config\.json|permissions\.json|sandbox\.json)/.test(cmd)) return true;
+    if (/(^|[\s'"=:(;&|]|\.\/)\.rgignore\b/.test(cmd)) return true;
     if (/\.\.\/+(state|settings\.json|connectors\.json)\b/.test(cmd)) return true;
     // The gateway's port with any host in front (loopback spellings, the address it's bound to, a LAN IP).
     if (this.gatewayPort && new RegExp(`[\\w\\]]:${this.gatewayPort}(?!\\d)`).test(cmd)) return true;

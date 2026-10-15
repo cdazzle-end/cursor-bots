@@ -52,15 +52,19 @@ export function validateCron(expr: string, timezone: string, minGapMinutes: numb
     job = new Cron(expr, { timezone, mode: "5-part", paused: true });
     let prev = job.nextRun();
     if (!prev) return "That schedule never runs.";
-    // The day fields only switch whole days on or off, so the closest two runs can be is the
-    // smallest gap between the day's time slots, or from the last slot to the next day's first.
+    // The day fields only switch whole days on or off. So two runs on the same day are as close
+    // as the day's time slots, and across days the closest pair is a day's last slot and the
+    // next active day's first one.
     const minutes = expandField(fields[0]!, 0, 59);
     const hours = expandField(fields[1]!, 0, 23);
     if (minutes && hours) {
       const slots = hours.flatMap((h) => minutes.map((m) => h * 60 + m));
-      let gap = 1440 - slots[slots.length - 1]! + slots[0]!;
-      for (let i = 1; i < slots.length; i++) gap = Math.min(gap, slots[i]! - slots[i - 1]!);
-      return gap < minGapMinutes ? tooClose : undefined;
+      for (let i = 1; i < slots.length; i++) if (slots[i]! - slots[i - 1]! < minGapMinutes) return tooClose;
+      const first = slots[0]!;
+      const last = slots[slots.length - 1]!;
+      // Even on back-to-back days the late and early slots are far enough apart.
+      if (1440 - last + first >= minGapMinutes) return undefined;
+      return crossDayGap(fields, first, last, timezone, minGapMinutes) ? tooClose : undefined;
     }
     // Unusual syntax: step through the runs for more than a week from the first one.
     const horizon = prev.getTime() + 8 * 86400_000;
@@ -75,6 +79,33 @@ export function validateCron(expr: string, timezone: string, minGapMinutes: numb
     return `Invalid schedule: ${err?.message ?? err}`;
   } finally {
     job?.stop();
+  }
+}
+
+/**
+ * Walk the real active days (a year ahead) and report whether a day's last
+ * slot comes within the minimum of the next active day's first slot. Two
+ * derived schedules do it in a few hundred steps: one that fires at the
+ * day's last slot and one at its first, both with the original day fields.
+ */
+function crossDayGap(fields: string[], first: number, last: number, timezone: string, minGapMinutes: number): boolean {
+  const days = fields.slice(2).join(" ");
+  const opts = { timezone, mode: "5-part" as const, paused: true };
+  const lastJob = new Cron(`${last % 60} ${Math.floor(last / 60)} ${days}`, opts);
+  const firstJob = new Cron(`${first % 60} ${Math.floor(first / 60)} ${days}`, opts);
+  try {
+    let l = lastJob.nextRun();
+    const horizon = (l?.getTime() ?? 0) + 400 * 86400_000;
+    for (let i = 0; l && l.getTime() <= horizon && i < 1000; i++) {
+      const f = firstJob.nextRun(l);
+      if (!f) return false;
+      if (f.getTime() - l.getTime() < minGapMinutes * 60_000) return true;
+      l = lastJob.nextRun(f);
+    }
+    return false;
+  } finally {
+    lastJob.stop();
+    firstJob.stop();
   }
 }
 

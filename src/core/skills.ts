@@ -24,21 +24,34 @@ const FRONTMATTER = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/;
 /** Keys save() writes itself; any other key in an existing SKILL.md is kept as written. */
 const MANAGED_KEYS = new Set(["name", "description", "disable-model-invocation", "created-by"]);
 
-/**
- * Top-level frontmatter entries: each key line plus every line up to the next
- * key (indented values, "- item" lists at column 0, comments), verbatim.
- * Lines before the first key (comments) form the preamble.
- */
-function frontmatterEntries(block: string): { preamble: string[]; entries: Array<{ key: string; lines: string[] }> } {
-  const preamble: string[] = [];
-  const entries: Array<{ key: string; lines: string[] }> = [];
+interface FrontmatterEntry {
+  key: string;
+  /** Column-0 comments and blank lines just above the key (they describe it). */
+  lead: string[];
+  /** The key line plus its value lines (indented lines, "- item" lists at column 0), verbatim. */
+  lines: string[];
+}
+
+/** Split frontmatter into top-level entries. Comments after the last key form the tail. */
+function frontmatterEntries(block: string): { entries: FrontmatterEntry[]; tail: string[] } {
+  const entries: FrontmatterEntry[] = [];
+  let pending: string[] = [];
   for (const line of block.split(/\r?\n/)) {
     const kv = /^([A-Za-z0-9_-]+):/.exec(line);
-    if (kv) entries.push({ key: kv[1]!, lines: [line] });
-    else if (entries.length) entries.at(-1)!.lines.push(line);
-    else preamble.push(line);
+    if (kv) {
+      entries.push({ key: kv[1]!, lead: pending, lines: [line] });
+      pending = [];
+    } else if (/^#/.test(line) || !line.trim()) {
+      pending.push(line);
+    } else if (entries.length) {
+      // A value line: comments or blanks in between belong to the value too.
+      entries.at(-1)!.lines.push(...pending, line);
+      pending = [];
+    } else {
+      pending.push(line);
+    }
   }
-  return { preamble, entries };
+  return { entries, tail: pending };
 }
 
 export function parseFrontmatter(md: string): { data: Record<string, string>; body: string } {
@@ -142,15 +155,21 @@ export class SkillLibrary {
     const lines = ["---", `name: ${name}`, `description: ${quote(input.description)}`];
     if (input.manualOnly) lines.push("disable-model-invocation: true");
     if (input.createdBy) lines.push(`created-by: ${quote(input.createdBy)}`);
-    // Keep the keys this library doesn't manage (license, allowed-tools, metadata, ...).
+    // Keep the keys this library doesn't manage (license, allowed-tools, metadata, ...) and every comment.
     if (existing) {
       const old = FRONTMATTER.exec(fs.readFileSync(path.join(this.workspace, existing.path), "utf8"));
-      const { preamble, entries } = old ? frontmatterEntries(old[1]!) : { preamble: [], entries: [] };
-      const kept = preamble.filter((l) => l.trim());
-      if (kept.length) lines.splice(1, 0, ...kept);
+      const { entries, tail } = old ? frontmatterEntries(old[1]!) : { entries: [], tail: [] };
+      const comments = (l: string[]) => l.filter((x) => x.trim());
       for (const e of entries) {
-        if (!MANAGED_KEYS.has(e.key)) lines.push(...trimTrailingBlank(e.lines));
+        if (!MANAGED_KEYS.has(e.key)) {
+          lines.push(...comments(e.lead), ...trimTrailingBlank(e.lines));
+        } else if (comments(e.lead).length) {
+          // A comment above a key we rewrite goes back above that key.
+          const at = lines.findIndex((l) => l.startsWith(`${e.key}:`));
+          if (at > 0) lines.splice(at, 0, ...comments(e.lead));
+        }
       }
+      lines.push(...comments(tail));
     }
     lines.push("---", "", body.startsWith("#") ? body : `# ${input.name.trim()}\n\n${body}`, "");
     writeFileAtomic(path.join(dir, "SKILL.md"), lines.join("\n"));
