@@ -145,6 +145,8 @@ export interface ReplyRoute {
   handoffId: Id;
   /** The requester's own reply route, so answers keep flowing up a delegation chain. */
   upstream?: ReplyRoute;
+  /** Stop generation of convId at handoff time; a later "stop" there drops the reply. */
+  stopGen?: number;
 }
 
 /** A reason to run a bot. Bots process one wake at a time, highest priority first. */

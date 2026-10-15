@@ -43,11 +43,20 @@ export interface CursorRuntimeOptions {
   openStore?: (o: { workspaceRef: string; stateRoot: string }) => Promise<OpenedStore>;
 }
 
-/** Where Cursor credentials come from: CURSOR_API_KEY, or the SDK's stored login (~/.cursor/sdk/auth.json). */
-export function cursorCredentials(apiKey?: string): "key" | "login" | undefined {
+/**
+ * Where Cursor credentials come from: CURSOR_API_KEY, or a login the SDK
+ * stored in ~/.cursor/sdk/auth.json. "expired" is a stored login the SDK
+ * would no longer use.
+ */
+export function cursorCredentials(apiKey?: string): "key" | "login" | "expired" | undefined {
   if (apiKey || process.env.CURSOR_API_KEY) return "key";
-  if (fs.existsSync(path.join(os.homedir(), ".cursor", "sdk", "auth.json"))) return "login";
-  return undefined;
+  try {
+    const auth = JSON.parse(fs.readFileSync(path.join(os.homedir(), ".cursor", "sdk", "auth.json"), "utf8"));
+    if (typeof auth?.apiKey !== "string" || !auth.apiKey) return undefined;
+    return typeof auth.apiKeyExpiresAtMs === "number" && auth.apiKeyExpiresAtMs <= Date.now() ? "expired" : "login";
+  } catch {
+    return undefined;
+  }
 }
 
 async function openSqliteStore(o: { workspaceRef: string; stateRoot: string }): Promise<OpenedStore> {
@@ -74,6 +83,8 @@ export class CursorRuntime implements AgentRuntime {
 
   constructor(opts: CursorRuntimeOptions) {
     this.opts = opts;
+    // An exported but empty CURSOR_API_KEY stops the SDK from using a stored login.
+    if (process.env.CURSOR_API_KEY === "") delete process.env.CURSOR_API_KEY;
   }
 
   private apiKey(): string | undefined {
@@ -81,7 +92,9 @@ export class CursorRuntime implements AgentRuntime {
   }
 
   available(): { ok: boolean; reason?: string } {
-    if (cursorCredentials(this.opts.apiKey)) return { ok: true };
+    const creds = cursorCredentials(this.opts.apiKey);
+    if (creds === "key" || creds === "login") return { ok: true };
+    if (creds === "expired") return { ok: false, reason: "Your stored Cursor login has expired: log in again or set CURSOR_API_KEY." };
     return { ok: false, reason: "No Cursor credentials: set CURSOR_API_KEY (create one at cursor.com/dashboard → API Keys)." };
   }
 

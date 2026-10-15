@@ -46,13 +46,15 @@ export function renderMarkdown(src, ctx) {
   while (i < lines.length) {
     const line = lines[i];
     // Any info string ("c++", "ts title=x"); the fence closes on at least as many backticks.
-    const fence = /^\s{0,3}(`{3,})[^`]*$/.exec(line);
+    // Fences inside list items are indented; strip that indent from the code too.
+    const fence = /^(\s*)(`{3,})[^`]*$/.exec(line);
     if (fence) {
       flush();
-      const close = new RegExp(`^\\s{0,3}\`{${fence[1].length},}\\s*$`);
+      const close = new RegExp(`^\\s*\`{${fence[2].length},}\\s*$`);
+      const indent = new RegExp(`^ {0,${fence[1].length}}`);
       const buf = [];
       i++;
-      while (i < lines.length && !close.test(lines[i])) buf.push(lines[i++]);
+      while (i < lines.length && !close.test(lines[i])) buf.push(lines[i++].replace(indent, ""));
       i++;
       out.push(`<pre><code>${esc(buf.join("\n"))}</code></pre>`);
       continue;
@@ -68,7 +70,8 @@ export function renderMarkdown(src, ctx) {
       flush();
       const ordered = /^\s*\d+[.)]\s+/.test(line);
       const itemRe = ordered ? /^\s*\d+[.)]\s+/ : /^\s*[-*+]\s+/;
-      const isContinuation = (l) => /^\s{2,}\S/.test(l) && !/^\s*([-*+]|\d+[.)])\s+/.test(l);
+      // A code fence ends the list item, so the fence handler renders it as a block (not folded into the text).
+      const isContinuation = (l) => /^\s{2,}\S/.test(l) && !/^\s*([-*+]|\d+[.)])\s+/.test(l) && !/^\s*`{3,}/.test(l);
       const nextNonBlank = (from) => {
         let j = from;
         while (j < lines.length && /^\s*$/.test(lines[j])) j++;

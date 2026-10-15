@@ -24,22 +24,28 @@ const FRONTMATTER = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/;
 /** Keys save() writes itself; any other key in an existing SKILL.md is kept as written. */
 const MANAGED_KEYS = new Set(["name", "description", "disable-model-invocation", "created-by"]);
 
-/** Top-level frontmatter entries: each key line plus its indented continuation lines, verbatim. */
-function frontmatterEntries(block: string): Array<{ key: string; lines: string[] }> {
-  const out: Array<{ key: string; lines: string[] }> = [];
+/**
+ * Top-level frontmatter entries: each key line plus every line up to the next
+ * key (indented values, "- item" lists at column 0, comments), verbatim.
+ * Lines before the first key (comments) form the preamble.
+ */
+function frontmatterEntries(block: string): { preamble: string[]; entries: Array<{ key: string; lines: string[] }> } {
+  const preamble: string[] = [];
+  const entries: Array<{ key: string; lines: string[] }> = [];
   for (const line of block.split(/\r?\n/)) {
     const kv = /^([A-Za-z0-9_-]+):/.exec(line);
-    if (kv) out.push({ key: kv[1]!, lines: [line] });
-    else if (out.length && (/^\s+/.test(line) || !line.trim())) out.at(-1)!.lines.push(line);
+    if (kv) entries.push({ key: kv[1]!, lines: [line] });
+    else if (entries.length) entries.at(-1)!.lines.push(line);
+    else preamble.push(line);
   }
-  return out;
+  return { preamble, entries };
 }
 
 export function parseFrontmatter(md: string): { data: Record<string, string>; body: string } {
   const m = FRONTMATTER.exec(md);
   if (!m) return { data: {}, body: md };
   const data: Record<string, string> = {};
-  for (const { key, lines } of frontmatterEntries(m[1]!)) {
+  for (const { key, lines } of frontmatterEntries(m[1]!).entries) {
     const first = /^[A-Za-z0-9_-]+:\s*(.*)$/.exec(lines[0]!)![1]!.trim();
     const rest = lines.slice(1).map((l) => l.trim());
     const block = /^([>|])[-+]?$/.exec(first);
@@ -47,8 +53,9 @@ export function parseFrontmatter(md: string): { data: Record<string, string>; bo
       // YAML block scalar: ">" folds lines into one, "|" keeps them.
       data[key] = (block[1] === ">" ? rest.filter(Boolean).join(" ") : rest.join("\n")).trim();
     } else {
-      // Plain values may wrap onto indented lines; nested metadata is kept as text.
-      data[key] = [unquote(first), ...rest.filter(Boolean)].join(" ").trim();
+      // Plain values may wrap onto indented lines; list items and nested metadata are kept as text, comments dropped.
+      const more = rest.filter((l) => l && !l.startsWith("#")).map((l) => l.replace(/^-\s+/, ""));
+      data[key] = [unquote(first), ...more].join(" ").trim();
     }
   }
   return { data, body: md.slice(m[0].length) };
@@ -138,7 +145,10 @@ export class SkillLibrary {
     // Keep the keys this library doesn't manage (license, allowed-tools, metadata, ...).
     if (existing) {
       const old = FRONTMATTER.exec(fs.readFileSync(path.join(this.workspace, existing.path), "utf8"));
-      for (const e of old ? frontmatterEntries(old[1]!) : []) {
+      const { preamble, entries } = old ? frontmatterEntries(old[1]!) : { preamble: [], entries: [] };
+      const kept = preamble.filter((l) => l.trim());
+      if (kept.length) lines.splice(1, 0, ...kept);
+      for (const e of entries) {
         if (!MANAGED_KEYS.has(e.key)) lines.push(...trimTrailingBlank(e.lines));
       }
     }

@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { ApprovalService } from "./approvals.ts";
 import { EventBus } from "./events.ts";
@@ -23,12 +24,13 @@ import type {
   Routine,
   RoutineRun,
   SecretRequest,
+  ReplyRoute,
   ResumeContext,
   Settings,
   WakeEvent,
 } from "./types.ts";
 import { colorFor, hostTimezone, mimeFor, newId, oneLine, readJson, resolveInside, slugify, stripMarkdown, writeJson } from "./util.ts";
-import { ensureBotFolder, prepareWorkspace } from "./workspace.ts";
+import { ensureBotFolder, prepareWorkspace, type GateConfig } from "./workspace.ts";
 import type { AgentRuntime, McpServerSpec, RunOutcome } from "../runtimes/types.ts";
 
 /** Handoff replies are capped (like Hermes' 16k) so one long answer can't flood the requester's context. */
@@ -95,13 +97,15 @@ export class Harness {
   private restoring = false;
   private stopping = false;
   private gatewayPort = "";
-  private gateConfig?: { url: string; token: string; timeoutMs: number; protect: string[] };
+  private gatewayHost = "";
+  private gateConfig?: GateConfig;
   /** Turns spent per chain, shared by every branch of a fan-out. */
   private chainTurns = new Map<Id, { turns: number; at: number; notified: boolean }>();
   /** Chains whose hop-limit notice was already posted. */
   private hopNotified = new Set<Id>();
   /** Where each live chain started, so "stop" there reaches delegated work. */
-  private chainOrigin = new Map<Id, Id>();
+  private chainOrigin = new Map<Id, { convId: Id; at: number }>();
+  private lastChainPrune = 0;
   private stoppedChains = new Set<Id>();
   /** Bumped by "stop" in a conversation; wakes created before the bump are dropped. */
   private stopGens = new Map<Id, number>();
@@ -135,9 +139,12 @@ export class Harness {
 
   async start(opts: { gatewayUrl: string }): Promise<void> {
     const waitMs = (this.store.settings.approvals.inlineWaitSeconds + 30) * 1000;
-    this.gatewayPort = new URL(opts.gatewayUrl).port;
-    this.gateConfig = { url: opts.gatewayUrl, token: this.gateToken, timeoutMs: waitMs, protect: this.protectedPaths() };
+    const gw = new URL(opts.gatewayUrl);
+    this.gatewayPort = gw.port;
+    this.gatewayHost = gw.hostname.replace(/^\[|\]$/g, "");
+    this.gateConfig = { url: opts.gatewayUrl, token: this.gateToken, timeoutMs: waitMs, protect: this.protectedPaths(), workspace: this.store.paths.workspace };
     prepareWorkspace(this.store.paths, this.gateConfig);
+    this.quarantineProjectMcp();
     for (const b of this.store.bots.values()) ensureBotFolder(this.store.paths, b.handle);
     this.approvals.start();
     this.scheduler.start();
@@ -145,8 +152,42 @@ export class Harness {
   }
 
   /** Re-install the hooks and manual if a bot (or anything else) changed them. Cheap when nothing changed. */
-  healWorkspace(): void {
+  healWorkspace(botId?: Id): void {
     if (this.gateConfig) prepareWorkspace(this.store.paths, this.gateConfig, { onlyIfChanged: true });
+    this.quarantineProjectMcp(botId);
+  }
+
+  /**
+   * Cursor starts every server in workspace/.cursor/mcp.json for every bot,
+   * without asking you, and bots can edit files in the workspace. So the
+   * harness doesn't allow that file: it moves it into state/ (out of the bots'
+   * reach) and tells you. Add MCP servers through Connect apps instead, which
+   * live in the gateway's own config.
+   */
+  private quarantineProjectMcp(botId?: Id): void {
+    const file = path.join(this.store.paths.workspace, ".cursor", "mcp.json");
+    try {
+      fs.lstatSync(file);
+    } catch {
+      return;
+    }
+    const dir = path.join(this.store.paths.state, "quarantine");
+    const dest = path.join(dir, `mcp-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.renameSync(file, dest);
+    } catch (err) {
+      // Can't move it (permissions?): remove it rather than let it run unapproved.
+      fs.rmSync(file, { force: true });
+      console.warn(`[cursor-bots] removed workspace/.cursor/mcp.json (${(err as Error).message})`);
+    }
+    const text =
+      `Moved workspace/.cursor/mcp.json to ${path.relative(this.store.paths.home, dest)}. ` +
+      "Servers in that file would start for every bot without your approval, and bots can edit it. Add MCP servers in Connect apps instead.";
+    const dm = botId ? this.store.dmFor(botId) : undefined;
+    if (dm) this.postNotice(dm.id, text);
+    else console.warn(`[cursor-bots] ${text}`);
+    this.bus.emit({ type: "notice", level: "warn", text });
   }
 
   async stop(): Promise<void> {
@@ -156,7 +197,8 @@ export class Harness {
     // the running turns below must not overwrite the snapshot or start new work.
     this.persistQueue();
     this.stopping = true;
-    for (const r of this.runners.values()) await r.shutdown();
+    for (const r of this.runners.values()) r.freeze();
+    await Promise.all([...this.runners.values()].map((r) => r.shutdown()));
     for (const rt of this.runtimes.values()) await rt.dispose?.();
   }
 
@@ -323,13 +365,23 @@ export class Harness {
           const runId = w.routineRunId;
           void runner.whenDone(w.id).then((res) => this.scheduler.finishRun(routineId, runId, res.ok, res.error));
         }
-        if (w.chain.originConvId) this.chainOrigin.set(w.chain.id, w.chain.originConvId);
+        this.noteChainOrigin(w.chain);
+        // Stop generations live in memory; carry the saved ones over so a "stop" after the restart still wins.
+        const gens: Array<{ convId: Id; stopGen?: number }> = [w];
+        for (let r: ReplyRoute | undefined = w.replyTo; r; r = r.upstream) gens.push(r);
+        for (const g of gens) if (g.stopGen !== undefined) this.stopGens.set(g.convId, Math.max(this.stopGen(g.convId), g.stopGen));
         void runner.enqueue(w);
       }
     } finally {
       this.restoring = false;
       this.persistQueue();
+      for (const r of this.runners.values()) r.kick();
     }
+  }
+
+  /** True while the saved queue is being loaded (runners collect wakes without starting them). */
+  get restoringQueue(): boolean {
+    return this.restoring;
   }
 
   // ------------------------------------------------------------------ chains & stopping
@@ -340,9 +392,7 @@ export class Harness {
    */
   chargeChainTurn(wake: WakeEvent, convId: Id): number | undefined {
     const now = Date.now();
-    if (this.chainTurns.size > 2000) {
-      for (const [id, c] of this.chainTurns) if (now - c.at > 6 * 3600_000) this.chainTurns.delete(id);
-    }
+    this.pruneChains();
     const entry = this.chainTurns.get(wake.chain.id) ?? { turns: 0, at: now, notified: false };
     entry.turns += 1;
     entry.at = now;
@@ -361,6 +411,29 @@ export class Harness {
       chain.originConvId && this.store.conversations.has(chain.originConvId) ? chain.originConvId : convId,
       `Stopped a chain of bot-to-bot work after ${this.store.settings.limits.maxChainRuns} turns to prevent a loop. Send a message to continue.`,
     );
+  }
+
+  private noteChainOrigin(chain: WakeEvent["chain"]): void {
+    if (chain.originConvId && !this.chainOrigin.has(chain.id)) this.chainOrigin.set(chain.id, { convId: chain.originConvId, at: Date.now() });
+  }
+
+  /** Forget chains that have been idle for hours (nothing queued or running uses them). */
+  private pruneChains(): void {
+    const now = Date.now();
+    if (now - this.lastChainPrune < 10 * 60_000) return;
+    this.lastChainPrune = now;
+    const live = new Set<Id>();
+    for (const r of this.runners.values()) {
+      for (const w of r.queue) live.add(w.chain.id);
+      if (r.current) live.add(r.current.wake.chain.id);
+    }
+    const cutoff = now - 6 * 3600_000;
+    const idle = (id: Id, at: number) => at < cutoff && !live.has(id);
+    for (const [id, c] of this.chainTurns) if (idle(id, c.at)) this.chainTurns.delete(id);
+    for (const [id, o] of this.chainOrigin) if (idle(id, Math.max(o.at, this.chainTurns.get(id)?.at ?? 0))) this.chainOrigin.delete(id);
+    for (const set of [this.stoppedChains, this.hopNotified]) {
+      for (const id of set) if (!live.has(id) && !this.chainOrigin.has(id) && !this.chainTurns.has(id)) set.delete(id);
+    }
   }
 
   /** True while a chain may still create bot-to-bot wakes. */
@@ -690,11 +763,13 @@ export class Harness {
 
   markRead(id: Id): void {
     const c = this.store.conversations.get(id);
-    if (!c || (!c.unread && !c.attention)) return;
-    c.unread = 0;
+    if (!c) return;
     const hasPending =
       [...this.store.approvals.values()].some((a) => a.convId === id && a.status === "pending") ||
       [...this.store.secretRequests.values()].some((s) => s.convId === id && s.status === "pending");
+    // Nothing changes (e.g. a card is still waiting): no save and no event, or viewers would ask again forever.
+    if (!c.unread && c.attention === hasPending) return;
+    c.unread = 0;
     c.attention = hasPending;
     this.store.saveConversations();
     this.bus.emit({ type: "conversation.updated", conversation: c });
@@ -765,7 +840,8 @@ export class Harness {
 
   private newChain(originConvId: Id): WakeEvent["chain"] {
     const chain = { id: newId("chain"), depth: 0, runs: 0, originConvId };
-    this.chainOrigin.set(chain.id, originConvId);
+    this.pruneChains();
+    this.noteChainOrigin(chain);
     return chain;
   }
 
@@ -897,7 +973,7 @@ export class Harness {
 
   wake(ev: WakeEvent): Promise<void> {
     if (this.stopping || !this.store.bots.has(ev.botId) || this.isStale(ev)) return Promise.resolve();
-    if (ev.chain.originConvId) this.chainOrigin.set(ev.chain.id, ev.chain.originConvId);
+    this.noteChainOrigin(ev.chain);
     return this.runner(ev.botId).enqueue(ev);
   }
 
@@ -911,7 +987,7 @@ export class Harness {
     if (!conv) return false;
     this.stopGens.set(convId, this.stopGen(convId) + 1);
     const chains = new Set<Id>();
-    for (const [chainId, origin] of this.chainOrigin) if (origin === convId) chains.add(chainId);
+    for (const [chainId, origin] of this.chainOrigin) if (origin.convId === convId) chains.add(chainId);
     for (const c of chains) this.stoppedChains.add(c);
     let any = false;
     for (const r of this.runners.values()) {
@@ -971,7 +1047,9 @@ export class Harness {
       attachments: attachments.length ? attachments : undefined,
       allowSilence: false,
       kind: "handoff",
-      replyTo: expectReply ? { botId: from.bot.id, convId: from.wake.convId, handoffId, upstream: from.wake.replyTo } : undefined,
+      replyTo: expectReply
+        ? { botId: from.bot.id, convId: from.wake.convId, handoffId, upstream: from.wake.replyTo, stopGen: this.stopGen(from.wake.convId) }
+        : undefined,
       chain: { ...from.wake.chain, depth },
       createdAt: Date.now(),
     });
@@ -1045,6 +1123,8 @@ export class Harness {
       attachments: reply.attachments,
       allowSilence: conv.kind === "group",
       kind: "handoff_reply",
+      // A "stop" in the requester's conversation since the handoff drops this reply.
+      stopGen: route.stopGen,
       replyTo: route.upstream,
       chain: { ...state.wake.chain, depth },
       createdAt: Date.now(),
@@ -1181,11 +1261,6 @@ export class Harness {
       if (bot.connectors !== "all" && !bot.connectors.includes(name)) continue;
       out[name] = this.connectorSpec(c, x);
     }
-    // Per-turn servers replace the workspace's .cursor/mcp.json for that run, so
-    // carry its servers along (a connector with the same name wins).
-    if (Object.keys(out).length) {
-      for (const [name, c] of Object.entries(this.projectMcpServers())) if (!(name in out)) out[name] = this.connectorSpec(c, (v) => v);
-    }
     return out;
   }
 
@@ -1200,31 +1275,6 @@ export class Harness {
       headers: c.headers ? Object.fromEntries(Object.entries(c.headers).map(([k, v]) => [k, x(v)])) : undefined,
     };
   }
-
-  /** Servers from workspace/.cursor/mcp.json (Cursor's own format). Unreadable files count as empty. */
-  private projectMcpServers(): Record<string, Omit<ConnectorConfig, "enabled">> {
-    try {
-      const raw = JSON.parse(fs.readFileSync(path.join(this.store.paths.workspace, ".cursor", "mcp.json"), "utf8"));
-      const servers = raw?.mcpServers;
-      if (!servers || typeof servers !== "object") return {};
-      const out: Record<string, Omit<ConnectorConfig, "enabled">> = {};
-      for (const [name, v] of Object.entries(servers as Record<string, any>)) {
-        if (!v || typeof v !== "object" || (!v.command && !v.url)) continue;
-        out[name] = {
-          type: v.type === "sse" || v.type === "http" || v.type === "stdio" ? v.type : undefined,
-          command: typeof v.command === "string" ? v.command : undefined,
-          args: Array.isArray(v.args) ? v.args.map(String) : undefined,
-          env: v.env && typeof v.env === "object" ? v.env : undefined,
-          url: typeof v.url === "string" ? v.url : undefined,
-          headers: v.headers && typeof v.headers === "object" ? v.headers : undefined,
-        };
-      }
-      return out;
-    } catch {
-      return {};
-    }
-  }
-
 
   // ------------------------------------------------------------------ routines
 
@@ -1303,7 +1353,9 @@ export class Harness {
       convId,
       allowSilence: false,
       replyTo: resume?.replyTo,
-      chain: resume ? { ...resume.chain } : this.newChain(convId),
+      // Your decision is a new action: a fresh chain (so an earlier "stop" or a spent budget doesn't swallow it)
+      // that still starts where the original work did, so "stop" there reaches it.
+      chain: resume ? { ...this.newChain(resume.chain.originConvId ?? convId), depth: resume.chain.depth } : this.newChain(convId),
       createdAt: Date.now(),
       ...extra,
     });
@@ -1334,21 +1386,25 @@ export class Harness {
   }
 
   /** Which bot does a Cursor hook call belong to? Hooks only know the Cursor conversation id. */
-  private hookBot(conversationId: string | undefined): Id | undefined {
+  /**
+   * Which bot a hook call belongs to. "ambiguous" when the Cursor conversation
+   * is unknown and several bots are working: guessing would put the card (and
+   * the grant) on the wrong bot.
+   */
+  private hookBot(conversationId: string | undefined): Id | "ambiguous" | undefined {
     if (conversationId) {
       for (const b of this.store.bots.values()) if (b.agentId === conversationId) return b.id;
       const learned = this.hookSessions.get(conversationId);
       if (learned && this.store.bots.has(learned)) return learned;
     }
-    const busy = [...this.runners.values()].filter((r) => r.current).sort((a, b) => b.current!.startedAt - a.current!.startedAt);
+    const busy = [...this.runners.values()].filter((r) => r.current);
     if (!busy.length) return undefined;
-    if (busy.length === 1 && conversationId) this.hookSessions.set(conversationId, busy[0]!.botId);
-    return busy[0]!.botId;
+    return busy.length === 1 ? busy[0]!.botId : "ambiguous";
   }
 
   /** beforeSubmitPrompt hook: learn which bot owns a Cursor conversation from the prompt's <you> tag. */
   learnHookSession(conversationId: unknown, promptHead: unknown): { continue: true } {
-    const m = /<you name="[^"]*" handle="@([a-z0-9][a-z0-9-]*)"/.exec(String(promptHead ?? ""));
+    const m = /<you\b[^>]*\bhandle="@([a-z0-9][a-z0-9-]*)"/.exec(String(promptHead ?? ""));
     const bot = m ? this.store.botByHandle(m[1]!) : undefined;
     if (bot && typeof conversationId === "string" && conversationId) this.hookSessions.set(conversationId, bot.id);
     return { continue: true };
@@ -1357,8 +1413,30 @@ export class Harness {
   /** The gateway's own state: bots must not read or change it (tokens, secrets, settings, checkpoints). */
   protectedPaths(): string[] {
     const p = this.store.paths;
+    const dotCursor = path.join(p.workspace, ".cursor");
     // The hooks folder and hooks.json are the approval gate itself; the manual is the bots' rulebook.
-    return [p.state, p.cursorStore, p.config, p.connectors, p.logs, p.hooksDir, p.hooksJson, path.join(p.rulesDir, "cursor-bots.mdc")];
+    // mcp.json would start servers without approval; the others are Cursor's own permission and sandbox config.
+    return [
+      p.state,
+      p.cursorStore,
+      p.config,
+      p.connectors,
+      p.logs,
+      p.hooksDir,
+      p.hooksJson,
+      path.join(p.rulesDir, "cursor-bots.mdc"),
+      ...["mcp.json", "mcp-approvals.json", "cli.json", "cli-config.json", "permissions.json", "sandbox.json"].map((f) => path.join(dotCursor, f)),
+    ];
+  }
+
+  /** True if a path (after following symlinks) is one of the protected paths or inside one. */
+  private insideProtected(target: string): boolean {
+    const abs = path.resolve(this.store.paths.workspace, target);
+    const candidates = [abs, realPrefix(abs)];
+    return this.protectedPaths().some((root) => {
+      const roots = [root, realPrefix(root)];
+      return candidates.some((c) => roots.some((r) => c === r || c.startsWith(r + path.sep)));
+    });
   }
 
   /**
@@ -1367,11 +1445,16 @@ export class Harness {
    * (Bots run as your OS user, so this raises the bar; it isn't a sandbox.)
    */
   touchesHarness(command: string): boolean {
-    if (this.protectedPaths().some((p) => command.includes(p))) return true;
-    if (/\b(secret\.key|secrets\.vault|ui\.token|mcp\.token|gate\.token|cursor-store|cursor-bots-gate|cursor-bots\.mdc)\b/.test(command)) return true;
-    if (/\.cursor\/(hooks\b|hooks\.json)/.test(command)) return true;
-    if (/\.\.\/+(state|settings\.json|connectors\.json)\b/.test(command)) return true;
-    if (this.gatewayPort && new RegExp(`(localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|\\[::1\\]):${this.gatewayPort}\\b`).test(command)) return true;
+    // Spell the home folder out, so ~/.cursor-bots/state and $HOME/... match the absolute paths.
+    const home = os.homedir();
+    const cmd = command.replace(/(^|[\s=:'"(])~(?=\/)/g, `$1${home}`).replace(/\$\{HOME\}|\$HOME\b/g, home);
+    if (this.protectedPaths().some((p) => cmd.includes(p))) return true;
+    if (/\b(secret\.key|secrets\.vault|ui\.token|mcp\.token|gate\.token|cursor-store|cursor-bots-gate|cursor-bots\.mdc)\b/.test(cmd)) return true;
+    if (/\.cursor\/(hooks\b|hooks\.json|mcp\.json|mcp-approvals\.json|cli\.json|cli-config\.json|permissions\.json|sandbox\.json)/.test(cmd)) return true;
+    if (/\.\.\/+(state|settings\.json|connectors\.json)\b/.test(cmd)) return true;
+    // The gateway's port with any host in front (loopback spellings, the address it's bound to, a LAN IP).
+    if (this.gatewayPort && new RegExp(`[\\w\\]]:${this.gatewayPort}(?!\\d)`).test(cmd)) return true;
+    if (this.gatewayHost && !["127.0.0.1", "localhost", "::1", "0.0.0.0", "::"].includes(this.gatewayHost) && cmd.includes(this.gatewayHost)) return true;
     return false;
   }
 
@@ -1379,7 +1462,9 @@ export class Harness {
   async gateShell(input: Record<string, unknown>): Promise<{ permission: "allow" | "deny"; user_message?: string; agent_message?: string }> {
     const command = String(input.command ?? "").trim();
     if (!command) return { permission: "allow" };
-    if (this.touchesHarness(command)) {
+    // The SDK passes the shell tool's working directory as cwd; running from inside state/ needs no path at all.
+    const cwd = typeof input.cwd === "string" && input.cwd ? input.cwd : undefined;
+    if (this.touchesHarness(command) || (cwd && this.insideProtected(cwd))) {
       return {
         permission: "deny",
         user_message: "Blocked: a bot tried to reach Cursor Bots' own API or state.",
@@ -1390,6 +1475,14 @@ export class Harness {
     const botId = this.hookBot(typeof input.conversation_id === "string" ? input.conversation_id : undefined);
     // Not one of our bots (e.g. you opened the workspace in the Cursor IDE): leave it to Cursor.
     if (!botId) return { permission: "allow" };
+    if (botId === "ambiguous") {
+      if (this.approvals.evaluate("shell", command) === "allow") return { permission: "allow" };
+      return {
+        permission: "deny",
+        user_message: "Blocked: Cursor Bots couldn't tell which bot ran this command, so it couldn't ask you.",
+        agent_message: "This command needs the user's approval, but the gateway couldn't tell which bot is running it. Try it again in a moment.",
+      };
+    }
     const cur = this.runners.get(botId)?.current;
     const convId = cur ? this.visibleConvFor(cur.wake) : this.store.dmFor(botId)?.id;
     if (!convId) return { permission: "allow" };
@@ -1543,4 +1636,21 @@ export class Harness {
       avatarShapes: AVATAR_SHAPES,
     };
   }
+}
+
+/** Follow symlinks on the longest existing prefix of a path (new files resolve through their parent). */
+function realPrefix(p: string): string {
+  const rest: string[] = [];
+  let cur = p;
+  for (let i = 0; i < 64; i++) {
+    try {
+      return path.join(fs.realpathSync(cur), ...rest);
+    } catch {
+      const parent = path.dirname(cur);
+      if (parent === cur) break;
+      rest.unshift(path.basename(cur));
+      cur = parent;
+    }
+  }
+  return p;
 }

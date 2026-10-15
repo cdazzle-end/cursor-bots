@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { AddressInfo } from "node:net";
 import { parseArgs } from "node:util";
 import { Harness } from "./core/harness.ts";
 import { defaultHome } from "./core/paths.ts";
@@ -81,7 +82,16 @@ async function start(argv: string[]): Promise<void> {
     server.once("error", reject);
     server.listen(port, values.host, () => resolve());
   });
-  await h.start({ gatewayUrl: `http://127.0.0.1:${port}` });
+  // The approval hook must reach the gateway at an address it really listens on;
+  // if it can't connect it assumes the gateway is off and lets commands through.
+  const gatewayUrl = boundUrl(server.address() as AddressInfo);
+  await h.start({ gatewayUrl });
+  if (!(await gateReachable(gatewayUrl, h.gateToken))) {
+    console.error(`\n  ✖ The approval hook can't reach the gateway at ${gatewayUrl}. Start with a --host this machine can connect to (e.g. 127.0.0.1).\n`);
+    server.close();
+    await h.stop().catch(() => {});
+    process.exit(1);
+  }
   if (values.starter) createStarterTeam(h);
 
   const rt = h.runtimes.get(h.store.settings.runtime);
@@ -113,8 +123,30 @@ async function start(argv: string[]): Promise<void> {
   process.on("SIGTERM", shutdown);
 }
 
+function boundUrl(a: AddressInfo): string {
+  const host = a.address === "0.0.0.0" || a.address === "::" ? "127.0.0.1" : a.address;
+  return `http://${host.includes(":") ? `[${host}]` : host}:${a.port}`;
+}
+
+async function gateReachable(url: string, gateToken: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${url}/api/gate/prompt`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-gate-token": gateToken },
+      body: "{}",
+      signal: AbortSignal.timeout(5000),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 function uiToken(stateDir: string): string {
-  if (process.env.CURSOR_BOTS_TOKEN) return process.env.CURSOR_BOTS_TOKEN;
+  const fromEnv = process.env.CURSOR_BOTS_TOKEN;
+  // Bots' shell commands inherit this process's environment; the token must not be in it.
+  delete process.env.CURSOR_BOTS_TOKEN;
+  if (fromEnv) return fromEnv;
   const tokenFile = path.join(stateDir, "ui.token");
   let token = fs.existsSync(tokenFile) ? fs.readFileSync(tokenFile, "utf8").trim() : "";
   if (!token) {
@@ -147,8 +179,11 @@ async function doctor(argv: string[]): Promise<void> {
   try {
     const sdk = await import("@cursor/sdk");
     ok("@cursor/sdk loads");
+    if (process.env.CURSOR_API_KEY === "") delete process.env.CURSOR_API_KEY;
     const creds = cursorCredentials();
-    if (creds) {
+    if (creds === "expired") {
+      bad("Your stored Cursor login has expired: log in again or set CURSOR_API_KEY.");
+    } else if (creds) {
       try {
         const me = await sdk.Cursor.me();
         ok(`${creds === "key" ? "CURSOR_API_KEY" : "Stored Cursor login"} works (${me.userEmail ?? me.apiKeyName})`);
@@ -181,7 +216,10 @@ async function doctor(argv: string[]): Promise<void> {
 
 async function models(): Promise<void> {
   const sdk = await import("@cursor/sdk");
-  if (!cursorCredentials()) throw new Error("No Cursor credentials found: set CURSOR_API_KEY first.");
+  if (process.env.CURSOR_API_KEY === "") delete process.env.CURSOR_API_KEY;
+  const creds = cursorCredentials();
+  if (creds === "expired") throw new Error("Your stored Cursor login has expired: log in again or set CURSOR_API_KEY.");
+  if (!creds) throw new Error("No Cursor credentials found: set CURSOR_API_KEY first.");
   for (const m of await sdk.Cursor.models.list()) {
     const params = (m.parameters ?? []).map((p) => `${p.id}=${p.values.map((v) => v.value).join("|")}`).join(" ");
     console.log(`${m.id.padEnd(28)} ${m.displayName}${params ? `  [${params}]` : ""}`);

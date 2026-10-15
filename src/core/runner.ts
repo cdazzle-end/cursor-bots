@@ -83,6 +83,11 @@ export class BotRunner {
     const cur = this.current;
     const steerable =
       ev.source === "user" && !ev.attachments?.length && !this.h.expandSkillRefs(ev.text, cur?.bot ?? this.h.store.bots.get(this.botId)!).length;
+    // While the gateway restores its saved queue, just collect; it starts the queue (in priority order) at the end.
+    if (this.h.restoringQueue) {
+      this.queue.push(ev);
+      return;
+    }
     if (cur?.run?.steer && steerable && ev.convId === cur.wake.convId && !cur.cancelled) {
       const ok = await cur.run.steer(`Message from ${this.h.store.settings.user.name} while you work:\n${ev.text}`);
       if (ok) {
@@ -124,14 +129,27 @@ export class BotRunner {
     return stopped;
   }
 
+  /** Start processing the queue (after a restore). */
+  kick(): void {
+    this.emitStatus();
+    void this.pump();
+  }
+
+  /**
+   * First step of a gateway shutdown, done for every bot before any cancel is
+   * awaited: start nothing new, and treat the running turn as cancelled so a
+   * turn that ends meanwhile posts nothing (it's restored as interrupted).
+   */
+  freeze(): void {
+    this.shuttingDown = true;
+    if (this.current) this.current.cancelled = true;
+  }
+
   /** Gateway shutdown: cancel the running turn but keep the queue, so it's restored on restart. */
   async shutdown(): Promise<void> {
-    this.shuttingDown = true;
+    this.freeze();
     const cur = this.current;
-    if (cur) {
-      cur.cancelled = true;
-      await cur.run?.cancel().catch(() => {});
-    }
+    if (cur) await cur.run?.cancel().catch(() => {});
     await this.session?.close().catch(() => {});
     this.session = undefined;
   }
@@ -277,7 +295,7 @@ export class BotRunner {
     let outcome: RunOutcome;
     try {
       // Re-install the approval hooks if anything changed them since the last turn.
-      h.healWorkspace();
+      h.healWorkspace(bot.id);
       const session = await this.ensureSession(bot);
 
       // Messages in this conversation the bot hasn't seen (other bots, earlier turns).
@@ -334,7 +352,6 @@ export class BotRunner {
         routineName: wake.routineId ? store.routines.get(wake.routineId)?.name : undefined,
       });
       const newest = store.messages(conv.id).at(-1);
-      if (newest) store.markSeen(bot.id, conv.id, newest.ts);
 
       const run = await session.send({
         text: prompt,
@@ -361,6 +378,14 @@ export class BotRunner {
         },
       });
       state.run = run;
+      // Only now has the model got this context; a send that throws leaves it unseen for next time.
+      if (newest) {
+        store.markSeen(bot.id, conv.id, newest.ts);
+        for (const id of this.delivered) {
+          const m = store.findMessage(conv.id, id);
+          if (m && m.ts <= newest.ts) this.delivered.delete(id);
+        }
+      }
       if (state.cancelled) await run.cancel().catch(() => {});
       outcome = await run.wait();
     } catch (err: any) {

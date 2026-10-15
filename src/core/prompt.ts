@@ -15,6 +15,11 @@ import { formatLocalTime, shortTime, slugify, truncate } from "./util.ts";
  * what the runtime can't know (other conversations, memory, the roster).
  */
 
+/** Attribute values come from names you and bots choose; keep a quote from breaking the tag. */
+function attr(v: string): string {
+  return v.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+}
+
 export function groupTag(c: Conversation): string {
   return `#${slugify(c.title ?? "group")}`;
 }
@@ -71,7 +76,7 @@ export function buildPrompt(p: PromptParts): string {
 
   out.push("<harness>");
   if (p.includeIdentity) {
-    out.push(`<you name="${bot.name}" handle="@${bot.handle}">`);
+    out.push(`<you name="${attr(bot.name)}" handle="@${bot.handle}">`);
     if (bot.label) out.push(`Label: ${bot.label}`);
     out.push(`Job: ${bot.about?.trim() || "Not described yet. Ask the user what you should own, then save it to memory."}`);
     if (bot.createdBy !== "user") {
@@ -84,7 +89,7 @@ export function buildPrompt(p: PromptParts): string {
     out.push(`<memory${mem.truncated ? ' truncated="true (use memory_read for all of it)"' : ""}>`);
     out.push(mem.text || "(empty — nothing saved yet)");
     out.push("</memory>");
-    out.push(`<team user="${user.name}${user.label ? ` (${user.label})` : ""}">`);
+    out.push(`<team user="${attr(user.name + (user.label ? ` (${user.label})` : ""))}">`);
     const others = [...store.bots.values()].filter((b) => b.id !== bot.id);
     if (!others.length) out.push("You are the only bot so far.");
     for (const b of others) {
@@ -98,14 +103,14 @@ export function buildPrompt(p: PromptParts): string {
     }
     out.push("</team>");
   } else {
-    out.push(`<you name="${bot.name}" handle="@${bot.handle}">Identity, memory and team are unchanged since your last turn.</you>`);
+    out.push(`<you name="${attr(bot.name)}" handle="@${bot.handle}">Identity, memory and team are unchanged since your last turn.</you>`);
   }
   out.push(`<now>${now}</now>`);
   out.push("</harness>");
   out.push("");
 
   if (p.unseen.length) {
-    out.push(`<context conversation="${conversationLabel(store, conv, bot.id)}">`);
+    out.push(`<context conversation="${attr(conversationLabel(store, conv, bot.id))}">`);
     out.push("Messages here since you last looked (oldest first):");
     for (const m of p.unseen) out.push(renderMessage(store, m, p.timezone, 800));
     out.push("</context>");
@@ -113,7 +118,7 @@ export function buildPrompt(p: PromptParts): string {
   }
 
   for (const s of p.skills ?? []) {
-    out.push(`<skill name="${s.name}">`);
+    out.push(`<skill name="${attr(s.name)}">`);
     out.push(`The user referenced this skill. Follow it for this request.`);
     out.push(s.content.trim());
     out.push("</skill>");
@@ -126,9 +131,9 @@ export function buildPrompt(p: PromptParts): string {
       : wake.fromBotId
         ? `@${store.bots.get(wake.fromBotId)?.handle ?? "bot"}`
         : wake.source;
-  const attrs = [`from="${from}"`, `kind="${p.incomingKind}"`, `via="${conversationLabel(store, conv, bot.id)}"`];
+  const attrs = [`from="${attr(from)}"`, `kind="${p.incomingKind}"`, `via="${attr(conversationLabel(store, conv, bot.id))}"`];
   if (p.addressed) attrs.push(`addressed="${p.addressed}"`);
-  if (p.routineName) attrs.push(`routine="${p.routineName}"`);
+  if (p.routineName) attrs.push(`routine="${attr(p.routineName)}"`);
   out.push(`<incoming ${attrs.join(" ")}>`);
   out.push(wake.text.trim() || "(no text)");
   for (const a of wake.attachments ?? []) out.push(attachmentLine(a, p.inlinedImages.has(a.path)));

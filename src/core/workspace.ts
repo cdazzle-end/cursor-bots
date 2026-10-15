@@ -24,14 +24,35 @@ try { input = JSON.parse(fs.readFileSync(0, "utf8") || "{}"); } catch {}
 const done = (out) => { process.stdout.write(JSON.stringify(out)); process.exit(0); };
 
 if (mode === "tool") {
-  const roots = (cfg.protect ?? []).map((p) => path.resolve(p));
+  // Resolve symlinks on the longest existing prefix, so a link inside the
+  // workspace can't lead into protected state (new files resolve via their parent).
+  const real = (p) => {
+    const rest = [];
+    let cur = p;
+    for (let i = 0; i < 64; i++) {
+      try { return path.join(fs.realpathSync(cur), ...rest); } catch {}
+      const parent = path.dirname(cur);
+      if (parent === cur) break;
+      rest.unshift(path.basename(cur));
+      cur = parent;
+    }
+    return p;
+  };
+  const roots = [...new Set((cfg.protect ?? []).flatMap((p) => [path.resolve(p), real(path.resolve(p))]))];
   const cwd = input.cwd || (input.workspace_roots ?? [])[0] || process.cwd();
+  const ws = real(path.resolve(cfg.workspace || cwd));
+  const inside = (abs) => roots.some((r) => abs === r || abs.startsWith(r + path.sep));
+  // Search and listing tools walk directories: a target that contains protected state
+  // outside the workspace (e.g. a link to the home folder) is as bad as one inside it.
+  const walks = /^(Grep|Glob|List|LS)$/.test(String(input.tool_name ?? ""));
+  const contains = (abs) => roots.some((r) => !(r === ws || r.startsWith(ws + path.sep)) && r.startsWith(abs + path.sep));
   const hits = [];
   const visit = (v) => {
     if (typeof v === "string") {
-      if (v.length < 4096 && !v.includes("\\n") && /[\\/\\\\]/.test(v)) {
+      if (v && v.length < 4096 && !v.includes("\\n")) {
         const abs = path.resolve(cwd, v);
-        if (roots.some((r) => abs === r || abs.startsWith(r + path.sep))) hits.push(v);
+        const r = real(abs);
+        if (inside(abs) || inside(r) || (walks && (contains(abs) || contains(r)))) hits.push(v);
       }
     } else if (v && typeof v === "object") {
       for (const x of Object.values(v)) visit(x);
@@ -73,6 +94,8 @@ export interface GateConfig {
   token: string;
   timeoutMs: number;
   protect: string[];
+  /** The bots' workspace (protected paths inside it don't block searching it). */
+  workspace: string;
 }
 
 function gateScript(cfg: GateConfig): string {
@@ -125,7 +148,8 @@ export function prepareWorkspace(paths: HomePaths, gate: GateConfig, opts: { onl
   prompt.unshift({ command: "node .cursor/hooks/cursor-bots-gate.mjs prompt", timeout: 10 });
   cfg.hooks.beforeSubmitPrompt = prompt;
   const tool = (cfg.hooks.preToolUse ?? []).filter((h) => !ours(h));
-  tool.unshift({ command: "node .cursor/hooks/cursor-bots-gate.mjs tool", matcher: "Read|Write|Edit|Delete|Grep|Glob|LS", timeout: 10 });
+  // The SDK's file tools are Read, Write, Delete, Grep, List and ReadLints ("Read" also matches ReadLints).
+  tool.unshift({ command: "node .cursor/hooks/cursor-bots-gate.mjs tool", matcher: "Read|Write|Edit|Delete|Grep|Glob|List|LS", timeout: 10 });
   cfg.hooks.preToolUse = tool;
   writeIfChanged(paths.hooksJson, JSON.stringify(cfg, null, 2) + "\n", quick);
 }

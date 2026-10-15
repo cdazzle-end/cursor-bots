@@ -134,6 +134,14 @@ test("the installed Cursor hook script maps sessions to bots and gates shell com
     assert.equal((await runHook("tool", { cwd: ws, tool_name: "Read", tool_input: { path: "bots/shipper/notes.md" } })).permission, "allow");
     assert.equal((await runHook("tool", { cwd: ws, tool_name: "Write", tool_input: { path: "notes.md", contents: "see ../state/x\nand more" } })).permission, "allow");
 
+    // A symlink inside the workspace can't lead file tools into state/, and List is checked too.
+    fs.symlinkSync("..", path.join(ws, "up"));
+    assert.equal((await runHook("tool", { cwd: ws, tool_name: "Read", tool_input: { path: "up/state/ui.token" } })).permission, "deny");
+    assert.equal((await runHook("tool", { cwd: ws, tool_name: "Grep", tool_input: { pattern: "token", path: "up" } })).permission, "deny");
+    assert.equal((await runHook("tool", { cwd: ws, tool_name: "Grep", tool_input: { pattern: "token", path: "." } })).permission, "allow");
+    assert.equal((await runHook("tool", { cwd: ws, tool_name: "List", tool_input: { path: s.h.store.paths.state } })).permission, "deny");
+    assert.match(hooks.hooks.preToolUse[0].matcher, /List/);
+
     // The hook itself, its config and hooks.json are off-limits too (deleting them would switch the gate off).
     for (const p of [".cursor/hooks/cursor-bots-gate.mjs", ".cursor/hooks.json", ".cursor/rules/cursor-bots.mdc"]) {
       assert.equal((await runHook("tool", { cwd: ws, tool_name: "Delete", tool_input: { path: p } })).permission, "deny", p);

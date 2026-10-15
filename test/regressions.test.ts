@@ -289,22 +289,79 @@ test("settings keep a model's params when the same model is saved without them",
   }
 });
 
-test("the workspace's .cursor/mcp.json servers ride along when a bot has connectors", async () => {
+test("a workspace .cursor/mcp.json is moved out of the bots' reach before the next turn", async () => {
   const { h, cleanup } = await makeHarness();
   try {
-    const a = h.createBot({ name: "Surfer" });
-    const b = h.createBot({ name: "Plain", connectors: [] });
-    fs.mkdirSync(path.join(h.store.paths.workspace, ".cursor"), { recursive: true });
-    fs.writeFileSync(
-      path.join(h.store.paths.workspace, ".cursor", "mcp.json"),
-      JSON.stringify({ mcpServers: { docs: { url: "https://docs.example/mcp" }, github: { command: "project-github" } } }),
-    );
+    const bot = h.createBot({ name: "Surfer" });
+    const dm = h.store.dmFor(bot.id)!;
+    const file = path.join(h.store.paths.workspace, ".cursor", "mcp.json");
+    // Servers in this file would start for every bot with no approval.
+    fs.writeFileSync(file, JSON.stringify({ mcpServers: { notes: { command: "sh", args: ["-c", "echo pwned"] } } }));
     h.store.connectors = { github: { command: "npx", args: ["server-github"], enabled: true } };
-    const mcp = h.mcpServersFor(a);
-    assert.deepEqual(Object.keys(mcp).sort(), ["docs", "github"]);
-    assert.equal(mcp.github!.command, "npx", "a connector wins over a project server with the same name");
-    assert.equal(mcp.docs!.url, "https://docs.example/mcp");
-    assert.deepEqual(h.mcpServersFor(b), {}, "no per-turn servers: the SDK loads mcp.json itself");
+    await h.postUserMessage(dm.id, { text: "hi" });
+    await settle(h);
+    assert.equal(fs.existsSync(file), false);
+    const moved = fs.readdirSync(path.join(h.store.paths.state, "quarantine"));
+    assert.equal(moved.length, 1);
+    assert.match(fs.readFileSync(path.join(h.store.paths.state, "quarantine", moved[0]!), "utf8"), /echo pwned/);
+    assert.ok(h.store.messages(dm.id).some((m) => m.kind === "notice" && /Moved workspace\/\.cursor\/mcp\.json/.test(m.text)));
+    assert.deepEqual(Object.keys(h.mcpServersFor(bot)), ["github"], "only connectors reach the bot");
+    // And bots can't write it in the first place.
+    assert.ok(h.protectedPaths().includes(file));
+    assert.ok(h.touchesHarness("echo '{}' > .cursor/mcp.json"));
+  } finally {
+    await cleanup();
+  }
+});
+
+test("shell gate: home-relative spellings, the tool's cwd and the bound host count as touching the gateway", async () => {
+  const { h, cleanup } = await makeHarness();
+  try {
+    const state = h.store.paths.state;
+    // Pretend the Cursor Bots home sits in your home folder, as it does by default (~/.cursor-bots).
+    const realHome = process.env.HOME;
+    process.env.HOME = path.dirname(h.store.paths.home);
+    try {
+      const rel = path.relative(os.homedir(), state);
+      assert.ok(h.touchesHarness(`cat ~/${rel}/ui.token`));
+      assert.ok(h.touchesHarness(`ls $HOME/${rel}`));
+      assert.ok(h.touchesHarness(`ls \${HOME}/${rel}`));
+      assert.ok(!h.touchesHarness("ls ~/projects"));
+    } finally {
+      process.env.HOME = realHome;
+    }
+    assert.ok(h.touchesHarness("curl -s http://192.168.1.20:1/api/state"), "any host on the gateway's port");
+    assert.ok(!h.touchesHarness("curl -s http://example.com:8080/"));
+    const r = await h.gateShell({ command: "cat *", cwd: state });
+    assert.equal(r.permission, "deny", "running inside state/ is blocked even with no path in the command");
+    // A symlink inside the workspace that leads into state/ counts too.
+    fs.symlinkSync(state, path.join(h.store.paths.workspace, "notes-link"));
+    assert.equal((await h.gateShell({ command: "ls", cwd: path.join(h.store.paths.workspace, "notes-link") })).permission, "deny");
+    assert.equal((await h.gateShell({ command: "ls", cwd: h.store.paths.workspace })).permission, "allow");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("shell gate: an unknown Cursor conversation with several bots working isn't pinned on one of them", async () => {
+  const { h, cleanup } = await makeHarness();
+  try {
+    const a = h.createBot({ name: 'Dr "Doc"' });
+    const b = h.createBot({ name: "Bee" });
+    // A quote in the name no longer breaks learning which bot owns a conversation.
+    h.learnHookSession("conv-a", `<harness>\n<you name="Dr &quot;Doc&quot;" handle="@${a.handle}">`);
+    await h.postUserMessage(h.store.dmFor(a.id)!.id, { text: "[[sleep 400]] [[reply a]]" });
+    await h.postUserMessage(h.store.dmFor(b.id)!.id, { text: "[[sleep 400]] [[reply b]]" });
+    await until(() => h.runner(a.id).status().state === "working" && h.runner(b.id).status().state === "working");
+    const known = await h.gateShell({ command: "git push origin main", conversation_id: "conv-a" });
+    assert.equal(known.permission, "deny");
+    assert.equal(h.approvals.pendingFor(a.id).length, 1, "the card went to the bot that owns the conversation");
+    const unknown = await h.gateShell({ command: "git push origin other", conversation_id: "conv-unknown" });
+    assert.equal(unknown.permission, "deny");
+    assert.match(unknown.agent_message!, /couldn't tell which bot/);
+    assert.equal(h.approvals.pendingFor(b.id).length, 0, "no card on a bot that didn't ask");
+    assert.equal((await h.gateShell({ command: "ls", conversation_id: "conv-unknown" })).permission, "allow", "allowed commands still run");
+    await settle(h);
   } finally {
     await cleanup();
   }
@@ -357,4 +414,218 @@ test("the HTTP API counts changes you make as activity", async () => {
     await h.stop();
     fs.rmSync(home, { recursive: true, force: true });
   }
+});
+
+// ------------------------------------------------------------------ second review round
+
+test("an approval you decide after a 'stop' in that chat still wakes the bot", async () => {
+  const { h, cleanup } = await makeHarness();
+  try {
+    const bot = h.createBot({ name: "Mailer" });
+    const dm = h.store.dmFor(bot.id)!;
+    await h.postUserMessage(dm.id, { text: '[[tool request_approval {"action":"Send the newsletter"}]] [[reply waiting]]' });
+    await settle(h);
+    await h.postUserMessage(dm.id, { text: "stop" });
+    await settle(h);
+    const before = texts(h, dm.id).filter((t) => t.startsWith("@mailer")).length;
+    h.decideApproval(h.approvals.pendingFor(bot.id)[0]!.id, "once");
+    await settle(h);
+    assert.equal(texts(h, dm.id).filter((t) => t.startsWith("@mailer")).length, before + 1, "your decision is a new action");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("'stop' in a group also drops a handoff reply coming back to that group", async () => {
+  const { h, cleanup } = await makeHarness();
+  try {
+    const alpha = h.createBot({ name: "Alpha" });
+    const beta = h.createBot({ name: "Beta" });
+    const gamma = h.createBot({ name: "Gamma" });
+    const crew = h.createGroup({ title: "Crew", members: [alpha.id, beta.id] });
+    const forGamma = nested("[[sleep 500]] [[reply gamma review done]]");
+    const forBeta = nested(`[[tool send_message {"to":"@gamma","text":"${forGamma}"}]] [[sleep 2000]] [[reply beta done]]`);
+    // Alpha starts the chain in its DM and asks Beta in #crew; Beta hands part of it to Gamma.
+    await h.postUserMessage(h.store.dmFor(alpha.id)!.id, { text: `[[tool send_message {"to":"#crew","text":"@beta ${forBeta}"}]] [[reply posted]]` });
+    await until(() => h.runner(gamma.id).status().state === "working");
+    await h.postUserMessage(crew.id, { text: "stop" });
+    await settle(h);
+    const after = h.store.messages(crew.id);
+    const stoppedAt = after.findIndex((m) => m.kind === "notice" && /^Stopped/.test(m.text));
+    assert.ok(stoppedAt >= 0);
+    assert.ok(!after.slice(stoppedAt).some((m) => m.author.kind === "bot"), "nothing posts in #crew after you stopped it");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("shutdown freezes every bot before waiting on any cancel: nothing runs twice after a restart", async () => {
+  const { h, home } = await makeHarness();
+  const alpha = h.createBot({ name: "Alpha" });
+  const beta = h.createBot({ name: "Beta" });
+  const g = h.createGroup({ title: "Crew", members: [alpha.id, beta.id] });
+  await h.postUserMessage(h.store.dmFor(alpha.id)!.id, { text: "[[sleep 3000]] [[reply alpha never]]" });
+  await h.postUserMessage(g.id, { text: "@beta [[sleep 150]] [[reply beta group]]" });
+  await h.postUserMessage(h.store.dmFor(beta.id)!.id, { text: "[[reply BETA-DM-ANSWER]]" });
+  await until(() => h.runner(alpha.id).status().state === "working" && h.runner(beta.id).status().state === "working");
+  // A slow cancel (real SDK runs take a moment to abort) used to let Beta keep going meanwhile.
+  const cur = (h.runner(alpha.id) as any).current;
+  await until(() => Boolean(cur.run));
+  const cancel = cur.run.cancel.bind(cur.run);
+  cur.run.cancel = async () => {
+    await sleep(400);
+    return cancel();
+  };
+  await h.stop();
+  const h2 = await restart(home);
+  try {
+    await settle(h2);
+    const dm = texts(h2, h2.store.dmFor(beta.id)!.id).filter((t) => /^@beta: BETA-DM-ANSWER/.test(t));
+    assert.equal(dm.length, 1, "the queued DM ran once, after the restart");
+  } finally {
+    await h2.stop();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a restart restores the queue in priority order: your message before a background routine", async () => {
+  const { h, home } = await makeHarness();
+  const worker = h.createBot({ name: "Worker" });
+  const other = h.createBot({ name: "Other" });
+  const g = h.createGroup({ title: "Crew", members: [worker.id, other.id] });
+  const r = h.scheduler.create({ botId: worker.id, name: "Digest", instruction: "[[reply routine output]]", cron: "0 9 * * *" });
+  await h.postUserMessage(g.id, { text: "@worker [[sleep 3000]] [[reply never]]" });
+  await until(() => h.runner(worker.id).status().state === "working");
+  await h.scheduler.fire(r.id, "schedule");
+  await h.postUserMessage(h.store.dmFor(worker.id)!.id, { text: "[[reply your urgent question]]" });
+  await h.stop();
+  const h2 = await restart(home);
+  try {
+    await settle(h2);
+    const order = [...h2.store.conversations.keys()]
+      .flatMap((id) => h2.store.messages(id))
+      .filter((m) => m.author.kind === "bot" && /routine output|your urgent question/.test(m.text))
+      .sort((a, b) => a.ts - b.ts)
+      .map((m) => m.text);
+    assert.deepEqual(order, ["your urgent question", "routine output"]);
+  } finally {
+    await h2.stop();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a send that fails before the run starts keeps the unseen context for the next turn", async () => {
+  const { h, mock, cleanup } = await makeHarness();
+  try {
+    const alpha = h.createBot({ name: "Alpha" });
+    const beta = h.createBot({ name: "Beta" });
+    const g = h.createGroup({ title: "Crew", members: [alpha.id, beta.id] });
+    await h.postUserMessage(g.id, { text: "@alpha hello" });
+    await settle(h);
+    await h.postUserMessage(g.id, { text: "@beta [[reply BETA-FINDING]]" });
+    await settle(h);
+    const session = [...mock.sessions.values()].find((s) => s.name === "Alpha")!;
+    const send = session.send.bind(session);
+    let failed = false;
+    session.send = async (input) => {
+      if (!failed) {
+        failed = true;
+        throw new Error("ECONNRESET");
+      }
+      return send(input);
+    };
+    await h.postUserMessage(g.id, { text: "@alpha what did beta find?" });
+    await settle(h);
+    await h.postUserMessage(g.id, { text: "@alpha again please" });
+    await settle(h);
+    assert.match(session.prompts.at(-1)!, /BETA-FINDING/, "the retry still shows what Alpha missed");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("cron spacing is checked on the day's time slots: fast for frequent schedules, dense days far ahead still caught", async () => {
+  const { validateCron } = await import("../src/core/scheduler.ts");
+  for (const expr of ["* * 1 * *", "0-59 0 1 * *", "* * * 12 *", "0,1 0 1 1 *", "*/4 * * * *", "0,3 9 * * *", "0,58 0,23 * * *" /* 23:58 → 00:00 next day */]) {
+    assert.ok(validateCron(expr, "UTC", 5), `${expr} is rejected`);
+  }
+  const t0 = Date.now();
+  for (const expr of ["*/5 * * * *", "0 9 * * *", "0 8 * * 1-5", "30 */2 * * *", "0,30 9-17 * * 1-5", "0 0 1 1 *"]) {
+    assert.equal(validateCron(expr, "America/New_York", 5), undefined, expr);
+  }
+  assert.ok(Date.now() - t0 < 200, "no long croner walk on the event loop");
+  assert.match(validateCron("0 0 30 2 *", "UTC", 5)!, /never runs|Invalid/);
+});
+
+test("Cursor credentials: an expired stored login and an empty CURSOR_API_KEY aren't reported as usable", async () => {
+  const { cursorCredentials } = await import("../src/runtimes/cursor.ts");
+  const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "cb-creds-"));
+  const realHome = process.env.HOME;
+  const realKey = process.env.CURSOR_API_KEY;
+  try {
+    process.env.HOME = fakeHome;
+    delete process.env.CURSOR_API_KEY;
+    assert.equal(cursorCredentials(), undefined);
+    fs.mkdirSync(path.join(fakeHome, ".cursor", "sdk"), { recursive: true });
+    const auth = path.join(fakeHome, ".cursor", "sdk", "auth.json");
+    fs.writeFileSync(auth, JSON.stringify({ version: 1, apiKey: "key_x", apiKeyExpiresAtMs: Date.now() - 86400_000 }));
+    assert.equal(cursorCredentials(), "expired");
+    fs.writeFileSync(auth, JSON.stringify({ version: 1, apiKey: "key_x", apiKeyExpiresAtMs: Date.now() + 86400_000 }));
+    assert.equal(cursorCredentials(), "login");
+    process.env.CURSOR_API_KEY = "";
+    assert.equal(cursorCredentials(), "login", "an empty key doesn't count");
+  } finally {
+    process.env.HOME = realHome;
+    if (realKey === undefined) delete process.env.CURSOR_API_KEY;
+    else process.env.CURSOR_API_KEY = realKey;
+    fs.rmSync(fakeHome, { recursive: true, force: true });
+  }
+});
+
+test("skill frontmatter keeps column-0 lists and comments under keys it doesn't manage", async () => {
+  const { h, cleanup } = await makeHarness();
+  try {
+    const dir = path.join(h.skills.root, "ops");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "SKILL.md"), "---\n# reviewed by ops\nname: ops\ndescription: Run ops checks.\nallowed-tools:\n- Bash\n- Read\nlicense: MIT\n---\n\n# Ops\n");
+    assert.equal(h.skills.find("ops")!.description, "Run ops checks.");
+    h.skills.save({ name: "ops", description: "Run ops checks.", body: "# Ops\n\nNew" });
+    const md = fs.readFileSync(path.join(dir, "SKILL.md"), "utf8");
+    assert.match(md, /^allowed-tools:\n- Bash\n- Read$/m);
+    assert.match(md, /^# reviewed by ops$/m);
+    assert.match(md, /^license: MIT$/m);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("marking a chat read while a card waits changes nothing, so viewers don't loop", async () => {
+  const { h, cleanup } = await makeHarness();
+  try {
+    const bot = h.createBot({ name: "Keys" });
+    const dm = h.store.dmFor(bot.id)!;
+    await h.postUserMessage(dm.id, { text: '[[tool request_secret {"name":"DEMO_KEY"}]] [[reply asked]]' });
+    await settle(h);
+    h.markRead(dm.id);
+    assert.equal(h.store.conversations.get(dm.id)!.attention, true, "the pending card keeps attention on");
+    let events = 0;
+    const off = h.bus.on((ev) => {
+      if (ev.type === "conversation.updated") events++;
+    });
+    h.markRead(dm.id);
+    h.markRead(dm.id);
+    off();
+    assert.equal(events, 0);
+  } finally {
+    await cleanup();
+  }
+});
+
+test("chat markdown: code fences inside numbered steps stay code blocks", async () => {
+  const mdPath = "../web/markdown.js";
+  const { renderMarkdown } = (await import(mdPath)) as { renderMarkdown: (s: string) => string };
+  assert.equal(
+    renderMarkdown("1. Install:\n\n   ```bash\n   npm install\n   npm run build\n   ```\n\n2. Start it:"),
+    '<ol><li>Install:</li></ol><pre><code>npm install\nnpm run build</code></pre><ol start="2"><li>Start it:</li></ol>',
+  );
 });

@@ -106,7 +106,7 @@ The app always requires its access token, which is printed on start (`http://hos
 | `--runtime cursor\|mock` | Default brain (saved to settings) |
 | `--starter` | Create the starter team on first run |
 | `--open` | Open the app in your browser on start |
-| `CURSOR_BOTS_TOKEN` | Force a specific access token |
+| `CURSOR_BOTS_TOKEN` | Force a specific access token (removed from the environment bots inherit) |
 
 Everything else is in the app's Settings: your name and label, time zone, default and routing models, group routing, approval mode and rules, Cursor Auto-review and sandbox, limits, secrets.
 
@@ -117,7 +117,7 @@ Everything else is in the app's Settings: your name and label, time zone, defaul
 - Consequential shell commands stop for approval. The rules are regexes you control. The hook fails *open* if the gateway is down, so it never blocks you from using Cursor yourself in that folder.
 - Text from web pages, files and other bots is treated as data, and the bots' manual says so. Prompt injection is still possible, so keep external actions behind approval.
 - The API needs the access token even on localhost, so a bot can't `curl` its own approval endpoint. It also refuses cross-origin writes.
-- Harness integrity guards (best effort, enforced by the workspace hooks): bots are blocked from shell commands that call the gateway's port or touch `~/.cursor-bots/state` or the hook files, and from file tools that read or write the gateway's state, settings, checkpoints, the hook script, `hooks.json` or the manual rule. The gateway rewrites changed hook files before every turn. Bots run as your OS user, so this raises the bar but isn't a sandbox. Secret values are never put in prompts or chats, but a deliberately malicious process running as you could still read the vault.
+- Harness integrity guards (best effort, enforced by the workspace hooks): bots are blocked from shell commands that call the gateway's port or touch `~/.cursor-bots/state` or the hook files, and from file tools that read or write the gateway's state, settings, checkpoints, the hook script, `hooks.json`, the manual rule or Cursor's permission and MCP config (symlinks are followed). The gateway rewrites changed hook files before every turn, and moves any `workspace/.cursor/mcp.json` into `state/quarantine/` because Cursor would start its servers without approval; add MCP servers in Connect apps. Bots run as your OS user and these checks match command text, so this raises the bar but isn't a sandbox. Secret values are never put in prompts or chats, but a deliberately malicious process running as you could still read the vault.
 
 ## Project layout
 

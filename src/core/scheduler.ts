@@ -27,26 +27,50 @@ export function validTimezone(tz: string): boolean {
   }
 }
 
+/** Expand a minute or hour field (numbers, ranges, steps, lists, * and ?); undefined for anything else. */
+function expandField(field: string, min: number, max: number): number[] | undefined {
+  const out = new Set<number>();
+  for (const part of field.split(",")) {
+    const m = /^(?:\*|\?|(\d+)(?:-(\d+))?)(?:\/(\d+))?$/.exec(part);
+    if (!m) return undefined;
+    const lo = m[1] !== undefined ? Number(m[1]) : min;
+    const hi = m[2] !== undefined ? Number(m[2]) : m[1] !== undefined && !m[3] ? lo : max;
+    const step = m[3] !== undefined ? Number(m[3]) : 1;
+    if (step < 1 || lo < min || hi > max || lo > hi) return undefined;
+    for (let v = lo; v <= hi; v += step) out.add(v);
+  }
+  return [...out].sort((a, b) => a - b);
+}
+
 export function validateCron(expr: string, timezone: string, minGapMinutes: number): string | undefined {
   const fields = expr.trim().split(/\s+/);
   if (fields.length !== 5) return "Use a five-field cron expression: minute hour day-of-month month day-of-week.";
   if (!validTimezone(timezone)) return `Unknown time zone: ${timezone}`;
+  const tooClose = `Runs must be at least ${minGapMinutes} minutes apart.`;
   let job: Cron | undefined;
   try {
     job = new Cron(expr, { timezone, mode: "5-part", paused: true });
-    // Check every gap over more than a full weekly cycle, not just the next few runs,
-    // so a list like "3,10,…,45,46" can't sneak a 1-minute gap past the check.
-    const horizon = Date.now() + 8 * 86400_000;
-    const maxRuns = Math.ceil((8 * 24 * 60) / Math.max(1, minGapMinutes)) + 2;
     let prev = job.nextRun();
     if (!prev) return "That schedule never runs.";
-    for (let i = 0; i < maxRuns; i++) {
+    // The day fields only switch whole days on or off, so the closest two runs can be is the
+    // smallest gap between the day's time slots, or from the last slot to the next day's first.
+    const minutes = expandField(fields[0]!, 0, 59);
+    const hours = expandField(fields[1]!, 0, 23);
+    if (minutes && hours) {
+      const slots = hours.flatMap((h) => minutes.map((m) => h * 60 + m));
+      let gap = 1440 - slots[slots.length - 1]! + slots[0]!;
+      for (let i = 1; i < slots.length; i++) gap = Math.min(gap, slots[i]! - slots[i - 1]!);
+      return gap < minGapMinutes ? tooClose : undefined;
+    }
+    // Unusual syntax: step through the runs for more than a week from the first one.
+    const horizon = prev.getTime() + 8 * 86400_000;
+    for (let i = 0; i < 3000; i++) {
       const next = job.nextRun(prev);
       if (!next || next.getTime() > horizon) return undefined;
-      if (next.getTime() - prev.getTime() < minGapMinutes * 60_000) return `Runs must be at least ${minGapMinutes} minutes apart.`;
+      if (next.getTime() - prev.getTime() < minGapMinutes * 60_000) return tooClose;
       prev = next;
     }
-    return `Runs must be at least ${minGapMinutes} minutes apart.`;
+    return tooClose;
   } catch (err: any) {
     return `Invalid schedule: ${err?.message ?? err}`;
   } finally {

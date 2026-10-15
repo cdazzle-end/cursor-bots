@@ -115,7 +115,7 @@ What Cursor gives you ([SDK docs](https://cursor.com/docs/sdk/typescript.md)):
 - **`@cursor/sdk`**: "The same agent that runs in the Cursor IDE, CLI, and web app", scriptable from TypeScript. The *local* runtime runs the agent loop in your Node process against files on disk, with Cursor-hosted models.
 - **Durable agents**: `Agent.create()` returns an `agent-<uuid>`. Conversation checkpoints persist in a SQLite or JSONL store, so `Agent.resume(id)` from a new process "picks up where the previous one left off."
 - **Custom tools** (`local.customTools`): in-process functions exposed to the model as an MCP server, which "skip interactive approval". This is how the harness gives bots `send_message`, `memory_update` and the rest.
-- **Workspace config** (`local.settingSources: ["project"]`): loads `.cursor/rules`, `.cursor/skills`, `AGENTS.md`, `.cursor/hooks.json` and `.cursor/mcp.json` from the workspace.
+- **Workspace config** (`local.settingSources: ["project"]`): loads `.cursor/rules`, `.cursor/skills`, `AGENTS.md`, `.cursor/hooks.json` and `.cursor/mcp.json` from the workspace. (Cursor Bots uses the first four and keeps `.cursor/mcp.json` out: its servers would start without approval. Connectors are passed per turn instead.)
 - **Hooks**: `beforeShellExecution` returns `allow`/`deny` per command, and `beforeSubmitPrompt` sees each prompt. This is the approval boundary.
 - **Steer and cancel**: `run.steer(text)` injects your message into a running local turn; `run.cancel()` stops it.
 - **Images**, **MCP servers**, **subagents**, **sandbox** (bubblewrap/seatbelt), and the **Auto-review** classifier.

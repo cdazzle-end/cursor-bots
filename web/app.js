@@ -385,7 +385,7 @@ function renderMain() {
   if (!c) return renderEmpty();
   const b = c.kind === "dm" ? bot(c.members[0]) : null;
   const rt = S.state.runtimes.find((r) => r.id === (b?.runtime || S.state.settings.runtime));
-  const placeholder = c.kind === "group" ? `Message ${convTitle(c)} — @ to address one bot` : c.kind === "botdm" ? "Bot-to-bot threads are read-only" : `Message ${convTitle(c)}`;
+  const placeholder = composerPlaceholder(c);
   $("#main").innerHTML = `
     <div class="chat-head" id="chat-head"></div>
     <div class="transcript" id="transcript"><div class="transcript-inner" id="tx"></div></div>
@@ -406,6 +406,10 @@ function renderMain() {
   renderHeader();
   setupComposer(c);
   renderTranscript(true);
+}
+
+function composerPlaceholder(c) {
+  return c.kind === "group" ? `Message ${convTitle(c)} — @ to address one bot` : c.kind === "botdm" ? "Bot-to-bot threads are read-only" : `Message ${convTitle(c)}`;
 }
 
 function renderHeader() {
@@ -1482,7 +1486,7 @@ function openSettings(tab = "general") {
         <div class="copy-field"><span>URL</span><code>${esc(url)}</code><button class="btn small" data-copytext="${esc(url)}">Copy</button></div>
         <div class="copy-field"><span>Header</span><code>Authorization: Bearer ${esc(tok)}</code><button class="btn small" data-copytext="Authorization: Bearer ${esc(tok)}">Copy</button></div>
         <div class="d-section"><h4>Claude Code</h4><div class="copy-field"><code>${esc(claude)}</code><button class="btn small" data-copytext="${esc(claude)}">Copy</button></div></div>
-        <div class="d-section"><h4>Cursor IDE (.cursor/mcp.json)</h4><pre class="input mono" style="white-space:pre-wrap;margin:0">${esc(cursorJson)}</pre><div class="row"><button class="btn small" data-copytext="${esc(cursorJson)}">Copy</button></div></div>
+        <div class="d-section"><h4>Cursor IDE (.cursor/mcp.json in another project, not the bots' workspace)</h4><pre class="input mono" style="white-space:pre-wrap;margin:0">${esc(cursorJson)}</pre><div class="row"><button class="btn small" data-copytext="${esc(cursorJson)}">Copy</button></div></div>
         <div class="muted">Hermes, OpenClaw and other harnesses: add an HTTP (streamable) MCP server with the URL and header above. Keep the token private; it can message your bots as you.</div>`;
       $$("[data-copytext]", body).forEach(
         (b) =>
@@ -1795,6 +1799,9 @@ function handleEvent(ev) {
       if (conv(S.current)?.members.includes(ev.bot.id)) {
         renderDetails();
         renderHeader();
+        // A DM is titled after its bot, so a rename changes the composer's hint too.
+        const input = $("#c-input");
+        if (input) input.placeholder = composerPlaceholder(conv(S.current));
       }
       break;
     case "bot.deleted":
@@ -1815,7 +1822,9 @@ function handleEvent(ev) {
       const prev = conv(c.id);
       if (c.id === S.current && document.visibilityState === "visible") {
         // You're looking at it: tell the server too, or the count comes back on reload and in other tabs.
-        if (c.unread || c.attention) api("POST", `/api/conversations/${c.id}/read`).catch(() => {});
+        // Only when something new needs clearing: a card that's still waiting keeps attention on, and
+        // asking again on every update would loop.
+        if (c.unread || (c.attention && !prev?.attention)) api("POST", `/api/conversations/${c.id}/read`).catch(() => {});
         c.unread = 0;
         c.attention = false;
       }
@@ -1825,7 +1834,7 @@ function handleEvent(ev) {
       if (c.id === S.current && shape(prev) !== shape(c)) {
         renderHeader();
         const input = $("#c-input");
-        if (input && c.kind !== "botdm") input.placeholder = c.kind === "group" ? `Message ${convTitle(c)} — @ to address one bot` : `Message ${convTitle(c)}`;
+        if (input) input.placeholder = composerPlaceholder(c);
         if (S.details) renderDetails();
       }
       scheduleSidebar();
