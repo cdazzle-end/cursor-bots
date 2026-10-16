@@ -1724,6 +1724,17 @@ function openProviderEditor(id, done) {
     S.modelsByRt = {};
     return true;
   };
+  // Catalogue searches and lookups go to the saved address, so save an edited URL or headers first.
+  const saveConnection = async () => {
+    const p = providerOf(id);
+    try {
+      const d = collect();
+      if (p && d.baseUrl.trim().replace(/\/+$/, "") === p.baseUrl && JSON.stringify(d.headers ?? null) === JSON.stringify(p.headers ?? null)) return true;
+    } catch {
+      // Invalid input: saveAll reports it.
+    }
+    return saveAll();
+  };
   $("#pe-save", m.el).onclick = async () => {
     if (await saveAll()) {
       toast("Saved");
@@ -1755,7 +1766,7 @@ function openProviderEditor(id, done) {
   $("#pe-add", body).onclick = async () => {
     const mid = $("#pe-add-id", body).value.trim();
     if (!mid) return;
-    // Save the URL first so the lookup goes to the right place.
+    if (!(await saveConnection())) return;
     const found = await api("GET", `/api/providers/${encodeURIComponent(id)}/lookup?model=${encodeURIComponent(mid)}`).catch(() => null);
     if (found?.model) addModel(found.model);
     else {
@@ -1767,6 +1778,7 @@ function openProviderEditor(id, done) {
   const browse = async () => {
     const q = $("#pe-search", body).value.trim();
     const out = $("#pe-catalog", body);
+    if (!(await saveConnection())) return;
     out.innerHTML = '<div class="muted">Searching…</div>';
     const res = await attempt(() => api("GET", `/api/providers/${encodeURIComponent(id)}/catalog?search=${encodeURIComponent(q)}`));
     const list = (res?.models ?? []).slice(0, 80);
