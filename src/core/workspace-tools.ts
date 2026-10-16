@@ -70,6 +70,8 @@ const READ_MAX_BYTES = 10 * 1024 * 1024;
 const READ_DEFAULT_LINES = 2000;
 const READ_MAX_LINES = 5000;
 const LINE_CAP = 2000;
+/** Longest part of a matching line grep shows. */
+const GREP_LINE_CAP = 300;
 const WRITE_MAX_CHARS = 5 * 1024 * 1024;
 const IMAGE_MAX_BYTES = 5 * 1024 * 1024;
 const SHELL_DEFAULT_SECONDS = 120;
@@ -1205,6 +1207,8 @@ const SPECS: ToolSpec[] = [
         let end = start - 1;
         for (let i = start - 1; i < Math.min(total, start - 1 + limit); i++) {
           let line = lines[i]!.replace(/\r$/, "");
+          // Scrubbed before cutting, so a secret across the cut isn't left half there (the whole page is scrubbed again below).
+          if (line.length > LINE_CAP) line = c.h.scrubSecrets(line);
           if (line.length > LINE_CAP) line = `${line.slice(0, LINE_CAP)}… (${line.length - LINE_CAP} more characters)`;
           const row = `${String(i + 1).padStart(6)}\t${line}`;
           if (rows.length && chars + row.length > OUTPUT_CAP) break;
@@ -1505,7 +1509,8 @@ const SPECS: ToolSpec[] = [
       const maxResults = clampInt(args.max_results, 100, 1, 1000);
       if (!files.length) return `No files to search under ${t.rel === "." ? "the workspace" : t.rel}${args.glob ? ` matching ${str(args.glob)}` : ""}.`;
       const r = await runGrepWorker(
-        { files, pattern: source, flags, maxResults, maxLine: 300 },
+        // Lines come back longer than shown, so secrets are scrubbed before the cut (one half of a secret isn't caught).
+        { files, pattern: source, flags, maxResults, maxLine: GREP_LINE_CAP + 4096 },
         () => c.state.cancelled,
         c.opts.pollMs ?? 100,
         c.opts.grepTimeoutMs ?? GREP_TIMEOUT_MS,
@@ -1517,7 +1522,11 @@ const SPECS: ToolSpec[] = [
       if (capped) notes.push("(Not every file was searched: the folder is very large. Narrow it with path or glob.)");
       if (tooBig) notes.push(`(${tooBig} file${tooBig === 1 ? "" : "s"} over ${fmtBytes(GREP_MAX_FILE_BYTES)} skipped.)`);
       if (!r.lines.length) return [`No matches in ${r.searched} file${r.searched === 1 ? "" : "s"}.`, ...notes].join("\n");
-      return capText(c.h.scrubSecrets([...r.lines, ...notes].join("\n")), OUTPUT_CAP, "…(results cut; narrow the search)");
+      const shown = c.h
+        .scrubSecrets(r.lines.join("\n"))
+        .split("\n")
+        .map((l) => (l.length > GREP_LINE_CAP ? `${l.slice(0, GREP_LINE_CAP)}…` : l));
+      return capText([...shown, ...notes].join("\n"), OUTPUT_CAP, "…(results cut; narrow the search)");
     },
   },
   {

@@ -101,8 +101,47 @@ test("providers: a key in an environment variable is used and taken out of bots'
     assert.equal(process.env.FEATHERLESS_API_KEY, undefined, "removed from this process's environment");
     assert.equal(s.h.childEnv().FEATHERLESS_API_KEY, undefined);
     assert.equal(s.h.describeProviders()[0]!.keySource, "environment");
+    // Not in any vault, but still taken out of what tools hand back to a model.
+    assert.equal(s.h.scrubSecrets("x fl_env_key_abcdef y"), "x [secret:FEATHERLESS_API_KEY] y");
+
+    // FEATHERLESS_API_KEY is for Featherless: pointed at another service, the entry doesn't send it.
+    s.h.updateProvider("featherless", { baseUrl: "https://llm.example.com/v1" });
+    assert.equal(s.fp.made[0]!.key(), undefined);
+    assert.equal(s.h.describeProviders()[0]!.hasKey, false);
+    s.h.updateProvider("featherless", { baseUrl: "https://api.featherless.ai/v1" });
+    assert.equal(s.fp.made[0]!.key(), "fl_env_key_abcdef");
+
+    // Removing and re-adding the provider keeps the key (it was read once), and it stays scrubbed meanwhile.
+    await s.h.deleteProvider("featherless");
+    assert.equal(s.h.scrubSecrets("fl_env_key_abcdef"), "[secret:FEATHERLESS_API_KEY]");
+    s.h.createProvider({ preset: "featherless" });
+    assert.equal(s.h.describeProviders()[0]!.keySource, "environment");
   } finally {
     delete process.env.FEATHERLESS_API_KEY;
+    await s.close();
+  }
+});
+
+test("providers: a saved key stays with its service; plain http only on your own network", async () => {
+  const s = await boot();
+  try {
+    s.h.createProvider({ preset: "featherless" });
+    s.h.setProviderKey("featherless", "fl_saved_key_123456");
+    // Same host, other path: still the same service.
+    s.h.updateProvider("featherless", { baseUrl: "https://api.featherless.ai/v1/" });
+    assert.equal(s.fp.made[0]!.key(), "fl_saved_key_123456");
+    // Another host must be given its own key; the old one isn't sent there.
+    s.h.updateProvider("featherless", { baseUrl: "https://api.featherless.example/v1" });
+    assert.equal(s.fp.made[0]!.key(), undefined);
+    assert.equal(s.h.describeProviders()[0]!.hasKey, false);
+
+    assert.throws(() => s.h.createProvider({ label: "Remote", baseUrl: "http://api.featherless.ai/v1" }), /Use https:\/\//);
+    for (const url of ["http://192.168.1.20:8000/v1", "http://gpu-box:11434/v1", "http://100.101.102.103:1234/v1", "http://ollama.lan/v1", "http://[fd00::5]:8000/v1"]) {
+      const p = s.h.createProvider({ label: `LAN ${url}`, baseUrl: url });
+      assert.equal(s.h.describeProviders().find((x) => x.id === p.id)!.needsKey, false, url);
+    }
+    assert.equal(s.h.describeProviders().find((x) => x.id === "featherless")!.needsKey, true);
+  } finally {
     await s.close();
   }
 });

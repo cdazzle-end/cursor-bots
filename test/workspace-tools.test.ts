@@ -431,6 +431,12 @@ test("shell: output is scrubbed of stored secrets and provider keys, and the chi
       await call(tools, "shell", { command: "mkdir -p bots/leaky && echo 'token s3cr3t-value-123' > bots/leaky/out.txt" });
       assert.match((await call(tools, "read_file", { path: "bots/leaky/out.txt" })).text, /token \[secret:DEMO_TOKEN\]/);
       assert.equal((await call(tools, "grep", { pattern: "token" })).text, "bots/leaky/out.txt:1:token [secret:DEMO_TOKEN]");
+      // A secret where a long line is cut is scrubbed first, so no part of it is shown.
+      const near = (n: number) => `${"x".repeat(n)} Bearer s3cr3t-value-123 tail`;
+      fs.writeFileSync(path.join(h.store.paths.workspace, "bots/leaky/long.log"), `${near(285)}\n${near(1985)}\n`);
+      const g = (await call(tools, "grep", { pattern: "Bearer", path: "bots/leaky/long.log" })).text;
+      const rf = (await call(tools, "read_file", { path: "bots/leaky/long.log" })).text;
+      for (const out of [g, rf]) assert.ok(!/s3cr3t|cr3t-val|value-123/.test(out), out);
     });
   } finally {
     if (saved.api === undefined) delete process.env.CURSOR_API_KEY;

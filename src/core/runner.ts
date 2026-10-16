@@ -20,6 +20,8 @@ export interface RunState {
   attachments: Attachment[];
   activity: Map<string, ActivityItem>;
   cancelled: boolean;
+  /** Aborted when the turn is stopped, including before a run exists (e.g. while connectors start). */
+  stop?: AbortController;
   startedAt: number;
 }
 
@@ -121,6 +123,7 @@ export class BotRunner {
     const cur = this.current;
     if (cur && !cur.cancelled && match(cur.wake)) {
       cur.cancelled = true;
+      cur.stop?.abort();
       stopped = true;
       // A tool waiting inline on an approval card returns now instead of holding the turn open.
       this.h.approvals.releaseStopped();
@@ -148,7 +151,10 @@ export class BotRunner {
    */
   freeze(): void {
     this.shuttingDown = true;
-    if (this.current) this.current.cancelled = true;
+    if (this.current) {
+      this.current.cancelled = true;
+      this.current.stop?.abort();
+    }
   }
 
   /** Gateway shutdown: cancel the running turn but keep the queue, so it's restored on restart. */
@@ -316,6 +322,7 @@ export class BotRunner {
       attachments: [],
       activity: new Map(),
       cancelled: false,
+      stop: new AbortController(),
       startedAt: Date.now(),
     };
     this.current = state;
@@ -390,46 +397,52 @@ export class BotRunner {
       const provides = runtime.provides ?? { workspaceTools: true, projectContext: true, mcp: true };
       const tools = buildTools(h, bot.id, () => this.current);
       if (!provides.workspaceTools) tools.push(...buildWorkspaceTools(h, bot.id, () => this.current));
-      if (!provides.mcp) tools.push(...(await this.mcpHub().tools(h.mcpServersFor(bot))));
+      // Connectors can take a while to start (an npx download, a host that's down): a stop doesn't wait for them.
+      if (!provides.mcp) tools.push(...(await untilStopped(state, this.mcpHub().tools(h.mcpServersFor(bot)), [])));
 
-      const run = await session.send({
-        system: provides.projectContext ? undefined : h.systemPromptFor(bot, runtime),
-        text: prompt,
-        images: images.length ? images : undefined,
-        tools,
-        mcpServers: provides.mcp ? h.mcpServersFor(bot) : {},
-        model: h.modelFor(bot, runtime),
-        onEvent: (ev) => {
-          if (ev.type === "text") {
-            state.text += ev.text;
-            h.bus.emit({ type: "run.delta", botId: bot.id, convId: conv.id, runId: state.runId, text: ev.text });
-          } else if (ev.type === "thinking") {
-            h.bus.emit({ type: "run.thinking", botId: bot.id, convId: conv.id, runId: state.runId, text: ev.text });
-          } else if (ev.type === "tool") {
-            const item: ActivityItem = { callId: ev.callId, name: ev.name, status: ev.status, summary: summarizeTool(ev.name, ev.args) };
-            const prev = state.activity.get(ev.callId);
-            if (prev && prev.summary && !item.summary) item.summary = prev.summary;
-            state.activity.set(ev.callId, item);
-            h.bus.emit({ type: "run.tool", botId: bot.id, convId: conv.id, runId: state.runId, item });
-          } else if (ev.type === "status") {
-            h.bus.emit({ type: "run.status", botId: bot.id, convId: conv.id, runId: state.runId, status: ev.status });
-          } else if (ev.type === "summary") {
-            // The runtime compacted its context; re-send identity and memory next turn.
-            this.needIdentity = true;
+      if (state.cancelled) {
+        // Stopped before anything reached the brain: send nothing.
+        outcome = { status: "cancelled", text: "" };
+      } else {
+        const run = await session.send({
+          system: provides.projectContext ? undefined : h.systemPromptFor(bot, runtime),
+          text: prompt,
+          images: images.length ? images : undefined,
+          tools,
+          mcpServers: provides.mcp ? h.mcpServersFor(bot) : {},
+          model: h.modelFor(bot, runtime),
+          onEvent: (ev) => {
+            if (ev.type === "text") {
+              state.text += ev.text;
+              h.bus.emit({ type: "run.delta", botId: bot.id, convId: conv.id, runId: state.runId, text: ev.text });
+            } else if (ev.type === "thinking") {
+              h.bus.emit({ type: "run.thinking", botId: bot.id, convId: conv.id, runId: state.runId, text: ev.text });
+            } else if (ev.type === "tool") {
+              const item: ActivityItem = { callId: ev.callId, name: ev.name, status: ev.status, summary: summarizeTool(ev.name, ev.args) };
+              const prev = state.activity.get(ev.callId);
+              if (prev && prev.summary && !item.summary) item.summary = prev.summary;
+              state.activity.set(ev.callId, item);
+              h.bus.emit({ type: "run.tool", botId: bot.id, convId: conv.id, runId: state.runId, item });
+            } else if (ev.type === "status") {
+              h.bus.emit({ type: "run.status", botId: bot.id, convId: conv.id, runId: state.runId, status: ev.status });
+            } else if (ev.type === "summary") {
+              // The runtime compacted its context; re-send identity and memory next turn.
+              this.needIdentity = true;
+            }
+          },
+        });
+        state.run = run;
+        // Only now has the model got this context; a send that throws leaves it unseen for next time.
+        if (newest) {
+          store.markSeen(bot.id, conv.id, newest.ts);
+          for (const id of this.delivered) {
+            const m = store.findMessage(conv.id, id);
+            if (m && m.ts <= newest.ts) this.delivered.delete(id);
           }
-        },
-      });
-      state.run = run;
-      // Only now has the model got this context; a send that throws leaves it unseen for next time.
-      if (newest) {
-        store.markSeen(bot.id, conv.id, newest.ts);
-        for (const id of this.delivered) {
-          const m = store.findMessage(conv.id, id);
-          if (m && m.ts <= newest.ts) this.delivered.delete(id);
         }
+        if (state.cancelled) await run.cancel().catch(() => {});
+        outcome = await run.wait();
       }
-      if (state.cancelled) await run.cancel().catch(() => {});
-      outcome = await run.wait();
     } catch (err: any) {
       outcome = { status: "error", text: "", error: describeError(err) };
     }
@@ -448,6 +461,18 @@ export class BotRunner {
       finish({ ok: outcome.status === "finished", error: outcome.error, message: posted });
     }
   }
+}
+
+/** `work`'s result, or `fallback` as soon as the turn is stopped (the work carries on in the background). */
+function untilStopped<T>(state: RunState, work: Promise<T>, fallback: T): Promise<T> {
+  const signal = state.stop?.signal;
+  if (!signal) return work;
+  if (signal.aborted) return Promise.resolve(fallback);
+  return new Promise<T>((resolve, reject) => {
+    const onStop = () => resolve(fallback);
+    signal.addEventListener("abort", onStop, { once: true });
+    work.then(resolve, reject).finally(() => signal.removeEventListener("abort", onStop));
+  });
 }
 
 function describeError(err: any): string {

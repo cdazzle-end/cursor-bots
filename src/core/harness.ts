@@ -33,7 +33,7 @@ import type {
 } from "./types.ts";
 import { colorFor, hostTimezone, mimeFor, newId, oneLine, readJson, resolveInside, slugify, stripMarkdown, writeJson } from "./util.ts";
 import { insideAny, isUnder, realPrefix, spellings } from "./guard.ts";
-import { cleanProvider, fromPreset, isLocalUrl, providerKeyName } from "./providers.ts";
+import { PROVIDER_PRESETS, cleanProvider, fromPreset, isLocalUrl, originOf, providerKeyName } from "./providers.ts";
 import { ensureBotFolder, prepareWorkspace, type GateConfig } from "./workspace.ts";
 import type { AgentRuntime, McpServerSpec, RunOutcome } from "../runtimes/types.ts";
 
@@ -105,10 +105,11 @@ export class Harness {
   readonly runtimes = new Map<string, AgentRuntime>();
   /** API keys for model providers: a separate vault, so no secrets tool can hand them to a bot. */
   readonly providerKeys: SecretVault;
-  /** Provider keys that came from environment variables (removed from bots' child environments). */
-  private providerKeyEnvNames = new Set<string>();
-  /** Keys read from those environment variables, by provider id. */
-  private envProviderKeys = new Map<Id, string>();
+  /**
+   * Provider keys read from environment variables, by variable name. Read once and taken out of
+   * process.env (so out of every child's environment); kept for scrubbing even after the provider goes.
+   */
+  private envKeys = new Map<string, string>();
   private providerFactory?: ProviderRuntimeFactory;
   private providerRuntimes = new Map<Id, AgentRuntime>();
   readonly gateToken: string;
@@ -266,8 +267,7 @@ export class Harness {
       // A key in an environment variable is read once and taken out of the environment bots inherit.
       const fromEnv = p.keyEnv ? process.env[p.keyEnv] : undefined;
       if (p.keyEnv && fromEnv) {
-        this.envProviderKeys.set(p.id, fromEnv);
-        this.providerKeyEnvNames.add(p.keyEnv);
+        this.envKeys.set(p.keyEnv, fromEnv);
         delete process.env[p.keyEnv];
       }
       if (!this.providerFactory || this.providerRuntimes.has(p.id) || this.runtimes.has(p.id)) continue;
@@ -284,7 +284,16 @@ export class Harness {
 
   private providerKey(id: Id): string | undefined {
     const name = providerKeyName(id);
-    return this.providerKeys.resolve([name])[name] || this.envProviderKeys.get(id);
+    const p = this.store.settings.providers.find((x) => x.id === id);
+    return this.providerKeys.resolve([name])[name] || (p ? this.envKeyFor(p) : undefined);
+  }
+
+  /** The key from the provider's environment variable. A preset's variable only goes to that preset's service. */
+  private envKeyFor(p: ProviderConfig): string | undefined {
+    const v = p.keyEnv ? this.envKeys.get(p.keyEnv) : undefined;
+    if (!v) return undefined;
+    const preset = PROVIDER_PRESETS.find((x) => x.keyEnv === p.keyEnv);
+    return preset && originOf(preset.baseUrl) !== originOf(p.baseUrl) ? undefined : v;
   }
 
   provider(id: Id): ProviderConfig {
@@ -297,8 +306,8 @@ export class Harness {
   describeProviders() {
     return this.store.settings.providers.map((p) => ({
       ...p,
-      hasKey: this.providerKeys.has(providerKeyName(p.id)) || this.envProviderKeys.has(p.id),
-      keySource: this.providerKeys.has(providerKeyName(p.id)) ? "saved" : this.envProviderKeys.has(p.id) ? "environment" : undefined,
+      hasKey: this.providerKeys.has(providerKeyName(p.id)) || Boolean(this.envKeyFor(p)),
+      keySource: this.providerKeys.has(providerKeyName(p.id)) ? "saved" : this.envKeyFor(p) ? "environment" : undefined,
       needsKey: !isLocalUrl(p.baseUrl),
     }));
   }
@@ -326,6 +335,8 @@ export class Harness {
     const before = list[i]!;
     const next = cleanProvider(patch, before, new Set());
     list[i] = next;
+    // A key belongs to the service it was saved for: another host has to be given one again.
+    if (originOf(next.baseUrl) !== originOf(before.baseUrl)) this.providerKeys.remove(providerKeyName(id));
     this.providersChanged();
     // Another endpoint is another service: start bots on it with a fresh context.
     if (next.baseUrl !== before.baseUrl) {
@@ -340,7 +351,6 @@ export class Harness {
     this.store.settings.providers = this.store.settings.providers.filter((x) => x.id !== id);
     if (this.store.settings.runtime === id) this.store.settings.runtime = this.runtimes.has("cursor") ? "cursor" : [...this.runtimes.keys()].find((k) => k !== id) ?? "cursor";
     this.providerKeys.remove(providerKeyName(id));
-    this.envProviderKeys.delete(id);
     for (const b of this.store.bots.values()) {
       const onIt = (b.runtime || "") === id;
       if (onIt) {
@@ -1719,14 +1729,19 @@ export class Harness {
   childEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = { ...process.env };
     for (const k of Object.keys(env)) {
-      if (k === "CURSOR_API_KEY" || k === "CURSOR_BOTS_TOKEN" || this.providerKeyEnvNames.has(k)) delete env[k];
+      if (k === "CURSOR_API_KEY" || k === "CURSOR_BOTS_TOKEN" || this.envKeys.has(k)) delete env[k];
     }
     return { ...env, ...extra };
   }
 
   /** Remove every stored secret value (and provider API key) from text that goes back to a model. */
   scrubSecrets(text: string): string {
-    return this.providerKeys.scrub(this.vault.scrub(text));
+    let out = this.providerKeys.scrub(this.vault.scrub(text));
+    // Keys from environment variables aren't in a vault; longest first, so one can't hide part of another.
+    for (const [name, v] of [...this.envKeys].sort((a, b) => b[1].length - a[1].length)) {
+      if (v.length >= 4) out = out.split(v).join(`[secret:${name}]`);
+    }
+    return out;
   }
 
   /**
@@ -1744,6 +1759,8 @@ export class Harness {
     if (/(^|[\s'"=:(;&|]|\.\/)\.cursor\/(hooks\b|hooks\.json|mcp\.json|mcp-approvals\.json|cli\.json|cli-config\.json|permissions\.json|sandbox\.json)/.test(cmd)) return true;
     if (/(^|[\s'"=:(;&|]|\.\/)\.(rgignore|cursorignore)\b/.test(cmd)) return true;
     if (/\.\.\/+(state|settings\.json|connectors\.json)\b/.test(cmd)) return true;
+    // A process's starting environment (the gateway's can still hold a provider key read from a variable).
+    if (/\/proc\/[^\s'"|;&<>]*environ\b/.test(cmd) || /(^|[\s;&|(`])ps\s+[a-z]*e[a-z]*(?=\s|$|[;&|)])/i.test(cmd)) return true;
     // The gateway's port with any host in front (loopback spellings, the address it's bound to, a LAN IP).
     if (this.gatewayPort && new RegExp(`[\\w\\]]:${this.gatewayPort}(?!\\d)`).test(cmd)) return true;
     if (this.gatewayHost && !["127.0.0.1", "localhost", "::1", "0.0.0.0", "::"].includes(this.gatewayHost)) {

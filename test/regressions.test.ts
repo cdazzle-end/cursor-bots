@@ -892,7 +892,45 @@ test("hook: a link to a file that doesn't exist yet in the gateway's state count
     const run = (input: unknown) => JSON.parse(spawnSync(process.execPath, [gate, "tool"], { input: JSON.stringify(input), cwd: ws }).stdout.toString()).permission;
     assert.equal(run({ cwd: ws, tool_name: "Write", tool_input: { path: "notes.json", contents: "{}" } }), "deny");
     assert.equal(run({ cwd: ws, tool_name: "Write", tool_input: { path: "fresh.json", contents: "{}" } }), "allow");
+    // A process's starting environment can hold a provider key the gateway read from a variable.
+    assert.equal(run({ cwd: ws, tool_name: "Read", tool_input: { path: "/proc/self/environ" } }), "deny");
+    assert.equal(run({ cwd: ws, tool_name: "Read", tool_input: { path: `/proc/${process.pid}/task/${process.pid}/environ` } }), "deny");
+    assert.equal(run({ cwd: ws, tool_name: "Grep", tool_input: { pattern: "KEY", path: "/proc" } }), "deny");
+    assert.equal(run({ cwd: ws, tool_name: "Read", tool_input: { path: "/proc/cpuinfo" } }), "allow");
+    for (const cmd of ["cat /proc/$PPID/environ", "tr '\\0' '\\n' < /proc/1234/environ", "strings /proc/*/environ", "ps eww -p $PPID", "ps auxe | grep node"]) {
+      assert.ok(h.touchesHarness(cmd), cmd);
+    }
+    for (const cmd of ["ps -ef", "ps aux | grep node", "ps -p 1 -o pid,cmd", "python3 -c 'import os; print(os.environ)'", "cat /proc/cpuinfo"]) {
+      assert.ok(!h.touchesHarness(cmd), cmd);
+    }
   } finally {
     await cleanup();
+  }
+});
+
+test("stop works while a provider bot's connectors are still starting, and nothing reaches the brain", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cb-mcpstop-"));
+  const mock = new MockRuntime({ chunkDelayMs: 0, provides: { workspaceTools: false, projectContext: false, mcp: false } });
+  const h = new Harness({ home, runtimes: [mock] });
+  h.store.settings.runtime = "mock";
+  await h.start({ gatewayUrl: "http://127.0.0.1:1" });
+  try {
+    const fixture = path.join(path.dirname(new URL(import.meta.url).pathname), "fixtures", "fake-mcp-server.mjs");
+    // A server that never answers: the hub would wait out its 60 s start timeout.
+    h.store.connectors = { slow: { command: process.execPath, args: [fixture], env: { FAKE_MCP_MODE: "hang" }, enabled: true } };
+    const bot = h.createBot({ name: "Waiter" });
+    const dm = h.store.dmFor(bot.id)!;
+    await h.postUserMessage(dm.id, { text: "hello" });
+    await until(() => h.runner(bot.id).status().state === "working");
+    await new Promise((r) => setTimeout(r, 150));
+    const t0 = Date.now();
+    await h.stopBot(bot.id);
+    await until(() => h.runner(bot.id).status().state !== "working", 3000);
+    assert.ok(Date.now() - t0 < 2000, "the stop didn't wait for the connector");
+    const session = [...mock.sessions.values()][0];
+    assert.equal(session?.prompts.length ?? 0, 0, "the stopped message was never sent to the brain");
+  } finally {
+    await h.stop();
+    fs.rmSync(home, { recursive: true, force: true });
   }
 });

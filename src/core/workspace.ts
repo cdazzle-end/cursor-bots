@@ -50,7 +50,12 @@ if (mode === "tool") {
   // "a is b or below b" (careful with "/", whose children don't start with "//").
   const under = (a, b) => a === b || a.startsWith(b.endsWith(path.sep) ? b : b + path.sep);
   const inWs = (p) => wss.some((w) => under(p, w));
-  const inside = (abs) => roots.some((r) => under(abs, r));
+  // A process's starting environment can hold a provider key the gateway read from a variable.
+  const procEnv = (p) => {
+    const s = p.split("/");
+    return s[1] === "proc" && s[s.length - 1] === "environ" && (s.length === 4 || (s.length === 6 && s[3] === "task"));
+  };
+  const inside = (abs) => roots.some((r) => under(abs, r)) || procEnv(abs);
   // Search and listing tools walk directories: a target that contains protected state
   // outside the workspace (e.g. a link to the home folder) is as bad as one inside it.
   const tool = String(input.tool_name ?? "");
@@ -86,7 +91,7 @@ if (mode === "tool") {
       if (v && v.length < 4096 && !v.includes("\\n")) {
         const abs = path.resolve(cwd, v);
         const r = real(abs);
-        if (inside(abs) || inside(r) || (walks && (contains(abs) || contains(r)))) hits.push(v);
+        if (inside(abs) || inside(r) || (walks && (contains(abs) || contains(r) || under(abs, "/proc") || under(r, "/proc")))) hits.push(v);
       }
     } else if (v && typeof v === "object") {
       for (const x of Object.values(v)) visit(x);

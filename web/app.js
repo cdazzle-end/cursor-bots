@@ -1464,7 +1464,19 @@ function openSettings(tab = "general") {
       $$("[data-padd]", body).forEach(
         (b) =>
           (b.onclick = async () => {
-            const created = await attempt(() => api("POST", "/api/providers", { preset: b.dataset.padd }));
+            const input = { preset: b.dataset.padd };
+            if (b.dataset.padd === "custom") {
+              // No address to start from: ask for it first.
+              const url = prompt("Base URL of the OpenAI-compatible API (e.g. https://api.example.com/v1 or http://localhost:8000/v1):");
+              if (!url?.trim()) return;
+              input.baseUrl = url.trim();
+              try {
+                input.label = new URL(input.baseUrl).hostname;
+              } catch {
+                // cleanProvider reports a bad URL.
+              }
+            }
+            const created = await attempt(() => api("POST", "/api/providers", input));
             if (!created) return;
             await refreshState();
             openProviderEditor(created.id, () => show("brain"));
@@ -1717,19 +1729,42 @@ function openProviderEditor(id, done) {
       models,
     };
   };
+  const origin = (u) => {
+    try {
+      return new URL(u).origin;
+    } catch {
+      return "";
+    }
+  };
   const saveAll = async () => {
+    const before = providerOf(id);
+    const url = $("#pe-url", body).value.trim();
+    // The server drops a saved key when the address moves to another host: say so first.
+    if (before?.keySource === "saved" && origin(url) && origin(url) !== origin(before.baseUrl) && !$("#pe-key", body).value.trim()) {
+      if (!confirm(`The saved API key was for ${origin(before.baseUrl)}. It won't be sent to ${origin(url)}: you'll need to paste the key for the new address. Continue?`)) return false;
+    }
     const saved = await attempt(async () => api("PATCH", `/api/providers/${encodeURIComponent(id)}`, collect()));
     if (!saved) return false;
+    // A key pasted but not saved with "Save key" is saved too.
+    const key = $("#pe-key", body).value.trim();
+    if (key) {
+      if (!(await attempt(() => api("PUT", `/api/providers/${encodeURIComponent(id)}/key`, { value: key })))) return false;
+      $("#pe-key", body).value = "";
+      $("#pe-key-state", body).textContent = "saved";
+      $("#pe-key-del", body).hidden = false;
+    }
     await refreshState();
     S.modelsByRt = {};
     return true;
   };
-  // Catalogue searches and lookups go to the saved address, so save an edited URL or headers first.
+  // Catalogue searches and lookups go to the saved address and key, so save an edited URL, headers or a pasted key first.
   const saveConnection = async () => {
     const p = providerOf(id);
     try {
       const d = collect();
-      if (p && d.baseUrl.trim().replace(/\/+$/, "") === p.baseUrl && JSON.stringify(d.headers ?? null) === JSON.stringify(p.headers ?? null)) return true;
+      const same = p && d.baseUrl.trim().replace(/\/+$/, "") === p.baseUrl && JSON.stringify(d.headers ?? null) === JSON.stringify(p.headers ?? null);
+      // A pasted key is needed for the search too.
+      if (same && !$("#pe-key", body).value.trim()) return true;
     } catch {
       // Invalid input: saveAll reports it.
     }

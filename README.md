@@ -79,7 +79,7 @@ House rules for *all* bots live in `~/.cursor-bots/workspace/AGENTS.md` (Shared 
 Bots don't have to run on Cursor. Any service with an OpenAI-compatible chat API can be a **brain**, and each bot picks its own brain and model in its details. You can mix them on one team: Cursor for the builder, an open model for the researcher.
 
 1. Settings → **Brain & models** → *Providers* → pick a preset: Featherless AI, OpenRouter, xAI, OpenAI, Groq, Together, DeepInfra, Ollama, LM Studio, or *Other* for any OpenAI-compatible URL.
-2. Paste the API key and click **Save and test**. The key is write-only: it is stored encrypted in its own vault, never shown again, never logged and never sent to the bots. You can also set it in the environment instead (`FEATHERLESS_API_KEY`, `OPENROUTER_API_KEY`, …). The gateway reads it once at startup and removes it from the environment that bots inherit.
+2. Paste the API key and click **Save and test**. The key is write-only: it is stored encrypted in its own vault, never shown again, never logged and never sent to the bots. It is only sent to the address it was saved for: point the provider at another host and you're asked for the key again. You can also set it in the environment instead (`FEATHERLESS_API_KEY`, `OPENROUTER_API_KEY`, …). The gateway reads it once, removes it from the environment bots' commands get, and scrubs it from tool output. Saving it in the app is still safer: any program running as your user can read the environment a process started with (on Linux, `/proc/<pid>/environ`). The harness blocks the obvious ways to do that, but bots run as you.
 3. Add models by id or search the provider's catalogue from the editor. Context size, reply length and (for Featherless) concurrency cost are filled in from the catalogue.
 4. In a bot's details, choose the provider as its brain, then a model. Or make it the default brain for every bot that hasn't picked one.
 
@@ -125,7 +125,7 @@ The app always requires its access token, which is printed on start (`http://hos
 | `CURSOR_BOTS_HOME` / `--home` | Where everything lives (default `~/.cursor-bots`) |
 | `--port`, `--host` | Web/API address (default `127.0.0.1:4777`) |
 | `--runtime cursor\|mock\|<provider>` | Default brain (saved to settings) |
-| `FEATHERLESS_API_KEY`, `OPENROUTER_API_KEY`, … | A provider's key, read once at startup when none is saved (removed from the environment bots inherit) |
+| `FEATHERLESS_API_KEY`, `OPENROUTER_API_KEY`, … | A provider's key, used when none is saved (read once, removed from the environment bots' commands get; saving it in the app is safer) |
 | `--starter` | Create the starter team on first run |
 | `--open` | Open the app in your browser on start |
 | `CURSOR_BOTS_TOKEN` | Force a specific access token (removed from the environment bots inherit) |

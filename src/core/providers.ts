@@ -153,10 +153,32 @@ export function providerKeyName(id: string): string {
   return `PROVIDER_${id.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`.slice(0, 64);
 }
 
-/** A server on this machine or the local network needs no key (Ollama, LM Studio, a vLLM here). */
+/**
+ * A server on this machine or your own network (Ollama, LM Studio, a vLLM on another box):
+ * it needs no key, and plain http:// is fine. Private, link-local and Tailscale-style
+ * (100.64/10) addresses count, as do single-label names and .local/.lan/.internal/.home.arpa.
+ */
 export function isLocalHost(hostname: string): boolean {
-  const h = hostname.replace(/^\[|\]$/g, "").toLowerCase();
-  return ["localhost", "::1", "0.0.0.0", "host.docker.internal"].includes(h) || /^127\./.test(h) || h.endsWith(".local") || h.endsWith(".localhost");
+  const h = hostname.replace(/^\[|\]$/g, "").toLowerCase().replace(/\.$/, "");
+  if (["localhost", "::1", "0.0.0.0", "host.docker.internal"].includes(h)) return true;
+  if (/(^|\.)(local|localhost|lan|internal|home\.arpa)$/.test(h)) return true;
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/.exec(h);
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])];
+    return a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || (a === 100 && b >= 64 && b <= 127);
+  }
+  if (h.includes(":")) return /^(fc|fd|fe[89ab])[0-9a-f]{0,2}:/.test(h);
+  // "gpu-box": a name only your own network can resolve.
+  return !h.includes(".");
+}
+
+/** "https://host:port" of a URL ("" if it isn't one). */
+export function originOf(url: string): string {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return "";
+  }
 }
 
 export function isLocalUrl(url: string): boolean {
@@ -232,6 +254,8 @@ export function cleanProvider(input: any, existing: ProviderConfig | undefined, 
     throw new Error("The base URL must be a full URL, e.g. https://api.featherless.ai/v1");
   }
   if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new Error("The base URL must start with https:// (or http:// for a local server).");
+  // The key travels in a header: over plain http only to this computer or your own network.
+  if (parsed.protocol === "http:" && !isLocalHost(parsed.hostname)) throw new Error("Use https:// for a service on the internet (http:// is only for this computer or your local network).");
   if (parsed.username || parsed.password) throw new Error("Don't put credentials in the base URL; use the API key field.");
   const models = Array.isArray(input?.models) ? input.models.map(cleanModel) : existing?.models ?? [];
   const ids = new Set<string>();
