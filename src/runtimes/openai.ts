@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ModelChoice, ProviderConfig, ProviderModel, ToolMode } from "../core/types.ts";
+import { isLocalHost } from "../core/providers.ts";
 import { writeFileAtomic } from "../core/util.ts";
 import type {
   AgentRuntime,
@@ -937,20 +938,6 @@ function imagePart(img: Image): WirePart {
 
 function plural(n: number, one: string, many = `${one}s`): string {
   return `${n} ${n === 1 ? one : many}`;
-}
-
-/** A local server needs no key (Ollama, LM Studio, a vLLM on this machine). */
-export function isLocalHost(hostname: string): boolean {
-  const h = hostname.replace(/^\[|\]$/g, "").toLowerCase();
-  return (
-    h === "localhost" ||
-    h === "::1" ||
-    h === "0.0.0.0" ||
-    h === "host.docker.internal" ||
-    /^127\./.test(h) ||
-    h.endsWith(".local") ||
-    h.endsWith(".localhost")
-  );
 }
 
 function safeUrl(u: string): string {
@@ -2613,7 +2600,7 @@ class OaiRun implements RuntimeRun {
     });
     stopped.catch(() => {});
     try {
-      return await Promise.race([Promise.resolve().then(() => tool.execute(args)), stopped]);
+      return await Promise.race([Promise.resolve().then(() => tool.execute(args, { signal })), stopped]);
     } catch (err) {
       if (signal.aborted) throw abortError();
       return { text: `The tool ${tool.name} failed: ${(err as Error)?.message ?? err}`, isError: true };

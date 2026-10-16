@@ -248,10 +248,10 @@ export class McpHub {
       readOnly: typeof ann.readOnlyHint === "boolean" ? ann.readOnlyHint : undefined,
       destructive: typeof ann.destructiveHint === "boolean" ? ann.destructiveHint : undefined,
       mcp: { server, tool: def.name },
-      execute: async (args) => {
+      execute: async (args, ctx) => {
         try {
           const params = args && typeof args === "object" && !Array.isArray(args) ? args : {};
-          const result = await conn.callTool(def.name, params, this.timeouts.callMs);
+          const result = await conn.callTool(def.name, params, this.timeouts.callMs, ctx?.signal);
           const out = toToolOutput(result);
           out.text = this.clean(out.text, e.secrets);
           return out;
@@ -373,6 +373,8 @@ interface Pending {
   reject(err: McpError): void;
   timer: NodeJS.Timeout;
   abort: AbortController;
+  signal?: AbortSignal;
+  onStop?: () => void;
 }
 
 interface TransportHandlers {
@@ -466,8 +468,8 @@ class McpConnection {
     return out;
   }
 
-  callTool(name: string, args: Record<string, unknown>, ms: number): Promise<unknown> {
-    return this.request("tools/call", { name, arguments: args }, ms);
+  callTool(name: string, args: Record<string, unknown>, ms: number, signal?: AbortSignal): Promise<unknown> {
+    return this.request("tools/call", { name, arguments: args }, ms, signal);
   }
 
   close(): Promise<void> {
@@ -553,20 +555,27 @@ class McpConnection {
     await this.notify("notifications/initialized").catch(() => {});
   }
 
-  private request(method: string, params: Json, ms: number): Promise<any> {
+  private request(method: string, params: Json, ms: number, signal?: AbortSignal): Promise<any> {
     const t = this.transport;
     if (this.dead || !t) return Promise.reject(this.dead ?? new McpError("not connected"));
+    if (signal?.aborted) return Promise.reject(new McpError("the turn was stopped"));
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
       const abort = new AbortController();
-      const timer = setTimeout(() => {
+      // Give up on the request and tell the server, which may stop the work (a timeout, or the turn was stopped).
+      const giveUp = (reason: string, err: McpError) => {
         if (!this.pending.delete(id)) return;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onStop);
         abort.abort();
-        if (method !== "initialize") void this.notify("notifications/cancelled", { requestId: id, reason: "timed out" }).catch(() => {});
-        reject(new McpError(`${method} got no answer within ${seconds(ms)}`, { timedOut: true }));
-      }, ms);
+        if (method !== "initialize") void this.notify("notifications/cancelled", { requestId: id, reason }).catch(() => {});
+        reject(err);
+      };
+      const timer = setTimeout(() => giveUp("timed out", new McpError(`${method} got no answer within ${seconds(ms)}`, { timedOut: true })), ms);
       timer.unref?.();
-      this.pending.set(id, { method, resolve, reject, timer, abort });
+      const onStop = () => giveUp("the user stopped the turn", new McpError("the turn was stopped"));
+      signal?.addEventListener("abort", onStop, { once: true });
+      this.pending.set(id, { method, resolve, reject, timer, abort, signal, onStop });
       t.send({ jsonrpc: "2.0", id, method, params }, abort.signal).then(
         (over) => {
           if (over) this.settle(id, undefined, new McpError(`the server ended its response to ${method} without an answer`));
@@ -587,6 +596,7 @@ class McpConnection {
     if (!p) return;
     this.pending.delete(id);
     clearTimeout(p.timer);
+    if (p.onStop) p.signal?.removeEventListener("abort", p.onStop);
     if (error) p.reject(error);
     else p.resolve(result);
   }

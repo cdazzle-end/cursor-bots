@@ -76,7 +76,12 @@ export interface BoundTool {
   inputSchema: Record<string, unknown>;
   readOnly?: boolean;
   destructive?: boolean;
-  execute(args: Record<string, unknown>): Promise<ToolOutput>;
+  /** `ctx.signal` aborts when the turn is stopped (runtimes that can, pass it; tools that can, stop early). */
+  execute(args: Record<string, unknown>, ctx?: ToolContext): Promise<ToolOutput>;
+}
+
+export interface ToolContext {
+  signal?: AbortSignal;
 }
 
 export interface ToolOutput {

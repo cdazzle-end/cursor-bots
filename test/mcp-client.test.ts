@@ -338,6 +338,18 @@ test("timeouts: a slow call fails and the server stays usable; a server that nev
     assert.equal((await byName(tools, "fake__slow").execute({ ms: 20 })).text, "done");
     assert.equal((await byName(tools, "fake__echo").execute({ text: "still here" })).text, "still here");
 
+    // Stopping the turn gives up on the call at once and tells the server, which can stop the work.
+    const stop = new AbortController();
+    const t2 = Date.now();
+    const call = byName(tools, "fake__slow").execute({}, { signal: stop.signal });
+    setTimeout(() => stop.abort(), 30);
+    const stopped = await call;
+    assert.equal(stopped.isError, true);
+    assert.match(stopped.text, /the turn was stopped/);
+    assert.ok(Date.now() - t2 < 150);
+    const info = JSON.parse((await byName(tools, "fake__info").execute({})).text);
+    assert.deepEqual(info.cancelled.map((c: any) => c.reason), ["timed out", "the user stopped the turn"]);
+
     const servers = { fake, hang: stdio({ FAKE_MCP_MODE: "hang", FAKE_PID_FILE: pidFile }) };
     tools = await hub.tools(servers);
     assert.ok(tools.some((t) => t.name === "fake__echo"));

@@ -83,6 +83,7 @@ async function call(name, args) {
           requestedVersion: state.requestedVersion,
           initialized: state.initialized,
           grandchild: grandchild?.pid ?? null,
+          cancelled: state.cancelled ?? [],
         }),
       );
     case "leak":
@@ -133,6 +134,7 @@ rl.on("line", async (line) => {
   }
   if (msg.id === undefined) {
     if (msg.method === "notifications/initialized") state.initialized = true;
+    if (msg.method === "notifications/cancelled") (state.cancelled ??= []).push(msg.params);
     return;
   }
   switch (msg.method) {

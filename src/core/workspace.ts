@@ -25,12 +25,16 @@ const done = (out) => { process.stdout.write(JSON.stringify(out)); process.exit(
 
 if (mode === "tool") {
   // Resolve symlinks on the longest existing prefix, so a link inside the
-  // workspace can't lead into protected state (new files resolve via their parent).
+  // workspace can't lead into protected state (new files resolve via their parent,
+  // and a link to a file that doesn't exist yet resolves to where that file would be).
   const real = (p) => {
     const rest = [];
     let cur = p;
-    for (let i = 0; i < 64; i++) {
+    for (let i = 0; i < 128; i++) {
       try { return path.join(fs.realpathSync(cur), ...rest); } catch {}
+      try {
+        if (fs.lstatSync(cur).isSymbolicLink()) { cur = path.resolve(path.dirname(cur), fs.readlinkSync(cur)); continue; }
+      } catch {}
       const parent = path.dirname(cur);
       if (parent === cur) break;
       rest.unshift(path.basename(cur));

@@ -153,11 +153,15 @@ export function providerKeyName(id: string): string {
   return `PROVIDER_${id.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`.slice(0, 64);
 }
 
-/** A local server (no key needed, http is fine). */
+/** A server on this machine or the local network needs no key (Ollama, LM Studio, a vLLM here). */
+export function isLocalHost(hostname: string): boolean {
+  const h = hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  return ["localhost", "::1", "0.0.0.0", "host.docker.internal"].includes(h) || /^127\./.test(h) || h.endsWith(".local") || h.endsWith(".localhost");
+}
+
 export function isLocalUrl(url: string): boolean {
   try {
-    const host = new URL(url).hostname.replace(/^\[|\]$/g, "").toLowerCase();
-    return ["localhost", "127.0.0.1", "::1", "0.0.0.0", "host.docker.internal"].includes(host) || host.endsWith(".local") || host.endsWith(".localhost");
+    return isLocalHost(new URL(url).hostname);
   } catch {
     return false;
   }

@@ -880,3 +880,19 @@ test("an attachment that is a symlink into the gateway's state is refused and ne
     await cleanup();
   }
 });
+
+test("hook: a link to a file that doesn't exist yet in the gateway's state counts as that file", async () => {
+  const { h, cleanup } = await makeHarness();
+  try {
+    const ws = h.store.paths.workspace;
+    // Writing through this link would create the file inside state/.
+    fs.symlinkSync(path.join(h.store.paths.state, "planted.json"), path.join(ws, "notes.json"));
+    const gate = path.join(h.store.paths.hooksDir, "cursor-bots-gate.mjs");
+    const { spawnSync } = await import("node:child_process");
+    const run = (input: unknown) => JSON.parse(spawnSync(process.execPath, [gate, "tool"], { input: JSON.stringify(input), cwd: ws }).stdout.toString()).permission;
+    assert.equal(run({ cwd: ws, tool_name: "Write", tool_input: { path: "notes.json", contents: "{}" } }), "deny");
+    assert.equal(run({ cwd: ws, tool_name: "Write", tool_input: { path: "fresh.json", contents: "{}" } }), "allow");
+  } finally {
+    await cleanup();
+  }
+});
