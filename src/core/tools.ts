@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import type { Harness } from "./harness.ts";
 import { addMemory, removeMemory, replaceMemory } from "./memory.ts";
 import { groupTag, renderMessage } from "./prompt.ts";
@@ -6,7 +5,8 @@ import type { RunState } from "./runner.ts";
 import { describeCron } from "./scheduler.ts";
 import { SecretVault } from "./secrets.ts";
 import type { Attachment, Id } from "./types.ts";
-import { oneLine, resolveInside, truncate } from "./util.ts";
+import { oneLine } from "./util.ts";
+import { runGatedCommand } from "./workspace-tools.ts";
 import type { BoundTool, ToolOutput } from "../runtimes/types.ts";
 
 /**
@@ -421,50 +421,13 @@ const TOOLS: ToolSpec[] = [
       const names = strList(args.secrets).map((n) => n.toUpperCase());
       const missing = names.filter((n) => !h.vault.has(n));
       if (missing.length) return { text: `Not stored: ${missing.join(", ")}. Use request_secret first.`, isError: true };
-      if (h.touchesHarness(command)) return { text: "Bots can't call the Cursor Bots gateway or read its files directly.", isError: true };
-      const origin = ["user", "approval", "system"].includes(state.wake.source) ? "foreground" : "background";
-      const gate = await h.approvals.gate({
-        botId: state.bot.id,
-        convId: h.visibleConvFor(state.wake),
-        kind: "shell",
-        subject: command,
-        origin,
-        waitSeconds: h.store.settings.approvals.inlineWaitSeconds,
-        resume: h.resumeFor(state.wake),
-        active: () => !state.cancelled,
+      // The same gate, working-folder checks, process handling and scrubbing as the shell tool, plus the secrets.
+      return runGatedCommand(h, state, {
+        command,
+        cwd: str(args.cwd) || undefined,
+        timeoutSeconds: Number(args.timeout_seconds) || undefined,
+        env: h.vault.resolve(names),
       });
-      if (gate.permission === "deny") return { text: gate.message, isError: gate.reason !== "pending" };
-      let cwd = h.store.paths.workspace;
-      try {
-        if (str(args.cwd)) cwd = resolveInside(h.store.paths.workspace, str(args.cwd));
-      } catch (err: any) {
-        return { text: err.message, isError: true };
-      }
-      const timeout = Math.min(900, Math.max(1, Number(args.timeout_seconds) || 120)) * 1000;
-      const env = { ...process.env, ...h.vault.resolve(names) };
-      const out = await new Promise<{ code: number | null; text: string }>((resolve) => {
-        const child = spawn("bash", ["-lc", command], { cwd, env });
-        let buf = "";
-        const add = (d: Buffer) => {
-          if (buf.length < 200_000) buf += d.toString("utf8");
-        };
-        child.stdout.on("data", add);
-        child.stderr.on("data", add);
-        const timer = setTimeout(() => {
-          child.kill("SIGKILL");
-          buf += `\n[killed after ${timeout / 1000}s]`;
-        }, timeout);
-        child.on("close", (code) => {
-          clearTimeout(timer);
-          resolve({ code, text: buf });
-        });
-        child.on("error", (err) => {
-          clearTimeout(timer);
-          resolve({ code: -1, text: String(err) });
-        });
-      });
-      const scrubbed = h.vault.scrub(out.text, names);
-      return { text: `exit ${out.code}\n${truncate(scrubbed, 40_000)}`, isError: out.code !== 0 };
     },
   },
   {
