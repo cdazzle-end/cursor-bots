@@ -75,6 +75,8 @@ export class MockSession implements RuntimeSession {
   readonly systems: Array<string | undefined> = [];
   /** Tool names offered with each prompt. */
   readonly toolNames: string[][] = [];
+  /** How many images came with each prompt. */
+  readonly imageCounts: number[] = [];
 
   constructor(agentId: string, name: string, rt: MockRuntime) {
     this.agentId = agentId;
@@ -86,6 +88,7 @@ export class MockSession implements RuntimeSession {
     this.prompts.push(input.text);
     this.systems.push(input.system);
     this.toolNames.push(input.tools.map((t) => t.name));
+    this.imageCounts.push(input.images?.length ?? 0);
     return new MockRun(this, input, this.rt.chunkDelayMs);
   }
 

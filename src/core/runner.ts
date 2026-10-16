@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import type { Harness } from "./harness.ts";
 import { buildPrompt } from "./prompt.ts";
 import type { ActivityItem, Attachment, Bot, Id, Message, WakeEvent } from "./types.ts";
-import { hash, isImageMime, newId, oneLine, resolveInside } from "./util.ts";
+import { hash, isImageMime, newId, oneLine } from "./util.ts";
 import type { BotStatus } from "./events.ts";
 import type { RunOutcome, RuntimeRun, RuntimeSession } from "../runtimes/types.ts";
 import { McpHub } from "./mcp-client.ts";
@@ -351,7 +351,7 @@ export class BotRunner {
       for (const a of wake.attachments ?? []) {
         if (images.length >= MAX_INLINE_IMAGES || !isImageMime(a.mime) || a.size > MAX_IMAGE_BYTES) continue;
         try {
-          images.push({ data: fs.readFileSync(resolveInside(store.paths.workspace, a.path)).toString("base64"), mimeType: a.mime });
+          images.push({ data: fs.readFileSync(h.workspaceFile(a.path)).toString("base64"), mimeType: a.mime });
           inlined.add(a.path);
         } catch {
           // Missing file: the path is still listed in the prompt.

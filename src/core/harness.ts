@@ -32,7 +32,7 @@ import type {
   WakeEvent,
 } from "./types.ts";
 import { colorFor, hostTimezone, mimeFor, newId, oneLine, readJson, resolveInside, slugify, stripMarkdown, writeJson } from "./util.ts";
-import { insideAny } from "./guard.ts";
+import { insideAny, isUnder, realPrefix, spellings } from "./guard.ts";
 import { cleanProvider, fromPreset, isLocalUrl, providerKeyName } from "./providers.ts";
 import { ensureBotFolder, prepareWorkspace, type GateConfig } from "./workspace.ts";
 import type { AgentRuntime, McpServerSpec, RunOutcome } from "../runtimes/types.ts";
@@ -1867,10 +1867,25 @@ export class Harness {
   }
 
   attachmentFor(relPath: string): Attachment {
-    const abs = resolveInside(this.store.paths.workspace, relPath);
+    const abs = this.workspaceFile(relPath);
     const st = fs.statSync(abs);
     if (!st.isFile()) throw new Error(`Not a file: ${relPath}`);
     return { path: path.relative(this.store.paths.workspace, abs), name: path.basename(abs), mime: mimeFor(abs), size: st.size };
+  }
+
+  /**
+   * A workspace path a bot named, for reading its bytes (attachments, images sent to the model).
+   * Symlinks are followed: the file must really be in the workspace and outside the gateway's state,
+   * since its contents can go to a third-party model provider.
+   */
+  workspaceFile(relPath: string): string {
+    const ws = this.store.paths.workspace;
+    const abs = resolveInside(ws, relPath);
+    const real = realPrefix(abs);
+    if (!spellings(ws).some((w) => isUnder(real, w)) || this.insideProtected(abs, { alsoProcessCwd: false })) {
+      throw new Error(`Not a workspace file: ${relPath}`);
+    }
+    return abs;
   }
 
   // ------------------------------------------------------------------ search & snapshot

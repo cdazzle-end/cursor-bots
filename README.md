@@ -42,7 +42,7 @@ No key yet? `npm run demo` starts the same app with a scripted demo brain and a 
 | Attention states and notifications | ✔ working spinner, unread, needs-you badge, desktop notifications |
 | Phone access | ✔ responsive web app; `--host 0.0.0.0` with a token |
 | Your *other* agents talking to the team | ✔ **Team MCP** at `/mcp`: Claude Code, the Cursor IDE, Hermes, OpenClaw or any MCP client can `list_bots`, `message_bot` (and wait for the answer), `read_chat`, `create_bot` |
-| No model picker | You choose: per-bot model from your Cursor account, or the default |
+| No model picker | You choose: per-bot brain and model, from your Cursor account or any OpenAI-compatible provider (Featherless, OpenRouter, xAI, Ollama…) |
 
 Not included: a virtual desktop with "watch the computer" and takeover (bots get a real browser through the Playwright connector instead), teach-by-demonstration, voice chat (dictation works), native Slack/X apps, team admin. See [RESEARCH.md §5](docs/RESEARCH.md#5-where-cursor-bots-differs-from-grok-bot).
 
@@ -50,6 +50,7 @@ Not included: a virtual desktop with "watch the computer" and takeover (bots get
 
 - **Node.js 22.18+** (it runs the TypeScript sources directly; the Cursor SDK needs 22.13+)
 - A **Cursor API key** (user or service-account key) from [cursor.com/dashboard → API Keys](https://cursor.com/dashboard). Usage bills to that Cursor account, like any SDK run.
+- *Or* a key for an OpenAI-compatible provider such as Featherless AI, or a local server like Ollama. See [Other models](#other-models-featherless-openrouter-xai-local-servers).
 - Linux, macOS or WSL. `npm run doctor` checks your setup.
 
 ## Using it
@@ -72,6 +73,26 @@ Not included: a virtual desktop with "watch the computer" and takeover (bots get
     Then "ask @researcher to dig into this and tell me what it finds" works from inside Claude Code.
 
 House rules for *all* bots live in `~/.cursor-bots/workspace/AGENTS.md` (Shared computer → AGENTS.md).
+
+### Other models: Featherless, OpenRouter, xAI, local servers
+
+Bots don't have to run on Cursor. Any service with an OpenAI-compatible chat API can be a **brain**, and each bot picks its own brain and model in its details. You can mix them on one team: Cursor for the builder, an open model for the researcher.
+
+1. Settings → **Brain & models** → *Providers* → pick a preset: Featherless AI, OpenRouter, xAI, OpenAI, Groq, Together, DeepInfra, Ollama, LM Studio, or *Other* for any OpenAI-compatible URL.
+2. Paste the API key and click **Save and test**. The key is write-only: it is stored encrypted in its own vault, never shown again, never logged and never sent to the bots. You can also set it in the environment instead (`FEATHERLESS_API_KEY`, `OPENROUTER_API_KEY`, …). The gateway reads it once at startup and removes it from the environment that bots inherit.
+3. Add models by id or search the provider's catalogue from the editor. Context size, reply length and (for Featherless) concurrency cost are filled in from the catalogue.
+4. In a bot's details, choose the provider as its brain, then a model. Or make it the default brain for every bot that hasn't picked one.
+
+**Featherless AI.** Set *Concurrency* to your plan's units (the Chat plan has 4; a 32B model costs 2 of them, a 70B model 4). Bots then queue for a slot instead of hitting 429 errors. A model that hasn't been used for a while is "cold": the first request can take minutes while Featherless loads it. The bot shows "warming up" and retries. Native tool calling is documented for the Qwen 3 family and Kimi-K2. For other models, set the tool mode to *Auto* (the default) or *Prompt*, and the runtime writes the tools into the prompt and reads tool calls back from the text.
+
+**What changes on a provider brain.** Cursor brings its own tuned agent: file tools, codebase indexing, context compaction and an optional sandbox. A plain model API brings only "messages in, text and tool calls out", so for these brains the harness supplies the rest:
+- its own shell, file, search and web-fetch tools, with the same approval rules;
+- its own MCP client for Connect apps;
+- its own transcript and context compaction, with summaries when the conversation outgrows the model's window.
+
+Open models vary a lot in how well they call tools and how much context they hold. A 32B model with a 32k window can do focused tasks well, but long multi-step work goes better on a larger model.
+
+`node src/cli.ts models --runtime featherless --search qwen` lists a provider's catalogue from the terminal, and `npm run doctor` checks each provider's key and models.
 
 ### Run it 24/7
 
@@ -103,7 +124,8 @@ The app always requires its access token, which is printed on start (`http://hos
 | `CURSOR_API_KEY` | Cursor API key used by every bot (a login stored by the Cursor SDK in `~/.cursor/sdk/auth.json` works too) |
 | `CURSOR_BOTS_HOME` / `--home` | Where everything lives (default `~/.cursor-bots`) |
 | `--port`, `--host` | Web/API address (default `127.0.0.1:4777`) |
-| `--runtime cursor\|mock` | Default brain (saved to settings) |
+| `--runtime cursor\|mock\|<provider>` | Default brain (saved to settings) |
+| `FEATHERLESS_API_KEY`, `OPENROUTER_API_KEY`, … | A provider's key, read once at startup when none is saved (removed from the environment bots inherit) |
 | `--starter` | Create the starter team on first run |
 | `--open` | Open the app in your browser on start |
 | `CURSOR_BOTS_TOKEN` | Force a specific access token (removed from the environment bots inherit) |
@@ -132,7 +154,11 @@ src/
   core/manual.ts         the operating manual every bot follows (an always-on Cursor rule)
   core/tools.ts          harness tools exposed to bots as Cursor custom tools
   core/memory.ts, skills.ts, scheduler.ts, approvals.ts, secrets.ts, store.ts, workspace.ts
+  core/providers.ts      provider presets and validation (Featherless, OpenRouter, xAI, local servers…)
+  core/workspace-tools.ts  shell, file, search and fetch tools for brains without their own
+  core/mcp-client.ts     MCP client (stdio, Streamable HTTP, legacy SSE) for brains without one
   runtimes/cursor.ts     Cursor SDK local agents
+  runtimes/openai.ts     any OpenAI-compatible chat API: agent loop, tool calling, compaction
   runtimes/mock.ts       scripted demo/test brain
 web/                     the app (vanilla JS, no build step)
 test/                    node:test suite (npm test)

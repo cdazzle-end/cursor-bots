@@ -856,3 +856,27 @@ test("shell gate: a relative working directory is checked where the SDK would ru
     await cleanup();
   }
 });
+
+test("an attachment that is a symlink into the gateway's state is refused and never sent to the model", async () => {
+  const { h, mock, cleanup } = await makeHarness();
+  try {
+    const bot = h.createBot({ name: "Viewer" });
+    const dm = h.store.dmFor(bot.id)!;
+    const ws = h.store.paths.workspace;
+    fs.writeFileSync(path.join(ws, "real.png"), Buffer.from("png"));
+    // A link with an image name pointing at the gateway's token: its bytes would go to the model provider.
+    fs.symlinkSync(path.join(h.store.paths.state, "gate.token"), path.join(ws, "leak.png"));
+    fs.symlinkSync(os.tmpdir(), path.join(ws, "outside"));
+    assert.throws(() => h.attachmentFor("leak.png"), /Not a workspace file/);
+    assert.throws(() => h.attachmentFor("outside/anything.png"), /Not a workspace file/);
+    assert.equal(h.attachmentFor("real.png").name, "real.png");
+
+    const att = (p: string) => ({ path: p, name: p, mime: "image/png", size: 3 });
+    await h.postUserMessage(dm.id, { text: "look", attachments: [att("leak.png"), att("real.png")] });
+    await settle(h);
+    const session = [...mock.sessions.values()][0]!;
+    assert.deepEqual(session.imageCounts, [1], "only the real file is inlined");
+  } finally {
+    await cleanup();
+  }
+});

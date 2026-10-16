@@ -13,7 +13,8 @@ This is a guided tour of the harness, written to teach how agent harnesses work,
  (files on disk)  (one per bot) (routines)  (rules, cards) (encrypted)   (.cursor/skills)
                       │
                       ▼
-             AgentRuntime  ── CursorRuntime (@cursor/sdk local agent)  or  MockRuntime
+             AgentRuntime  ── CursorRuntime (@cursor/sdk local agent), OpenAICompatRuntime
+                      │       (one per provider: Featherless, OpenRouter, Ollama…) or MockRuntime
                       │
                       ▼
               Shared workspace = every bot's cwd (files, skills, rules, hooks, browser profile)
@@ -25,7 +26,7 @@ Start the app and look in `~/.cursor-bots` (or the `--home` you passed):
 
 ```
 ~/.cursor-bots/
-  settings.json            your profile, time zone, runtime, models, approval rules, limits
+  settings.json            your profile, time zone, runtime, models, providers, approval rules, limits
   connectors.json          "Connect apps": MCP servers (values may say ${secret:NAME})
   state/
     bots.json              the roster: name, handle, label, job, avatar, model, agentId…
@@ -35,6 +36,8 @@ Start the app and look in `~/.cursor-bots` (or the `--home` you passed):
     routines.json          schedules, webhook keys, last 20 runs each
     approvals.json         pending and decided approval requests
     secrets.vault          AES-256-GCM encrypted secret values (+ secret.key, mode 0600)
+    provider-keys.vault    model provider API keys, same encryption, out of the bots' reach (section 9)
+    agents/<agentId>.jsonl provider brains' transcripts, one OpenAI-format message per line
     seen.json              what each bot has already seen in each conversation
     queue.json             queued work, so a restart doesn't lose it
   cursor-store/            the Cursor SDK's SQLite agent store (index.db + checkpoint blobs): each bot's conversation context
@@ -51,7 +54,7 @@ Start the app and look in `~/.cursor-bots` (or the `--home` you passed):
 
 Two kinds of memory live here, and the difference matters:
 
-- **Runtime context**: what the model saw earlier in its session. Cursor stores it in `cursor-store/` and compacts it when it gets long. It's big, lossy and opaque.
+- **Runtime context**: what the model saw earlier in its session. Cursor stores it in `cursor-store/` and compacts it when it gets long. It's big, lossy and opaque. (Provider brains keep theirs in `state/agents/` and compact it themselves.)
 - **Harness memory**: `state/memory/<bot>.md`. It's small and deliberate, and the bot edits it with a tool. The harness injects it every turn, so it survives compaction, restarts, and even a wiped `cursor-store/`.
 
 ## 2. A bot is a durable agent session plus an identity
@@ -207,17 +210,50 @@ Defense in depth: Cursor's **Auto-review** classifier and **sandbox** (bubblewra
 
 ```ts
 interface AgentRuntime {
+  provides?: { workspaceTools?, projectContext?, mcp? };                        // what the brain brings itself
   open(spec: { botId, agentId?, name, cwd, model? }): Promise<RuntimeSession>;  // create or resume
-  complete?(prompt): Promise<string>;                                           // optional one-shot (group routing)
+  complete?(prompt, { model? }): Promise<string>;                               // optional one-shot (group routing)
+  listModels?(), fetchModels?({ search }), lookupModel?(id);                    // the model picker and catalogue
 }
-interface RuntimeSession { agentId; send({ text, images, tools, mcpServers, model, onEvent }): Promise<RuntimeRun> }
+interface RuntimeSession { agentId; send({ text, images, system, tools, mcpServers, model, onEvent }): Promise<RuntimeRun> }
 interface RuntimeRun { steer?(text); cancel(); wait(): Promise<{ status, text, error?, usage? }> }
 ```
 
-- `CursorRuntime` (`src/runtimes/cursor.ts`): the Cursor SDK local agent. Harness tools become SDK `customTools`, connectors become `mcpServers`, and stream events map to `onEvent`.
+- `CursorRuntime` (`src/runtimes/cursor.ts`): the Cursor SDK local agent. Harness tools become SDK `customTools`, connectors become `mcpServers`, and stream events map to `onEvent`. Cursor brings its own file and shell tools, loads `AGENTS.md`, rules and skills from the workspace, and runs MCP servers, so it declares all three `provides` flags.
+- `OpenAICompatRuntime` (`src/runtimes/openai.ts`): any OpenAI-compatible chat completions API. One instance per **provider**, described below.
 - `MockRuntime` (`src/runtimes/mock.ts`): a scripted brain for tests and demos. It understands directives like `[[tool send_message {"to":"@critic","text":"hi"}]]`, so every feature can be tested without an API key.
 
-To add your own (the Claude Agent SDK, an OpenAI-compatible loop, a Cursor Cloud Agent), implement these three interfaces and register the runtime in `src/cli.ts`. Bots pick a runtime in their details.
+### Providers
+
+A provider is a saved `ProviderConfig` in `settings.json` (`src/core/providers.ts` has the presets and validation): base URL, models, concurrency, tool mode and optional headers. Each provider becomes a brain whose runtime id is the provider id (`featherless`, `openrouter`, …). Adding, editing or removing one in Settings rebuilds the registry (`Harness.syncProviders`). Bots keep `runtime` and `model` plus `modelRuntime`, the brain that model belongs to, so switching a bot's brain never sends a Cursor model id to Featherless or the reverse (`Harness.modelFor`). Removing a provider moves its bots to the default brain and posts a notice in their chats.
+
+**Keys.** Provider keys live in a second `SecretVault` on their own files (`state/provider-keys.vault` and `.json`, same key file). They are not ordinary secrets, so `list_secrets`, `run_with_secrets` and `${secret:…}` can't reach them, and a bot can't ask for one and `curl` it somewhere. The API accepts a key (`PUT /api/providers/:id/key`) but never returns it, `describeProviders` only says whether one is set, and every tool output is scrubbed of both vaults' values before it goes to any model. A key in the environment (`FEATHERLESS_API_KEY`, named by `keyEnv`) is read once and deleted from `process.env`. The shell gate treats `provider-keys.*` as gateway state. The base URL and headers live in `settings.json`, which bots can't write, so a bot can't point the key at another host.
+
+### What the harness adds for a plain model API
+
+A chat API has no tools, no project context and no MCP client, so the runner fills in what the runtime's `provides` leaves out:
+
+| Cursor brings | For a provider brain, the harness supplies |
+| --- | --- |
+| Its agent's instructions plus `AGENTS.md`, `.cursor/rules` and skills from the workspace | `SendInput.system` from `Harness.systemPromptFor`: the manual, the workspace-tools section of the manual, `workspace/AGENTS.md`, other always-on rules and the skills index |
+| File, search and shell tools | `buildWorkspaceTools` (`src/core/workspace-tools.ts`): shell, read, write, edit, delete, list, grep, glob and `web_fetch`, as ordinary harness tools |
+| An MCP client for connectors | `McpHub` (`src/core/mcp-client.ts`): one per bot, connectors as `<server>__<tool>` tools |
+| Its own transcript and compaction | The runtime keeps an OpenAI-format JSONL transcript per session in `state/agents/` and summarizes it when it outgrows the model's window |
+
+**Workspace tools keep the approval boundary.** Cursor's shell goes through the hook in §7. The harness's own shell checks the same things in-process. A command that touches the gateway is refused before approvals, even after "Always allow" or with approvals off. Everything else goes to `approvals.gate` with the exact command text, so "Allow once" is consumed by the retry. Commands run in their own process group with a timeout, and the stop button kills the whole tree. Their environment drops `CURSOR_API_KEY`, `CURSOR_BOTS_TOKEN` and provider key variables, and their output is scrubbed of secrets.
+
+File tools are stricter than Cursor's. A path must resolve inside the workspace after following symlinks, and outside the gateway's protected paths. Walking tools don't follow symlinked folders. `web_fetch` is GET only. It refuses the gateway itself and private or loopback addresses after DNS resolution, and caps what it returns.
+
+**Connectors.** `McpHub` speaks stdio (its own process group, killed on close), Streamable HTTP (session id, JSON or SSE answers, `DELETE` on close) and the older HTTP+SSE transport, and falls back to the older one when a server turns the POST away. Connections are reused across turns, restarted when they die or their config changes, and closed when a bot's session resets. A failing server is reported once in the bot's chat with its credentials removed. Connector calls aren't gated, as with Cursor.
+
+**The agent loop** (`openai.ts`) runs one turn as model call → tool calls → results → model call until the model answers.
+- **Streaming.** Answers stream over SSE. Reasoning (`reasoning_content`, `reasoning`, or `<think>` tags) is shown as thinking and never ends up in the reply.
+- **Tool modes.** Per model: `native` (API function calling), `prompt` (tools described in the system message, calls parsed from `<tool_call>` blocks) or `none`. `auto` tries native and drops to prompt mode if the server or model can't do it.
+- **Retries.** Concurrency limits (429), cold models still loading (Featherless answers 400 for those) and 503s are retried with backoff and a status line in the chat. Missing keys, gated models and unknown models fail at once with a message naming the provider.
+- **Concurrency.** A semaphore holds bots to the provider's concurrency units, so they queue instead of failing.
+- **Context.** Old tool output is shortened first, then older turns are summarized. A summary emits the `summary` event, which makes the runner resend identity and memory next turn, the same as after a Cursor compaction.
+
+To add another kind of brain (the Claude Agent SDK, a Cursor Cloud Agent), implement these interfaces, declare what it `provides`, and register it in `src/cli.ts`. Bots pick a brain in their details.
 
 ## 10. Team MCP: letting other harnesses in
 
@@ -242,3 +278,5 @@ This is how a Claude Code session, the Cursor IDE, Hermes or OpenClaw can delega
 ## 12. Testing
 
 `npm test` runs the suite on the mock runtime: DMs, restart persistence, handoffs, groups and the loop guard, approvals, the real hook script (including tamper healing), routines and webhooks, skills, secrets, steering and stop, helper bots, deletion, the token gate. `test/regressions.test.ts` pins down fixed defects: shared chain budgets, stop reaching delegated work, queue survival across restarts, approvals inside handoffs, torn JSONL lines, skill frontmatter round-trips, paused routines on copy and import, time zone re-arming, absence pauses, and the chat Markdown renderer. `npm run typecheck` checks everything against the real `@cursor/sdk` types.
+
+Provider brains are tested without any network: `test/openai-runtime.test.ts` drives the agent loop against a scripted OpenAI-compatible server (split SSE chunks, tool calls, reasoning, cold models, 429s, compaction, transcript resume), `test/mcp-client.test.ts` runs the MCP hub against a stdio fixture and local HTTP and SSE servers (and the gateway's own Team MCP endpoint), `test/workspace-tools.test.ts` checks the shell and file tools against the approval boundary, and `test/providers.test.ts` covers the registry, write-only keys and the providers API.
