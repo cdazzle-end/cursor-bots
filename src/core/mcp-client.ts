@@ -28,9 +28,11 @@ export interface McpTimeouts {
   callMs: number;
   /** After a server timed out while starting, skip it this long, so each turn doesn't stall on it again. */
   retryMs: number;
+  /** HTTP and SSE servers: re-list tools at the start of a turn once the list is this old (their change notices may never reach us). */
+  relistMs: number;
 }
 
-export const MCP_TIMEOUTS: McpTimeouts = { startMs: 60_000, listMs: 30_000, callMs: 300_000, retryMs: 120_000 };
+export const MCP_TIMEOUTS: McpTimeouts = { startMs: 60_000, listMs: 30_000, callMs: 300_000, retryMs: 120_000, relistMs: 60_000 };
 
 /** The most text one tool result may hand the model. */
 const MAX_TEXT = 200_000;
@@ -38,6 +40,8 @@ const MAX_DESCRIPTION = 4000;
 /** One stdio message may be large (screenshots), but not unbounded. */
 const MAX_LINE = 64 * 1024 * 1024;
 const STDERR_TAIL = 2048;
+/** Raw stderr kept: it is cleaned as a whole before the tail is cut, so the cut never splits a credential. */
+const STDERR_KEEP = 8192;
 
 export interface McpHubOptions {
   /** Reported to servers as clientInfo.name. */
@@ -106,11 +110,13 @@ export class McpHub {
     this.timeouts = { ...MCP_TIMEOUTS, ...opts.timeouts };
   }
 
-  /** Connect to (or reuse) these servers and return their tools. Servers no longer listed are closed. */
-  async tools(servers: Record<string, McpServerSpec>): Promise<BoundTool[]> {
-    const run = this.queue.then(() => this.reconcile(servers));
-    this.queue = run.catch(() => {});
-    return run;
+  /**
+   * Connect to (or reuse) these servers and return their tools. Servers no longer listed are closed.
+   * When `signal` aborts (the turn was stopped) this returns no tools at once; servers still
+   * starting finish in the background, ready for the next turn.
+   */
+  async tools(servers: Record<string, McpServerSpec>, signal?: AbortSignal): Promise<BoundTool[]> {
+    return unlessAborted(this.serial(() => this.reconcile(servers)), signal, () => []);
   }
 
   async close(): Promise<void> {
@@ -119,8 +125,17 @@ export class McpHub {
       this.live.clear();
       this.entries.clear();
       await Promise.all(conns.map((c) => c.close()));
+      // A reconcile in flight may still be stopping a server it dropped; with the rest closed it ends soon.
+      await this.queue;
     })();
     return this.closing;
+  }
+
+  /** Run `fn` after everything queued before it, so reconciles and restarts never overlap. */
+  private serial<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(fn);
+    this.queue = run.catch(() => {});
+    return run;
   }
 
   private async reconcile(servers: Record<string, McpServerSpec>): Promise<McpBoundTool[]> {
@@ -137,7 +152,7 @@ export class McpHub {
     for (const server of names) {
       const e = this.entries.get(server);
       if (!e?.conn || !e.tools) continue;
-      for (const def of e.tools) out.push(this.bind(server, e, e.conn, def, taken));
+      for (const def of e.tools) out.push(this.bind(server, e, def, taken));
     }
     return out;
   }
@@ -150,20 +165,23 @@ export class McpHub {
       await this.drop(server);
       e = undefined;
     }
+    if (this.closing) return;
     if (!e) {
       e = { key, spec, secrets: [] };
       this.entries.set(server, e);
     }
     if (e.conn?.dead) {
-      // It died (mid-call, or the session expired): start it again.
+      // It died (mid-call, or the server went away): start it again.
       await this.closeConn(e.conn);
       e.conn = undefined;
       e.tools = undefined;
     }
     if (!e.conn) {
       if (e.retryAt && Date.now() < e.retryAt) return;
+      // The hub started closing while an old connection was stopping: start nothing new.
+      if (this.closing) return;
       e.retryAt = undefined;
-      const conn = new McpConnection(spec, this.opts);
+      const conn = new McpConnection(spec, this.opts, this.timeouts);
       this.live.add(conn);
       try {
         await conn.start(this.timeouts.startMs);
@@ -171,7 +189,7 @@ export class McpHub {
         e.secrets = conn.secrets;
         await this.closeConn(conn);
         if (this.entries.get(server) !== e) return;
-        const problem = asMcpError(err);
+        const problem = asMcpError(err, (t) => this.clean(t, conn.secrets));
         if (problem.timedOut) e.retryAt = Date.now() + this.timeouts.retryMs;
         this.report(server, e, problem);
         return;
@@ -183,10 +201,13 @@ export class McpHub {
       e.conn = conn;
       e.secrets = conn.secrets;
     }
-    if (e.conn.stale || !e.tools) {
-      const conn = e.conn;
+    const conn = e.conn;
+    // A remote server's tools/list_changed comes on a stream we don't open: re-list a list that has grown old.
+    const old = conn.remote && e.listedAt !== undefined && Date.now() - e.listedAt >= this.timeouts.relistMs;
+    if (conn.stale || !e.tools || old) {
       try {
         e.tools = await conn.listTools(this.timeouts.listMs);
+        e.listedAt = Date.now();
       } catch (err) {
         if (conn.dead) {
           await this.closeConn(conn);
@@ -195,12 +216,14 @@ export class McpHub {
             e.tools = undefined;
           }
         }
+        if (this.closing) return;
         // A failed refresh keeps the tools we already had; it's retried next turn.
-        this.report(server, e, asMcpError(err));
+        this.report(server, e, asMcpError(err, (t) => this.clean(t, e.secrets)));
         return;
       }
     }
     this.reported.delete(server);
+    e.problem = undefined;
   }
 
   private async drop(server: string): Promise<void> {
@@ -209,12 +232,32 @@ export class McpHub {
     if (e?.conn) await this.closeConn(e.conn);
   }
 
+  /** Stop a connection; it stays in `live` until it has stopped, so close() waits for it too. */
   private async closeConn(conn: McpConnection): Promise<void> {
-    this.live.delete(conn);
     await conn.close();
+    this.live.delete(conn);
+  }
+
+  /**
+   * The connection a bound tool calls. One that died since (the server
+   * crashed, or the network broke) is started again first, in turn with
+   * reconciles and reported the same way, so later calls in the turn work.
+   */
+  private async connection(server: string, e: Entry, signal?: AbortSignal): Promise<McpConnection> {
+    if (e.conn && !e.conn.dead) return e.conn;
+    const revive = this.serial(async () => {
+      if (!this.closing && this.entries.get(server) === e) await this.ensure(server, e.spec);
+    });
+    await unlessAborted(revive, signal, () => {
+      throw new McpError("the turn was stopped");
+    });
+    if (this.closing) throw new McpError("the connector was closed");
+    if (e.conn && !e.conn.dead) return e.conn;
+    throw e.problem ?? e.conn?.dead ?? new McpError("the connector is not running");
   }
 
   private report(server: string, e: Entry, err: McpError): void {
+    e.problem = err;
     const headline = this.clean(err.headline, e.secrets);
     if (this.reported.get(server) === headline) return;
     this.reported.set(server, headline);
@@ -227,17 +270,10 @@ export class McpHub {
 
   /** Remove the connector's own credentials, then every stored secret. */
   private clean(text: string, secrets: string[]): string {
-    let out = text;
-    for (const v of secrets) out = out.split(v).join("[redacted]");
-    if (!this.opts.scrub) return out;
-    try {
-      return this.opts.scrub(out);
-    } catch {
-      return "[output withheld: removing secrets from it failed]";
-    }
+    return redact(text, secrets, this.opts.scrub);
   }
 
-  private bind(server: string, e: Entry, conn: McpConnection, def: McpToolDef, taken: Set<string>): McpBoundTool {
+  private bind(server: string, e: Entry, def: McpToolDef, taken: Set<string>): McpBoundTool {
     const name = mcpToolName(server, def.name, taken);
     taken.add(name);
     const ann = def.annotations && typeof def.annotations === "object" ? def.annotations : {};
@@ -249,16 +285,18 @@ export class McpHub {
       destructive: typeof ann.destructiveHint === "boolean" ? ann.destructiveHint : undefined,
       mcp: { server, tool: def.name },
       execute: async (args, ctx) => {
+        const clean = (text: string) => this.clean(text, e.secrets);
+        let conn: McpConnection | undefined;
         try {
           const params = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+          conn = await this.connection(server, e, ctx?.signal);
           const result = await conn.callTool(def.name, params, this.timeouts.callMs, ctx?.signal);
-          const out = toToolOutput(result);
-          out.text = this.clean(out.text, e.secrets);
-          return out;
+          return toToolOutput(result, clean);
         } catch (err) {
-          const problem = asMcpError(err);
-          const after = conn.dead ? "\n(The connector stopped; it will be restarted on the next turn.)" : "";
-          return { text: this.clean(`Connector "${server}", tool "${def.name}" failed: ${problem.message}${after}`, e.secrets), isError: true };
+          // A call that may have run is not sent again; the next call starts the connector again.
+          const problem = asMcpError(err, clean);
+          const after = conn?.dead ? "\n(The connector stopped; it will be restarted on the next call.)" : "";
+          return { text: clean(`Connector "${server}", tool "${def.name}" failed: ${problem.message}${after}`), isError: true };
         }
       },
     };
@@ -271,10 +309,14 @@ interface Entry {
   spec: McpServerSpec;
   conn?: McpConnection;
   tools?: McpToolDef[];
+  /** When `tools` was loaded. */
+  listedAt?: number;
   /** Credentials to strip from anything this server says. */
   secrets: string[];
   /** Set after a start timed out: don't try again before this. */
   retryAt?: number;
+  /** The last problem reported, for a call that finds the connector down. */
+  problem?: McpError;
 }
 
 /**
@@ -308,8 +350,8 @@ function toolDescription(server: string, def: McpToolDef): string {
   return truncate(`[${server}] ${text}`, MAX_DESCRIPTION);
 }
 
-/** Turn a tools/call result into what the model gets. */
-export function toToolOutput(result: unknown): ToolOutput {
+/** Turn a tools/call result into what the model gets; `clean` removes secrets from its text. */
+export function toToolOutput(result: unknown, clean: (text: string) => string = (t) => t): ToolOutput {
   const r: Json = result && typeof result === "object" ? (result as Json) : {};
   const texts: string[] = [];
   const images: Array<{ data: string; mimeType: string }> = [];
@@ -356,8 +398,11 @@ export function toToolOutput(result: unknown): ToolOutput {
   if (!texts.length && r.structuredContent !== undefined) texts.push(JSON.stringify(r.structuredContent));
   // Servers on the 2024-10-07 protocol answered with `toolResult`.
   if (!content.length && !texts.length && r.toolResult !== undefined) texts.push(typeof r.toolResult === "string" ? r.toolResult : JSON.stringify(r.toolResult));
-  let text = texts.join("\n");
-  if (text.length > MAX_TEXT) text = `${text.slice(0, MAX_TEXT)}\n[… ${text.length - MAX_TEXT} more characters cut]`;
+  // Cleaned before it is cut (half a credential no longer matches). Text far past the cut goes first, so cleaning stays cheap.
+  const joined = texts.join("\n");
+  let text = clean(joined.length > MAX_TEXT * 2 ? joined.slice(0, MAX_TEXT * 2) : joined);
+  const total = text.length + Math.max(0, joined.length - MAX_TEXT * 2);
+  if (text.length > MAX_TEXT) text = `${text.slice(0, MAX_TEXT)}\n[… ${total - MAX_TEXT} more characters cut]`;
   if (!text) text = images.length ? `[${images.length} image${images.length === 1 ? "" : "s"}]` : "(no output)";
   const out: ToolOutput = { text };
   if (images.length) out.images = images;
@@ -380,6 +425,8 @@ interface Pending {
 interface TransportHandlers {
   message(msg: unknown): void;
   closed(reason: McpError): void;
+  /** Remove credentials from server text; transports call it before they shorten anything. */
+  clean(text: string): string;
 }
 
 interface Transport {
@@ -392,6 +439,8 @@ interface Transport {
   protocolVersion?: string;
   /** Extra context for errors (the end of a stdio server's stderr). */
   detail?(): string | undefined;
+  /** Streamable HTTP: a transport for a new session with the same server. */
+  restart?(handlers: TransportHandlers): Transport;
   close(): Promise<void>;
 }
 
@@ -401,21 +450,31 @@ class McpConnection {
   dead?: McpError;
   /** The tool list needs (re)loading. */
   stale = true;
+  /** HTTP or SSE (not a process we run). */
+  remote: boolean;
   /** Values to strip from errors and results (the spec's credentials). */
   secrets: string[];
   private spec: McpServerSpec;
   private opts: McpHubOptions;
+  private timeouts: McpTimeouts;
   private transport?: Transport;
+  /** Set while a new Streamable HTTP session replaces one the server forgot; requests wait for it. */
+  private renewing?: Promise<Transport>;
   private pending = new Map<number, Pending>();
   private nextId = 1;
   private generation = 0;
   private closing?: Promise<void>;
 
-  constructor(spec: McpServerSpec, opts: McpHubOptions) {
+  constructor(spec: McpServerSpec, opts: McpHubOptions, timeouts: McpTimeouts) {
     this.spec = spec;
     this.opts = opts;
+    this.timeouts = timeouts;
     this.secrets = [];
+    this.remote = transportType(spec) !== "stdio";
   }
+
+  /** Remove the spec's credentials and every stored secret: done before anything is shortened. */
+  clean = (text: string): string => redact(text, this.secrets, this.opts.scrub);
 
   async start(ms: number): Promise<void> {
     const abort = new AbortController();
@@ -485,7 +544,7 @@ class McpConnection {
 
   private async handshake(signal: AbortSignal, ms: number): Promise<void> {
     const spec = this.spec;
-    const type = spec.type ?? (spec.url ? "http" : "stdio");
+    const type = transportType(spec);
     if (type === "stdio") {
       const env = this.opts.env();
       this.secrets = secretValues(spec, env);
@@ -539,27 +598,67 @@ class McpConnection {
       closed: (reason) => {
         if (gen === this.generation) this.onClosed(reason);
       },
+      clean: this.clean,
     };
   }
 
-  private async initialize(ms: number): Promise<void> {
+  /** Initialize the session on `via` (default: the current transport). */
+  private async initialize(ms: number, via?: Transport): Promise<void> {
     const res: any = await this.request(
       "initialize",
       { protocolVersion: MCP_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: this.opts.clientName, version: CLIENT_VERSION } },
       // start() has the real deadline (with a better message); this one only frees the request afterwards.
       ms + 1000,
+      undefined,
+      via,
     );
     const version = typeof res?.protocolVersion === "string" && res.protocolVersion ? res.protocolVersion : MCP_PROTOCOL_VERSION;
-    if (this.transport) this.transport.protocolVersion = version;
+    const t = via ?? this.transport;
+    if (t) t.protocolVersion = version;
     // Lenient: a server that turns the notification away may still work.
-    await this.notify("notifications/initialized").catch(() => {});
+    await this.notify("notifications/initialized", undefined, via).catch(() => {});
   }
 
-  private request(method: string, params: Json, ms: number, signal?: AbortSignal): Promise<any> {
-    const t = this.transport;
+  /**
+   * Streamable HTTP: the server forgot our session (it expired, or the server
+   * restarted), so it did not process the request. Start a new session, once
+   * however many requests noticed; if that fails, the connector is down.
+   */
+  private renew(from: Transport): Promise<Transport> {
+    if (this.renewing) return this.renewing;
+    if (this.dead) return Promise.reject(this.dead);
+    // Another request already replaced it.
+    if (this.transport && this.transport !== from) return Promise.resolve(this.transport);
+    if (!from.restart) return Promise.reject(new McpError("the server ended the session"));
+    const run = (async () => {
+      // The old transport is left open: requests still on it get their 404 too and are sent again here.
+      const t = from.restart!(this.handlers());
+      this.use(t);
+      await this.initialize(this.timeouts.startMs, t);
+      // A new session may come with other tools.
+      this.stale = true;
+      return t;
+    })();
+    this.renewing = run;
+    run.then(
+      () => {
+        if (this.renewing === run) this.renewing = undefined;
+      },
+      (err) => {
+        if (this.renewing === run) this.renewing = undefined;
+        this.onClosed(new McpError("the server ended the session, and starting a new one failed", { detail: asMcpError(err, this.clean).message }));
+      },
+    );
+    return run;
+  }
+
+  /** `via`: send on that transport, not waiting for a new session (for the one that starts it). */
+  private request(method: string, params: Json, ms: number, signal?: AbortSignal, via?: Transport): Promise<any> {
+    const t = via ?? this.transport;
     if (this.dead || !t) return Promise.reject(this.dead ?? new McpError("not connected"));
     if (signal?.aborted) return Promise.reject(new McpError("the turn was stopped"));
     const id = this.nextId++;
+    const msg = { jsonrpc: "2.0", id, method, params };
     return new Promise((resolve, reject) => {
       const abort = new AbortController();
       // Give up on the request and tell the server, which may stop the work (a timeout, or the turn was stopped).
@@ -576,17 +675,27 @@ class McpConnection {
       const onStop = () => giveUp("the user stopped the turn", new McpError("the turn was stopped"));
       signal?.addEventListener("abort", onStop, { once: true });
       this.pending.set(id, { method, resolve, reject, timer, abort, signal, onStop });
-      t.send({ jsonrpc: "2.0", id, method, params }, abort.signal).then(
-        (over) => {
-          if (over) this.settle(id, undefined, new McpError(`the server ended its response to ${method} without an answer`));
-        },
-        (err) => this.settle(id, undefined, asMcpError(err)),
-      );
+      const fail = (err: unknown) => this.settle(id, undefined, asMcpError(err, this.clean));
+      // `retry`: turned away because the server forgot the session (so not processed), it may go once more on a new one.
+      const sendOn = (to: Transport, retry: boolean) => {
+        if (!this.pending.has(id)) return;
+        to.send(msg, abort.signal).then(
+          (over) => {
+            if (over) this.settle(id, undefined, new McpError(`the server ended its response to ${method} without an answer`));
+          },
+          (err) => {
+            if (retry && !via && err instanceof SessionGone) this.renew(to).then((next) => sendOn(next, false), fail);
+            else fail(err);
+          },
+        );
+      };
+      if (this.renewing && !via) this.renewing.then((next) => sendOn(next, true), fail);
+      else sendOn(t, true);
     });
   }
 
-  private async notify(method: string, params?: Json): Promise<void> {
-    const t = this.transport;
+  private async notify(method: string, params?: Json, via?: Transport): Promise<void> {
+    const t = via ?? this.transport;
     if (this.dead || !t) return;
     await t.send(params ? { jsonrpc: "2.0", method, params } : { jsonrpc: "2.0", method });
   }
@@ -597,6 +706,8 @@ class McpConnection {
     this.pending.delete(id);
     clearTimeout(p.timer);
     if (p.onStop) p.signal?.removeEventListener("abort", p.onStop);
+    // Also ends the request's own HTTP response stream, whatever the server does with it.
+    p.abort.abort();
     if (error) p.reject(error);
     else p.resolve(result);
   }
@@ -629,7 +740,8 @@ class McpConnection {
       const code = Number(m.error?.code);
       const message = typeof m.error?.message === "string" ? m.error.message : "";
       const known = Number.isFinite(code);
-      this.settle(id, undefined, new McpError(`${p.method} failed${known ? ` (error ${code})` : ""}`, { detail: oneLine(message, 500), rpcCode: known ? code : undefined }));
+      const detail = cleanLine(message, this.clean, 500);
+      this.settle(id, undefined, new McpError(`${p.method} failed${known ? ` (error ${code})` : ""}`, { detail, rpcCode: known ? code : undefined }));
     } else this.settle(id, m.result);
   }
 
@@ -648,7 +760,9 @@ class StdioTransport implements Transport {
   private handlers: TransportHandlers;
   /** Its own process group, so close() also stops what it started (npx → node). */
   private group: boolean;
+  /** Raw, up to STDERR_KEEP; `stderrCut` once older output was dropped. */
   private stderr = "";
+  private stderrCut = false;
   private lines: Lines;
   private ended?: McpError;
   private exitInfo?: { code: number | null; signal: NodeJS.Signals | null };
@@ -688,7 +802,7 @@ class StdioTransport implements Transport {
     child.on("error", (err: NodeJS.ErrnoException) => {
       if (child.pid === undefined) markExited();
       const why = err.code === "ENOENT" ? " (command not found)" : err.code === "EACCES" ? " (permission denied)" : err.code ? ` (${err.code})` : "";
-      this.end(new McpError(`could not start "${oneLine(command, 80)}"${why}`));
+      this.end(new McpError(`could not start "${cleanLine(command, handlers.clean, 80)}"${why}`));
     });
     child.on("exit", (code, signal) => {
       this.exitInfo = { code, signal };
@@ -708,8 +822,10 @@ class StdioTransport implements Transport {
   }
 
   detail(): string | undefined {
-    const tail = this.stderr.trim();
-    return tail ? (this.stderr.length >= STDERR_TAIL ? `…${tail}` : tail) : undefined;
+    // Cleaned as a whole, then cut: the cut can't leave part of a credential behind.
+    const text = this.handlers.clean(this.stderr).trim();
+    if (!text) return undefined;
+    return this.stderrCut || text.length > STDERR_TAIL ? `…${text.slice(-STDERR_TAIL).trimStart()}` : text;
   }
 
   close(): Promise<void> {
@@ -755,14 +871,23 @@ class StdioTransport implements Transport {
       msg = JSON.parse(text);
     } catch {
       // Some servers log to stdout; keep it for error messages instead of failing.
-      this.noteStderr(`(stdout) ${text.slice(0, 300)}\n`);
+      this.noteStderr(`(stdout) ${cleanLine(text, this.handlers.clean, 300)}\n`);
       return;
     }
     this.handlers.message(msg);
   }
 
   private noteStderr(chunk: string): void {
-    this.stderr = (this.stderr + chunk).slice(-STDERR_TAIL);
+    const all = this.stderr + chunk;
+    if (all.length <= STDERR_KEEP) {
+      this.stderr = all;
+      return;
+    }
+    // Drop whole lines where that still leaves a full tail, so the start doesn't split a credential either.
+    const from = all.length - STDERR_KEEP;
+    const nl = all.indexOf("\n", from);
+    this.stderr = nl >= 0 && all.length - nl - 1 >= STDERR_TAIL ? all.slice(nl + 1) : all.slice(from);
+    this.stderrCut = true;
   }
 
   private exitError(): McpError {
@@ -782,6 +907,13 @@ class StdioTransport implements Transport {
   }
 }
 
+/** Streamable HTTP: the server no longer knows the session (404), so it did not process the message. */
+class SessionGone extends McpError {
+  constructor() {
+    super("the server ended the session");
+  }
+}
+
 /** Streamable HTTP: POST each message; the answer is JSON or an SSE stream. */
 class HttpTransport implements Transport {
   protocolVersion?: string;
@@ -789,6 +921,8 @@ class HttpTransport implements Transport {
   private headers: Record<string, string>;
   private handlers: TransportHandlers;
   private sessionId?: string;
+  /** The server forgot the session (404): later messages fail at once, and the connection starts a new session. */
+  private gone = false;
   private inflight = new Set<AbortController>();
   private ended?: McpError;
   private closing?: Promise<void>;
@@ -799,31 +933,41 @@ class HttpTransport implements Transport {
     this.handlers = handlers;
   }
 
+  restart(handlers: TransportHandlers): HttpTransport {
+    return new HttpTransport(this.url, this.headers, handlers);
+  }
+
   async send(msg: Json, signal?: AbortSignal): Promise<boolean> {
     if (this.ended) throw this.ended;
+    if (this.gone) throw new SessionGone();
     const isRequest = typeof msg.method === "string" && msg.id !== undefined;
+    const session = this.sessionId;
     const ctrl = track(this.inflight, signal);
     try {
-      const res = await fetch(this.url, {
-        method: "POST",
-        headers: buildHeaders(this.headers, {
-          "content-type": "application/json",
-          accept: "application/json, text/event-stream",
-          ...(this.sessionId ? { "mcp-session-id": this.sessionId } : {}),
-          ...(this.protocolVersion ? { "mcp-protocol-version": this.protocolVersion } : {}),
-        }),
-        body: JSON.stringify(msg),
-        signal: ctrl.signal,
-      });
+      const res = await fetchSameOrigin(
+        this.url,
+        {
+          method: "POST",
+          headers: buildHeaders(this.headers, {
+            "content-type": "application/json",
+            accept: "application/json, text/event-stream",
+            ...(session ? { "mcp-session-id": session } : {}),
+            ...(this.protocolVersion ? { "mcp-protocol-version": this.protocolVersion } : {}),
+          }),
+          body: JSON.stringify(msg),
+          signal: ctrl.signal,
+        },
+        this.url.origin,
+      );
       const sid = res.headers.get("mcp-session-id");
       if (sid && !this.sessionId) this.sessionId = sid;
-      if (res.status === 404 && this.sessionId && msg.method !== "initialize") {
+      if (res.status === 404 && session) {
         await discard(res);
-        // The session is already gone on the server: nothing to DELETE on close.
-        this.sessionId = undefined;
-        throw this.end(new McpError("the server ended the session"));
+        // The spec: a 404 for a request with a session id means the session is gone (nothing to DELETE on close).
+        this.gone = true;
+        throw new SessionGone();
       }
-      if (!res.ok) throw await httpError(res);
+      if (!res.ok) throw await httpError(res, this.handlers.clean);
       if (!isRequest || res.status === 202 || !res.body) {
         await discard(res);
         return true;
@@ -859,16 +1003,20 @@ class HttpTransport implements Transport {
     this.closing ??= (async () => {
       this.end(new McpError("the connector was closed"));
       for (const c of this.inflight) c.abort();
-      if (!this.sessionId) return;
+      if (!this.sessionId || this.gone) return;
       try {
-        const res = await fetch(this.url, {
-          method: "DELETE",
-          headers: buildHeaders(this.headers, {
-            "mcp-session-id": this.sessionId,
-            ...(this.protocolVersion ? { "mcp-protocol-version": this.protocolVersion } : {}),
-          }),
-          signal: AbortSignal.timeout(2000),
-        });
+        const res = await fetchSameOrigin(
+          this.url,
+          {
+            method: "DELETE",
+            headers: buildHeaders(this.headers, {
+              "mcp-session-id": this.sessionId,
+              ...(this.protocolVersion ? { "mcp-protocol-version": this.protocolVersion } : {}),
+            }),
+            signal: AbortSignal.timeout(2000),
+          },
+          this.url.origin,
+        );
         await discard(res);
       } catch {
         // Best effort: the server drops idle sessions anyway.
@@ -928,11 +1076,11 @@ class SseTransport implements Transport {
   private async connect(): Promise<void> {
     let res: Response;
     try {
-      res = await fetch(this.url, { method: "GET", headers: buildHeaders(this.headers, { accept: "text/event-stream" }), signal: this.stream.signal });
+      res = await fetchSameOrigin(this.url, { method: "GET", headers: buildHeaders(this.headers, { accept: "text/event-stream" }), signal: this.stream.signal }, this.url.origin);
     } catch (err) {
-      throw this.ended ?? new McpError("cannot reach the server", { detail: networkDetail(err) });
+      throw this.ended ?? (err instanceof McpError ? err : new McpError("cannot reach the server", { detail: networkDetail(err) }));
     }
-    if (!res.ok) throw await httpError(res);
+    if (!res.ok) throw await httpError(res, this.handlers.clean);
     if (!(res.headers.get("content-type") ?? "").includes("text/event-stream") || !res.body) {
       await discard(res);
       throw new McpError("the server did not open an event stream");
@@ -950,13 +1098,12 @@ class SseTransport implements Transport {
     if (!this.endpoint) throw new McpError("not connected");
     const ctrl = track(this.inflight, signal);
     try {
-      const res = await fetch(this.endpoint, {
-        method: "POST",
-        headers: buildHeaders(this.headers, { "content-type": "application/json" }),
-        body: JSON.stringify(msg),
-        signal: ctrl.signal,
-      });
-      if (!res.ok) throw await httpError(res);
+      const res = await fetchSameOrigin(
+        this.endpoint,
+        { method: "POST", headers: buildHeaders(this.headers, { "content-type": "application/json" }), body: JSON.stringify(msg), signal: ctrl.signal },
+        this.url.origin,
+      );
+      if (!res.ok) throw await httpError(res, this.handlers.clean);
       // Answers come on the event stream; a few servers also put them in the POST response.
       if ((res.headers.get("content-type") ?? "").includes("application/json")) {
         const parsed = parseJson(await res.text());
@@ -1108,10 +1255,42 @@ async function readSse(body: ReadableStream<Uint8Array>, onEvent: (ev: SseEvent)
   }
 }
 
-/** Does this message (or batch) carry the answer to request `id`? */
+/** Does this message (or batch) carry the answer to request `id`? Ids compare as numbers, as onMessage matches them ("5" answers 5). */
 function answers(msg: unknown, id: unknown): boolean {
-  const one = (m: any) => m && typeof m === "object" && typeof m.method !== "string" && m.id === id && ("result" in m || "error" in m);
+  const one = (m: any) =>
+    m && typeof m === "object" && typeof m.method !== "string" && m.id !== undefined && m.id !== null && Number(m.id) === Number(id) && ("result" in m || "error" in m);
   return Array.isArray(msg) ? msg.some(one) : one(msg);
+}
+
+/**
+ * fetch that follows redirects itself, and only on the connector's own origin:
+ * Node's fetch would take custom headers (X-API-Key, …) and the body to
+ * another host. 307 and 308 keep the method and body; 301, 302 and 303 are
+ * followed for a GET. Any other redirect comes back as the response it is.
+ */
+async function fetchSameOrigin(url: URL, init: RequestInit, origin: string): Promise<Response> {
+  const method = init.method ?? "GET";
+  let at = url;
+  for (let hops = 0; ; hops++) {
+    const res = await fetch(at, { ...init, redirect: "manual" });
+    const location = res.status >= 300 && res.status < 400 ? res.headers.get("location") : null;
+    if (location === null) return res;
+    let next: URL | undefined;
+    try {
+      next = new URL(location, at);
+    } catch {
+      next = undefined;
+    }
+    if (next && next.origin !== origin) {
+      await discard(res);
+      throw new McpError("the server redirected to another host");
+    }
+    const follow = res.status === 307 || res.status === 308 || (method === "GET" && [301, 302, 303].includes(res.status));
+    if (!next || !follow) return res;
+    await discard(res);
+    if (hops >= 5) throw new McpError("the server redirected too many times");
+    at = next;
+  }
 }
 
 function buildHeaders(user: Record<string, string>, own: Record<string, string>): Headers {
@@ -1139,7 +1318,7 @@ function track(set: Set<AbortController>, signal?: AbortSignal): AbortController
   return ctrl;
 }
 
-async function httpError(res: Response): Promise<McpError> {
+async function httpError(res: Response, clean: (text: string) => string): Promise<McpError> {
   let body = "";
   try {
     body = (await res.text()).slice(0, 4000);
@@ -1153,7 +1332,7 @@ async function httpError(res: Response): Promise<McpError> {
     if (typeof m === "string") detail = m;
   } else if (!(res.headers.get("content-type") ?? "").includes("html")) detail = body;
   const hint = res.status === 401 || res.status === 403 ? " (check the connector's token or headers)" : "";
-  return new McpError(`HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ""}${hint}`, { detail: oneLine(detail, 300) || undefined, status: res.status });
+  return new McpError(`HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ""}${hint}`, { detail: cleanLine(detail, clean, 300) || undefined, status: res.status });
 }
 
 async function discard(res: Response): Promise<void> {
@@ -1178,7 +1357,13 @@ function parseUrl(raw: string | undefined): URL {
     throw new McpError("its URL is not valid");
   }
   if (u.protocol !== "http:" && u.protocol !== "https:") throw new McpError("its URL must start with http:// or https://");
+  // fetch refuses such a URL. Never echo it: the part before @ is a credential.
+  if (u.username || u.password) throw new McpError("put credentials in the connector's headers, not in its URL");
   return u;
+}
+
+function transportType(spec: McpServerSpec): "stdio" | "http" | "sse" {
+  return spec.type ?? (spec.url ? "http" : "stdio");
 }
 
 function parseJson(text: string): unknown {
@@ -1189,9 +1374,47 @@ function parseJson(text: string): unknown {
   }
 }
 
-function asMcpError(err: unknown): McpError {
+/** `clean` runs before the message is shortened. */
+function asMcpError(err: unknown, clean: (text: string) => string = (t) => t): McpError {
   if (err instanceof McpError) return err;
-  return new McpError(oneLine(String((err as any)?.message ?? err ?? "unknown error"), 300));
+  return new McpError(cleanLine(String((err as any)?.message ?? err ?? "unknown error"), clean, 300));
+}
+
+/** Remove `secrets` (the connector's own credentials), then whatever `scrub` removes (every stored secret). */
+function redact(text: string, secrets: string[], scrub?: (text: string) => string): string {
+  let out = text;
+  for (const v of secrets) out = out.split(v).join("[redacted]");
+  if (!scrub) return out;
+  try {
+    return scrub(out);
+  } catch {
+    return "[output withheld: removing secrets from it failed]";
+  }
+}
+
+/**
+ * One line of at most `max` characters, cleaned before it is shortened (half a
+ * credential no longer matches). Text far past the cut goes first, so cleaning a huge message stays cheap.
+ */
+function cleanLine(text: string, clean: (text: string) => string, max: number): string {
+  return oneLine(clean(text.length > max * 20 ? text.slice(0, max * 20) : text), max);
+}
+
+/** `p`, or `aborted()` as soon as `signal` aborts; `p` keeps running. */
+function unlessAborted<T>(p: Promise<T>, signal: AbortSignal | undefined, aborted: () => T): Promise<T> {
+  if (!signal) return p;
+  return new Promise<T>((resolve, reject) => {
+    const stop = () => {
+      try {
+        resolve(aborted());
+      } catch (err) {
+        reject(err);
+      }
+    };
+    p.then(resolve, reject).finally(() => signal.removeEventListener("abort", stop));
+    if (signal.aborted) stop();
+    else signal.addEventListener("abort", stop, { once: true });
+  });
 }
 
 function seconds(ms: number): string {
@@ -1225,6 +1448,12 @@ function stableJson(v: unknown): string {
 }
 
 const SECRETISH = /key|token|secret|passw|auth|cred|cookie|session|private|signature|bearer/i;
+/**
+ * Values of credential-sounding variables that plainly are settings (ALLOW_PRIVATE_REPOS=true,
+ * AUTH_MODE=oauth, MAX_TOKENS=4000): flags, numbers and single short words. Hiding them would
+ * corrupt every result that contains them.
+ */
+const PLAIN_SETTING = /^(?:[a-z]{1,10}|-?\d{1,12}(?:\.\d+)?)$/i;
 const PLAIN_HEADERS = new Set(["accept", "accept-language", "cache-control", "content-type", "mcp-protocol-version", "user-agent"]);
 
 /**
@@ -1232,23 +1461,26 @@ const PLAIN_HEADERS = new Set(["accept", "accept-language", "cache-control", "co
  * values (and their parts, so "Bearer <token>" also hides a bare token), its
  * env values that look like credentials, URL passwords and token-like query
  * values, and credential-looking variables from the inherited environment.
+ * (Values expanded from ${secret:NAME} are removed by the hub's scrub as well.)
  */
 function secretValues(spec: McpServerSpec, inherited?: NodeJS.ProcessEnv): string[] {
   const out = new Set<string>();
   const add = (v: unknown, min: number) => {
     if (typeof v === "string" && v.trim().length >= min) out.add(v.trim());
   };
+  const credential = (v: unknown) => typeof v === "string" && !PLAIN_SETTING.test(v.trim());
   for (const [k, v] of Object.entries(spec.headers ?? {})) {
     if (PLAIN_HEADERS.has(k.toLowerCase())) continue;
     add(v, 6);
     for (const piece of String(v).split(/[\s,;]+/)) add(piece, 8);
   }
   for (const [k, v] of Object.entries(spec.env ?? {})) {
-    if (SECRETISH.test(k)) add(v, 4);
-    else if (typeof v === "string" && v.length >= 20 && !/[\s/\\]/.test(v)) add(v, 20);
+    if (SECRETISH.test(k)) {
+      if (credential(v)) add(v, 8);
+    } else if (typeof v === "string" && v.length >= 20 && !/[\s/\\]/.test(v)) add(v, 20);
   }
   // Paths (SSH_AUTH_SOCK, XAUTHORITY, …) match the names but aren't secrets.
-  if (inherited) for (const [k, v] of Object.entries(inherited)) if (SECRETISH.test(k) && !/^(\/|~|unix:)/.test(v ?? "")) add(v, 8);
+  if (inherited) for (const [k, v] of Object.entries(inherited)) if (SECRETISH.test(k) && !/^(\/|~|unix:)/.test(v ?? "") && credential(v)) add(v, 8);
   if (spec.url) {
     try {
       const u = new URL(spec.url);

@@ -98,6 +98,14 @@ async function readBody(req: http.IncomingMessage): Promise<string> {
   return body;
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Does any 6-character piece of `secret` appear in `text`? */
+function leaks(text: string, secret: string): boolean {
+  for (let i = 0; i + 6 <= secret.length; i++) if (text.includes(secret.slice(i, i + 6))) return true;
+  return false;
+}
+
 test("stdio: paginated tools, every content type, env, cwd and clientInfo", async () => {
   const { hub, errors, cwd, cleanup } = makeHub();
   try {
@@ -177,7 +185,7 @@ test("stdio: answers ping, refuses other server requests, and follows tools/list
   }
 });
 
-test("stdio: a server that dies mid-call fails that call clearly and is restarted on the next tools()", async () => {
+test("stdio: a server that dies mid-call fails that call clearly and is started again by the next call", async () => {
   const { hub, errors, cleanup } = makeHub();
   try {
     const servers = { fake: stdio() };
@@ -187,14 +195,16 @@ test("stdio: a server that dies mid-call fails that call clearly and is restarte
     assert.equal(crash.isError, true);
     assert.match(crash.text, /^Connector "fake", tool "crash" failed: the server exited \(code 3\)/);
     assert.match(crash.text, /boom: the server fell over/);
-    assert.match(crash.text, /restarted on the next turn/);
-    // The rest of the turn fails fast instead of hanging.
-    const after = await byName(first, "fake__echo").execute({ text: "x" });
-    assert.equal(after.isError, true);
+    assert.match(crash.text, /restarted on the next call/);
     await waitDead(pid);
 
+    // The rest of the turn doesn't fail with it: the next call starts the server again.
+    assert.equal((await byName(first, "fake__echo").execute({ text: "x" })).text, "x");
+    const restarted = (await info(first)).pid;
+    assert.notEqual(restarted, pid);
+    // The next turn keeps that process.
     const second = await hub.tools(servers);
-    assert.notEqual((await info(second)).pid, pid);
+    assert.equal((await info(second)).pid, restarted);
     assert.equal((await byName(second, "fake__echo").execute({ text: "back" })).text, "back");
     assert.deepEqual([...errors], []);
   } finally {
@@ -281,6 +291,51 @@ test("output goes through scrub, and the connector's own credentials are redacte
     const tools = await hub.tools({ fake: stdio({ API_TOKEN: "hdr-secret-123" }) });
     const out = await byName(tools, "fake__leak").execute({});
     assert.equal(out.text, "the key is [secret:KEY] and the header is [redacted]");
+  } finally {
+    await cleanup();
+  }
+});
+
+test("credentials are removed before anything is cut: the stderr tail, JSON-RPC errors and long output", async () => {
+  // The connector's own (an env var with a credential's name), and one only the hub's scrub knows (a ${secret:} value).
+  const own = `tka_${"Kp3Vw9Zr".repeat(5)}`;
+  const stored = `tkb_${"Hm4Xq8Ys".repeat(5)}`;
+  const { hub, errors, cleanup } = makeHub({ scrub: (t) => t.split(stored).join("[secret:SVC]") });
+  try {
+    // Each server logs its token, then enough noise that the last 2048 characters of stderr start 24 characters into it.
+    const noisy = (token: string) => `config: token=${token}\n${"x".repeat(2026)}\n`;
+    await hub.tools({
+      own: stdio({ FAKE_MCP_MODE: "fail-start", API_TOKEN: own, FAKE_STDERR: noisy(own) }),
+      stored: stdio({ FAKE_MCP_MODE: "fail-start", FAKE_STDERR: noisy(stored) }),
+    });
+    assert.deepEqual(errors.map((e) => e.server).sort(), ["own", "stored"]);
+    for (const e of errors) {
+      assert.match(e.message, /^the server exited \(code 2\): ….*\]\nx{2026}$/s);
+      assert.ok(!leaks(e.message, own) && !leaks(e.message, stored), e.message.slice(0, 80));
+    }
+
+    const leak = byName(await hub.tools({ fake: stdio({ API_TOKEN: own }) }), "fake__leak");
+    // A JSON-RPC error message is kept to 500 characters: uncleaned, this one would be cut 12 characters into the token.
+    const rpc = await leak.execute({ pad: 480, error: true });
+    assert.equal(rpc.isError, true);
+    assert.match(rpc.text, /tools\/call failed \(error -32000\): x{480} token=\[redacted\]$/);
+    assert.ok(!leaks(rpc.text, own));
+    // Tool output is kept to 200,000 characters: likewise.
+    const out = await leak.execute({ pad: 199_981 });
+    assert.ok(out.text.endsWith("x token=[redacted]"), out.text.slice(-40));
+    assert.ok(!leaks(out.text, own));
+  } finally {
+    await cleanup();
+  }
+});
+
+test("plain settings in credential-sounding env vars are not redacted from output", async () => {
+  const { hub, cleanup } = makeHub();
+  try {
+    const env = { API_TOKEN: "hdr-secret-123", ALLOW_PRIVATE_REPOS: "true", AUTH_MODE: "token", MAX_TOKENS: "40000000", SESSION_KIND: "personal" };
+    const tools = await hub.tools({ fake: stdio(env) });
+    const text = JSON.stringify({ private: true, auth: "token", max_tokens: 40000000, session: "personal", archived: false, token: "hdr-secret-123" });
+    assert.equal((await byName(tools, "fake__echo").execute({ text })).text, text.replace("hdr-secret-123", "[redacted]"));
   } finally {
     await cleanup();
   }
@@ -389,18 +444,72 @@ test("close: stops every server and what it started, is idempotent, and later ca
   }
 });
 
-/** Streamable HTTP: JSON and SSE answers, a session id, 202 for notifications, 404 once the session is gone. */
+test("close: waits for a server a reconcile is still stopping, and starts none after", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-close-"));
+  const { hub, cleanup } = makeHub();
+  try {
+    const v1 = path.join(dir, "v1.pid");
+    const v2 = path.join(dir, "v2.pid");
+    await hub.tools({ fake: stdio({ FAKE_MCP_MODE: "linger", FAKE_PID_FILE: v1 }) });
+    const pid = Number(fs.readFileSync(v1, "utf8"));
+    // A changed spec: the reconcile stops v1 (slowly: it ignores stdin closing), then would start v2.
+    const turn = hub.tools({ fake: stdio({ FAKE_MCP_MODE: "linger", FAKE_PID_FILE: v2 }) });
+    await sleep(50);
+    await hub.close();
+    assert.ok(!isAlive(pid), "close() returned while the old server was still running");
+    assert.deepEqual(await turn, []);
+    await sleep(100);
+    assert.ok(!fs.existsSync(v2), "a server was started after close()");
+  } finally {
+    await cleanup();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tools(): a stopped turn gets no tools at once; slow starts finish in the background for the next turn", async () => {
+  const { hub, errors, cleanup } = makeHub({ timeouts: { startMs: 800, retryMs: 60_000 } });
+  try {
+    const servers = { fake: stdio(), hang: stdio({ FAKE_MCP_MODE: "hang" }) };
+    const stop = new AbortController();
+    const t0 = Date.now();
+    const turn = hub.tools(servers, stop.signal);
+    setTimeout(() => stop.abort(), 50);
+    assert.deepEqual(await turn, []);
+    assert.ok(Date.now() - t0 < 400, "Stop waited for the hung server");
+    // A turn stopped before it asks gets nothing either.
+    assert.deepEqual(await hub.tools(servers, stop.signal), []);
+
+    // The next turn waits for that start, then uses what it started (and skips the hung server).
+    const tools = await hub.tools(servers);
+    assert.ok(tools.some((t) => t.name === "fake__echo"));
+    assert.ok(!tools.some((t) => t.name.startsWith("hang__")));
+    assert.equal(errors.length, 1);
+    assert.match(errors[0]!.message, /^no answer within 800ms/);
+  } finally {
+    await cleanup();
+  }
+});
+
+/**
+ * Streamable HTTP: JSON and SSE answers, a session id, 202 for notifications, 404 once the session is gone.
+ * Also: /deny (401, `pad` characters before it quotes the token), /away?to= (307 there), /moved (308 to /mcp).
+ */
 async function fakeHttp() {
-  const seen = { auth: [] as string[], accept: [] as string[], versions: [] as string[], notes: [] as string[], deletes: 0, sessions: 0 };
+  const seen = { auth: [] as string[], accept: [] as string[], versions: [] as string[], notes: [] as string[], deletes: 0, sessions: 0, hits: 0, lists: 0, drops: 0, open: 0 };
   let session = "";
+  let grown = false;
   const server = http.createServer(async (req, res) => {
+    seen.hits++;
     const body = await readBody(req);
     const url = new URL(req.url!, "http://x");
     if (url.pathname === "/deny") {
+      const pad = Number(url.searchParams.get("pad") ?? 0);
       res.writeHead(401, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: `invalid credentials: ${req.headers.authorization}` }));
+      res.end(JSON.stringify({ error: `${"x".repeat(pad)}${pad ? " " : ""}invalid credentials: ${req.headers.authorization}` }));
       return;
     }
+    if (url.pathname === "/away") return void res.writeHead(307, { location: url.searchParams.get("to")! }).end();
+    if (url.pathname === "/moved") return void res.writeHead(308, { location: "/mcp" }).end();
     if (req.method === "DELETE") {
       seen.deletes++;
       if (req.headers["mcp-session-id"] === session) session = "";
@@ -425,11 +534,13 @@ async function fakeHttp() {
       return void res.writeHead(202).end();
     }
     if (msg.method === "tools/list") {
+      seen.lists++;
       // An SSE answer: a comment, a notification first, CRLF line ends, and the event split across writes.
       res.writeHead(200, { "content-type": "text/event-stream" });
       res.write(": keep-alive\n\n");
       res.write(`event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", method: "notifications/message", params: { level: "info", data: "listing" } })}\n\n`);
-      const data = reply({ tools: [{ name: "json_echo", inputSchema: { type: "object" } }, { name: "sse_echo" }, { name: "expire" }] });
+      const names = ["json_echo", "sse_echo", "expire", "drop", "grow", ...(grown ? ["late"] : [])];
+      const data = reply({ tools: names.map((name) => (name === "json_echo" ? { name, inputSchema: { type: "object" } } : { name })) });
       res.write(`event: message\r\ndata: ${data.slice(0, 10)}`);
       setTimeout(() => res.end(`${data.slice(10)}\r\n\r\n`), 20);
       return;
@@ -442,14 +553,29 @@ async function fakeHttp() {
       }
       if (name === "sse_echo") {
         // Left open after the answer: the client must stop reading once it has what it asked for.
+        seen.open++;
+        res.on("close", () => seen.open--);
         res.writeHead(200, { "content-type": "text/event-stream" });
-        res.write(`data: ${reply({ content: [{ type: "text", text: `sse: ${args.text}` }] })}\n\n`);
+        // `stringId`: echo the request id as a string, as some servers do.
+        const answer = { jsonrpc: "2.0", id: args.stringId ? String(msg.id) : msg.id, result: { content: [{ type: "text", text: `sse: ${args.text}` }] } };
+        res.write(`data: ${JSON.stringify(answer)}\n\n`);
         return;
       }
       if (name === "expire") {
         session = "";
         res.writeHead(200, { "content-type": "application/json" });
         return void res.end(reply({ content: [{ type: "text", text: "expired" }] }));
+      }
+      if (name === "drop") {
+        // The connection breaks before an answer: the call may have run.
+        seen.drops++;
+        return void req.socket.destroy();
+      }
+      if (name === "grow") {
+        // A new tool, announced nowhere the client listens.
+        grown = true;
+        res.writeHead(200, { "content-type": "application/json" });
+        return void res.end(reply({ content: [{ type: "text", text: "grown" }] }));
       }
     }
     res.writeHead(200, { "content-type": "application/json" });
@@ -467,7 +593,7 @@ test("Streamable HTTP: JSON and SSE answers, session id, headers, session expiry
     let tools = await hub.tools({ remote: spec });
     assert.deepEqual(
       tools.map((t) => t.name),
-      ["remote__json_echo", "remote__sse_echo", "remote__expire"],
+      ["remote__json_echo", "remote__sse_echo", "remote__expire", "remote__drop", "remote__grow"],
     );
     assert.equal((await byName(tools, "remote__json_echo").execute({ text: "a" })).text, "json: a");
     assert.equal((await byName(tools, "remote__sse_echo").execute({ text: "b" })).text, "sse: b");
@@ -477,21 +603,113 @@ test("Streamable HTTP: JSON and SSE answers, session id, headers, session expiry
     // The version the server answered with is sent on every later request.
     assert.ok(srv.seen.versions.length >= 3 && srv.seen.versions.every((v) => v === "2025-03-26"));
 
-    // The server forgets the session: the next call fails clearly and the next turn starts a new session.
+    // The server forgets the session: the calls it turns away start one new session and are sent again, in the same turn.
     assert.equal((await byName(tools, "remote__expire").execute({})).text, "expired");
-    const gone = await byName(tools, "remote__json_echo").execute({ text: "x" });
-    assert.equal(gone.isError, true);
-    assert.match(gone.text, /the server ended the session/);
+    const again = await Promise.all([byName(tools, "remote__json_echo").execute({ text: "x" }), byName(tools, "remote__sse_echo").execute({ text: "y" })]);
+    assert.deepEqual(
+      again.map((o) => o.text),
+      ["json: x", "sse: y"],
+    );
+    assert.equal(srv.seen.sessions, 2);
+    assert.deepEqual(srv.seen.notes, ["notifications/initialized", "notifications/initialized"]);
     tools = await hub.tools({ remote: spec });
     assert.equal(srv.seen.sessions, 2);
     assert.equal((await byName(tools, "remote__json_echo").execute({ text: "again" })).text, "json: again");
     assert.deepEqual([...errors], []);
 
+    // Only the live session is deleted: the server already forgot the first.
     await hub.close();
     assert.equal(srv.seen.deletes, 1);
   } finally {
     await cleanup();
     await srv.close();
+  }
+});
+
+test("Streamable HTTP: a broken connection fails that call only (it isn't sent again), and the next call reconnects", async () => {
+  const srv = await fakeHttp();
+  const { hub, errors, cleanup } = makeHub();
+  try {
+    const tools = await hub.tools({ remote: { type: "http", url: `${srv.base}/mcp` } });
+    const drop = await byName(tools, "remote__drop").execute({});
+    assert.equal(drop.isError, true);
+    assert.match(drop.text, /^Connector "remote", tool "drop" failed: cannot reach the server.*\n\(The connector stopped; it will be restarted on the next call\.\)$/);
+    assert.equal(srv.seen.drops, 1);
+    assert.equal((await byName(tools, "remote__json_echo").execute({ text: "back" })).text, "json: back");
+    assert.equal(srv.seen.sessions, 2);
+    assert.equal(srv.seen.drops, 1);
+    assert.deepEqual([...errors], []);
+  } finally {
+    await cleanup();
+    await srv.close();
+  }
+});
+
+test("Streamable HTTP: an answer stream left open is closed once answered, whatever type of id it echoes", async () => {
+  const srv = await fakeHttp();
+  const { hub, cleanup } = makeHub();
+  try {
+    const sse = byName(await hub.tools({ remote: { type: "http", url: `${srv.base}/mcp` } }), "remote__sse_echo");
+    for (const stringId of [false, true, true, true]) assert.equal((await sse.execute({ text: "s", stringId })).text, "sse: s");
+    const end = Date.now() + 2000;
+    while (srv.seen.open && Date.now() < end) await sleep(20);
+    assert.equal(srv.seen.open, 0, "answer streams are still open");
+  } finally {
+    await cleanup();
+    await srv.close();
+  }
+});
+
+test("HTTP: tools are listed again once the list is older than relistMs", async () => {
+  const srv = await fakeHttp();
+  const { hub, cleanup } = makeHub({ timeouts: { relistMs: 300 } });
+  try {
+    const servers: Record<string, McpServerSpec> = { remote: { type: "http", url: `${srv.base}/mcp` } };
+    let tools = await hub.tools(servers);
+    assert.equal((await byName(tools, "remote__grow").execute({})).text, "grown");
+    // A fresh list is reused...
+    tools = await hub.tools(servers);
+    assert.ok(!tools.some((t) => t.name === "remote__late"));
+    assert.equal(srv.seen.lists, 1);
+    // ...an older one is loaded again.
+    await sleep(350);
+    tools = await hub.tools(servers);
+    assert.ok(tools.some((t) => t.name === "remote__late"));
+    assert.equal(srv.seen.lists, 2);
+    assert.equal(srv.seen.sessions, 1);
+  } finally {
+    await cleanup();
+    await srv.close();
+  }
+});
+
+test("redirects are followed on the connector's own host only, so its headers and body never reach another", async () => {
+  const srv = await fakeHttp();
+  const got: string[] = [];
+  const other = http.createServer((req, res) => {
+    got.push(`${req.method} ${req.url} ${req.headers["x-api-key"]}`);
+    res.writeHead(404).end();
+  });
+  const elsewhere = await listen(other);
+  const { hub, errors, cleanup } = makeHub();
+  try {
+    const headers = { "X-API-Key": "zap-very-secret-key-1" };
+    const away = `${srv.base}/away?to=${encodeURIComponent(`${elsewhere}/collect`)}`;
+    assert.deepEqual(await hub.tools({ http: { type: "http", url: away, headers }, sse: { type: "sse", url: away, headers } }), []);
+    assert.deepEqual(got, []);
+    assert.deepEqual(
+      errors.map((e) => `${e.server}: ${e.message}`).sort(),
+      ["http: the server redirected to another host", "sse: the server redirected to another host"],
+    );
+
+    // On its own host (/moved → /mcp) the redirect is followed, body and all.
+    const tools = await hub.tools({ moved: { type: "http", url: `${srv.base}/moved`, headers } });
+    assert.equal((await byName(tools, "moved__json_echo").execute({ text: "here" })).text, "json: here");
+    assert.equal(errors.length, 2);
+  } finally {
+    await cleanup();
+    await srv.close();
+    await stop(other);
   }
 });
 
@@ -510,6 +728,23 @@ test("HTTP errors are reported once, with a hint and without the token", async (
     assert.equal(errors[1]!.server, "dead");
     assert.match(errors[1]!.message, /^cannot reach the server/);
     assert.doesNotMatch(errors[1]!.message, /query-secret-value/);
+
+    // A long body is cleaned before it is cut to 300 characters: uncut, this one would end 15 characters into the token.
+    const token = `ghp_${"9fK2mQ7x".repeat(5)}`;
+    await hub.tools({ long: { type: "http", url: `${srv.base}/deny?pad=255`, headers: { Authorization: `Bearer ${token}` } } });
+    assert.equal(errors[2]!.server, "long");
+    assert.match(errors[2]!.message, /: x{255} invalid credentials: \[redacted\]$/);
+    assert.ok(!leaks(errors[2]!.message, token));
+
+    // Credentials in the URL: fetch refuses them, so say where they go instead (without repeating them).
+    const hits = srv.seen.hits;
+    const withUser = srv.base.replace("http://", "http://someone:pw-secret-789@");
+    await hub.tools({ inurl: { type: "http", url: `${withUser}/mcp` }, inurlsse: { type: "sse", url: `${withUser}/sse` } });
+    assert.deepEqual(
+      errors.slice(3).map((e) => `${e.server}: ${e.message}`).sort(),
+      ["inurl: put credentials in the connector's headers, not in its URL", "inurlsse: put credentials in the connector's headers, not in its URL"],
+    );
+    assert.equal(srv.seen.hits, hits);
   } finally {
     await cleanup();
     await srv.close();

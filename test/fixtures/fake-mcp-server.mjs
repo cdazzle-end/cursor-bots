@@ -2,8 +2,9 @@
 // A scripted MCP server over stdio, for test/mcp-client.test.ts.
 //
 // FAKE_MCP_MODE:  (unset)     a working server
-//                 fail-start  complain on stderr (quoting FAKE_TOKEN) and exit 2 before answering
+//                 fail-start  complain on stderr (FAKE_STDERR, or a line quoting FAKE_TOKEN) and exit 2 before answering
 //                 hang        read stdin but never answer, and ignore stdin closing
+//                 linger      a working server that ignores stdin closing (SIGTERM stops it), so it is slow to close
 //                 grandchild  also start a long-running child process (to check the process group is killed)
 // FAKE_PID_FILE:  write this process's pid there at startup.
 import { spawn } from "node:child_process";
@@ -13,7 +14,7 @@ import * as readline from "node:readline";
 const mode = process.env.FAKE_MCP_MODE ?? "";
 if (process.env.FAKE_PID_FILE) fs.writeFileSync(process.env.FAKE_PID_FILE, String(process.pid));
 if (mode === "fail-start") {
-  process.stderr.write(`fatal: the token ${process.env.FAKE_TOKEN ?? ""} was rejected\n`);
+  process.stderr.write(process.env.FAKE_STDERR ?? `fatal: the token ${process.env.FAKE_TOKEN ?? ""} was rejected\n`);
   process.exit(2);
 }
 
@@ -87,6 +88,12 @@ async function call(name, args) {
         }),
       );
     case "leak":
+      // With `pad`: that many characters, then the API_TOKEN variable, as text or (with `error`) as a JSON-RPC error.
+      if (typeof args.pad === "number") {
+        const t = `${"x".repeat(args.pad)} token=${process.env.API_TOKEN ?? ""}`;
+        if (args.error) throw Object.assign(new Error(t), { code: -32000 });
+        return text(t);
+      }
       return text("the key is s3cr3t-value and the header is hdr-secret-123");
     case "crash":
       process.stderr.write("boom: the server fell over\n");
@@ -151,7 +158,12 @@ rl.on("line", async (line) => {
       return send({ jsonrpc: "2.0", id: msg.id, result: { tools: all.slice(start, start + 4), ...(next ? { nextCursor: next } : {}) } });
     }
     case "tools/call": {
-      const out = await call(msg.params.name, msg.params.arguments ?? {});
+      let out;
+      try {
+        out = await call(msg.params.name, msg.params.arguments ?? {});
+      } catch (err) {
+        return send({ jsonrpc: "2.0", id: msg.id, error: { code: err.code ?? -32603, message: String(err.message) } });
+      }
       if (out === undefined) return;
       if (out === null) return send({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: `Unknown tool: ${msg.params.name}` } });
       return send({ jsonrpc: "2.0", id: msg.id, result: out });
@@ -161,6 +173,6 @@ rl.on("line", async (line) => {
   }
 });
 rl.on("close", () => {
-  if (mode !== "hang") process.exit(0);
+  if (mode !== "hang" && mode !== "linger") process.exit(0);
 });
-if (mode === "hang") setInterval(() => {}, 1000);
+if (mode === "hang" || mode === "linger") setInterval(() => {}, 1000);
