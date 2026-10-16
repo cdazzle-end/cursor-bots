@@ -27,7 +27,7 @@ export interface AgentRuntime {
   /** Open (create or resume) the long-lived agent session for one bot. */
   open(spec: SessionSpec): Promise<RuntimeSession>;
   /** One-shot text completion for small decisions (group routing). Optional. */
-  complete?(prompt: string, opts?: { model?: ModelChoice }): Promise<string>;
+  complete?(prompt: string, opts?: { model?: ModelChoice; signal?: AbortSignal }): Promise<string>;
   listModels?(): Promise<RuntimeModel[]>;
   /** Providers: read the service's model catalogue (optionally filtered). */
   fetchModels?(opts?: { search?: string }): Promise<ProviderModel[]>;
