@@ -92,7 +92,7 @@ Bots don't have to run on Cursor. Any service with an OpenAI-compatible chat API
 
 Open models vary a lot in how well they call tools and how much context they hold. A 32B model with a 32k window can do focused tasks well, but long multi-step work goes better on a larger model.
 
-`node src/cli.ts models --runtime featherless --search qwen` lists a provider's catalogue from the terminal, and `npm run doctor` checks each provider's key and models.
+`node src/cli.ts models --runtime featherless --search qwen` lists a provider's catalogue from the terminal, and `npm run doctor` checks each provider's models and its key (with one short test prompt).
 
 ### Run it 24/7
 

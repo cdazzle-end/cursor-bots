@@ -274,8 +274,10 @@ export function cleanProvider(input: any, existing: ProviderConfig | undefined, 
       : input?.maxTokensParam === null
         ? undefined
         : existing?.maxTokensParam;
+  const preset = existing?.preset ?? (PROVIDER_PRESETS.some((x) => x.key === input?.preset) ? String(input.preset) : undefined);
   return {
     id,
+    preset,
     label,
     baseUrl,
     enabled: input?.enabled === undefined ? existing?.enabled ?? true : Boolean(input.enabled),
@@ -304,6 +306,7 @@ export function fromPreset(key: string): Partial<ProviderConfig> {
   if (!p) throw new Error(`Unknown provider preset: ${key}`);
   return {
     id: p.key === "custom" ? undefined : p.key,
+    preset: p.key,
     label: p.label,
     baseUrl: p.baseUrl,
     maxConcurrency: p.maxConcurrency,

@@ -218,7 +218,7 @@ async function doctor(argv: string[]): Promise<void> {
   const bwrap = ["/usr/bin/bwrap", "/usr/local/bin/bwrap"].some((p) => fs.existsSync(p));
   if (process.platform === "linux") (bwrap ? ok : warn)(bwrap ? "bubblewrap found (Cursor sandbox available)" : "bubblewrap not found: the optional Cursor sandbox won't work on this Linux host");
 
-  // Model providers: key present, catalogue reachable, configured models known.
+  // Model providers: key present, catalogue reachable, configured models known, and one test prompt.
   const h = new Harness({ home, runtimes: [], providerRuntime });
   for (const p of h.describeProviders()) {
     if (!p.enabled) {
@@ -236,6 +236,10 @@ async function doctor(argv: string[]): Promise<void> {
         const found = catalog.some((c) => c.id === m.id) || (await h.providerLookup(p.id, m.id));
         (found ? ok : warn)(`  ${m.id}${found ? "" : ": not in the provider's list (check the id)"}`);
       }
+      // Some model lists are public (Featherless, OpenRouter): only a real request checks the key.
+      const t = await h.testProvider(p.id);
+      if (t.ok) ok(`${p.label}: ${t.model ?? "the default model"} answered a test prompt (${(t.ms / 1000).toFixed(1)}s)`);
+      else bad(`${p.label}: test prompt failed: ${t.error}`);
     } catch (err: any) {
       bad(`${p.label}: ${err?.message ?? err}`);
     }

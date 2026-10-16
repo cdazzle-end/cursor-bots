@@ -1459,6 +1459,7 @@ function openSettings(tab = "general") {
         });
       };
       const presets = await api("GET", "/api/providers").then((r) => r.presets).catch(() => []);
+      S.presets = presets;
       $("#s-presets").innerHTML = `<span class="muted" style="align-self:center">Add:</span>${presets.map((pr) => `<button class="btn small" data-padd="${esc(pr.key)}">${esc(pr.label)}</button>`).join("")}`;
       const redraw = () => refreshState().then(() => show("brain"));
       $$("[data-padd]", body).forEach(
@@ -1680,7 +1681,9 @@ function openProviderEditor(id, done) {
     drawModels();
   };
   const p = p0;
-  body.innerHTML = `<div class="grid2"><div class="field">Name<input id="pe-label" value="${esc(p.label)}"></div><div class="field">Base URL<input id="pe-url" value="${esc(p.baseUrl)}" placeholder="https://api.example.com/v1"></div></div>
+  const preset = (S.presets ?? []).find((x) => x.key === p.preset);
+  const tips = [preset?.note ? esc(preset.note) : "", p.needsKey && !p.hasKey && preset?.keyUrl ? `<a href="${esc(preset.keyUrl)}" target="_blank" rel="noopener">Get a key</a>` : ""].filter(Boolean).join(" ");
+  body.innerHTML = `${tips ? `<div class="muted" style="margin-bottom:8px">${tips}</div>` : ""}<div class="grid2"><div class="field">Name<input id="pe-label" value="${esc(p.label)}"></div><div class="field">Base URL<input id="pe-url" value="${esc(p.baseUrl)}" placeholder="https://api.example.com/v1"></div></div>
     <div class="field">API key <span class="muted" id="pe-key-state">${p.hasKey ? `saved${p.keySource === "environment" ? ` (from ${esc(p.keyEnv ?? "the environment")})` : ""}` : p.needsKey ? "not set yet" : "not needed for a local server"}</span>
       <div class="row" style="display:flex;gap:6px"><input id="pe-key" type="password" autocomplete="off" placeholder="${p.hasKey ? "Paste a new key to replace the saved one" : "Paste your API key"}" style="flex:1"><button class="btn small" id="pe-key-save">Save key</button><button class="btn small danger" id="pe-key-del" ${p.keySource === "saved" ? "" : "hidden"}>Remove key</button></div>
       <div class="muted">Stored encrypted on this computer, never shown again, and kept away from bots (they can't read it with any tool).</div></div>
@@ -2175,6 +2178,16 @@ function handleEvent(ev) {
       const l = S.live[ev.botId];
       if (l && l.runId === ev.runId) {
         l.text += ev.text;
+        l.status = undefined;
+        if (ev.convId === S.current) scheduleLive();
+      }
+      break;
+    }
+    case "run.thinking": {
+      // The model is working again: a "waiting for capacity" or "loading" line no longer applies.
+      const l = S.live[ev.botId];
+      if (l && l.runId === ev.runId && l.status) {
+        l.status = undefined;
         if (ev.convId === S.current) scheduleLive();
       }
       break;
@@ -2191,6 +2204,7 @@ function handleEvent(ev) {
       const l = S.live[ev.botId];
       if (l && l.runId === ev.runId) {
         l.tools.set(ev.item.callId, ev.item);
+        l.status = undefined;
         if (ev.convId === S.current) scheduleLive();
       }
       break;

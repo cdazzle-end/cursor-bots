@@ -16,11 +16,12 @@ import { settle } from "./helpers.ts";
 const BARE = { workspaceTools: false, projectContext: false, mcp: false };
 
 function fakeProviders() {
-  const made: Array<{ id: string; mock: MockRuntime; key: () => string | undefined }> = [];
+  const made: Array<{ id: string; mock: MockRuntime; key: () => string | undefined; completes: Array<Record<string, unknown> | undefined> }> = [];
   const factory: ProviderRuntimeFactory = (deps) => {
     const mock = new MockRuntime({ chunkDelayMs: 0, provides: BARE });
     const id = deps.provider().id;
-    made.push({ id, mock, key: deps.apiKey });
+    const completes: Array<Record<string, unknown> | undefined> = [];
+    made.push({ id, mock, key: deps.apiKey, completes });
     const rt: AgentRuntime = {
       id,
       get label() {
@@ -29,7 +30,10 @@ function fakeProviders() {
       provides: BARE,
       available: () => (deps.apiKey() ? { ok: true } : { ok: false, reason: `${deps.provider().label} needs an API key.` }),
       open: (spec) => mock.open(spec),
-      complete: (p) => mock.complete(p),
+      complete: (p, o) => {
+        completes.push(o);
+        return mock.complete(p);
+      },
       listModels: async () => deps.provider().models.map((m) => ({ id: m.id, displayName: m.label ?? m.id, contextWindow: m.contextWindow })),
       fetchModels: async (o) => [{ id: "Qwen/Qwen3-32B", contextWindow: 32768 }, { id: "meta-llama/Llama-3.3-70B-Instruct" }].filter((m) => !o?.search || m.id.toLowerCase().includes(o.search.toLowerCase())),
       lookupModel: async (mid) => (mid === "Qwen/Qwen3-32B" ? { id: mid, contextWindow: 32768, concurrencyCost: 2 } : undefined),
@@ -207,6 +211,53 @@ test("providers: removing one moves its bots to the default brain with a notice"
     s.h.store.bots.get(bot.id)!.runtime = "gone";
     assert.throws(() => s.h.runtimeFor(s.h.store.bots.get(bot.id)!), /no longer exists/);
   } finally {
+    await s.close();
+  }
+});
+
+test("providers: a model stays with its brain through copies, templates and helpers; removing the default brain says so", async () => {
+  const s = await boot();
+  const savedCursorKey = process.env.CURSOR_API_KEY;
+  try {
+    const p = s.h.createProvider({ preset: "featherless" });
+    assert.equal(p.preset, "featherless", "remembers its preset (for the editor's notes)");
+    s.h.setProviderKey("featherless", "fl_key_0000000000");
+    // A bot with a Cursor model from before, then Featherless becomes the default brain.
+    const old = s.h.createBot({ name: "Old", model: { id: "composer-2.5" }, modelRuntime: "cursor" });
+    s.h.updateSettings({ runtime: "featherless" });
+    const fl = s.h.runtimes.get("featherless")!;
+    const copy = s.h.duplicateBot(old.id);
+    assert.equal(copy.modelRuntime, "cursor");
+    assert.deepEqual(s.h.modelFor(copy, fl), { id: "Qwen/Qwen3-32B" }, "the Cursor model isn't sent to Featherless");
+    const t = s.h.exportBot(old.id);
+    assert.equal(t.modelRuntime, "cursor");
+    const imported = s.h.importBot({ ...t, modelRuntime: undefined });
+    assert.equal(imported.modelRuntime, "cursor", "older templates hold Cursor models");
+    assert.deepEqual(s.h.modelFor(imported, fl), { id: "Qwen/Qwen3-32B" });
+
+    // A helper made by a bot on Featherless runs on Featherless too.
+    s.h.updateSettings({ runtime: "mock" });
+    const maker = s.h.createBot({ name: "Maker", runtime: "featherless" });
+    await s.h.postUserMessage(s.h.store.dmFor(maker.id)!.id, { text: '[[tool create_bot {"name":"Helper","job":"Find sources"}]] [[reply Made one.]]' });
+    await settle(s.h);
+    assert.equal([...s.h.store.bots.values()].find((b) => b.name === "Helper")?.runtime, "featherless");
+
+    // The test prompt gets an abort signal, so a call that runs out of time lets go of its capacity.
+    await s.h.testProvider("featherless");
+    assert.ok(s.fp.made[0]!.completes.at(-1)?.signal instanceof AbortSignal);
+
+    // Removing the default brain tells the bots that were on it.
+    s.h.updateSettings({ runtime: "featherless" });
+    const plain = s.h.createBot({ name: "Plain" });
+    await s.h.deleteProvider("featherless");
+    assert.ok(s.h.store.messages(s.h.store.dmFor(plain.id)!.id).some((m) => m.kind === "notice" && /Featherless AI was removed, so Plain now runs on the default brain \(/.test(m.text)));
+
+    // The Cursor key isn't handed to another provider in tool output either.
+    process.env.CURSOR_API_KEY = "key_cursor_abcdef123456";
+    assert.equal(s.h.scrubSecrets("k=key_cursor_abcdef123456"), "k=[secret:CURSOR_API_KEY]");
+  } finally {
+    if (savedCursorKey === undefined) delete process.env.CURSOR_API_KEY;
+    else process.env.CURSOR_API_KEY = savedCursorKey;
     await s.close();
   }
 });

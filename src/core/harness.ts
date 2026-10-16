@@ -69,6 +69,8 @@ export interface BotInput {
   about?: string;
   avatar?: Partial<Bot["avatar"]>;
   model?: ModelChoice;
+  /** The brain `model` belongs to (default: the bot's brain). */
+  modelRuntime?: string;
   runtime?: string;
   connectors?: Bot["connectors"];
   disabledSkills?: string[];
@@ -83,6 +85,8 @@ export interface BotTemplate {
   about?: string;
   avatar: Bot["avatar"];
   model?: ModelChoice;
+  /** The brain the model belongs to ("cursor" in older templates), so it isn't sent to another one. */
+  modelRuntime?: string;
   connectors: Bot["connectors"];
   disabledSkills: string[];
   routines: Array<Pick<Routine, "name" | "instruction" | "cron" | "timezone" | "skill"> & { enabled?: boolean }>;
@@ -337,31 +341,39 @@ export class Harness {
     list[i] = next;
     // A key belongs to the service it was saved for: another host has to be given one again.
     if (originOf(next.baseUrl) !== originOf(before.baseUrl)) this.providerKeys.remove(providerKeyName(id));
+    // The runtime reads the config on every request, so running turns carry on with the new address.
     this.providersChanged();
-    // Another endpoint is another service: start bots on it with a fresh context.
-    if (next.baseUrl !== before.baseUrl) {
-      for (const b of this.store.bots.values()) if ((b.runtime || this.store.settings.runtime) === id) void this.runners.get(b.id)?.resetSession();
-    }
     return next;
   }
 
   /** Remove a provider. Bots that ran on it move to the default brain and are told so. */
   async deleteProvider(id: Id): Promise<void> {
     const p = this.provider(id);
+    const wasDefault = this.store.settings.runtime === id;
     this.store.settings.providers = this.store.settings.providers.filter((x) => x.id !== id);
-    if (this.store.settings.runtime === id) this.store.settings.runtime = this.runtimes.has("cursor") ? "cursor" : [...this.runtimes.keys()].find((k) => k !== id) ?? "cursor";
+    if (wasDefault) this.store.settings.runtime = this.runtimes.has("cursor") ? "cursor" : [...this.runtimes.keys()].find((k) => k !== id) ?? "cursor";
     this.providerKeys.remove(providerKeyName(id));
     for (const b of this.store.bots.values()) {
-      const onIt = (b.runtime || "") === id;
+      // Bots set to it, and bots on the default brain when it was the default.
+      const onIt = (b.runtime || (wasDefault ? id : "")) === id;
       if (onIt) {
         b.runtime = undefined;
         if (b.modelRuntime === id) {
           b.model = undefined;
           b.modelRuntime = undefined;
         }
-        await this.runners.get(b.id)?.resetSession();
+        const runner = this.runners.get(b.id);
+        const working = runner?.status().state === "working";
+        if (working) await runner!.stop();
+        await runner?.resetSession();
         const dm = this.store.dmFor(b.id);
-        if (dm) this.postNotice(dm.id, `${p.label} was removed, so ${b.name} now runs on the default brain. Its memory is kept; its conversation context starts fresh.`);
+        const brain = this.runtimes.get(this.store.settings.runtime)?.label ?? this.store.settings.runtime;
+        if (dm) {
+          this.postNotice(
+            dm.id,
+            `${p.label} was removed, so ${b.name} now runs on the default brain (${brain}).${working ? " The turn it was working on was stopped; send the message again." : ""} Its memory is kept; its conversation context starts fresh.`,
+          );
+        }
         this.bus.emit({ type: "bot.updated", bot: this.describeBot(b) });
       }
     }
@@ -411,11 +423,11 @@ export class Harness {
     if (!avail.ok) return { ok: false, error: avail.reason, ms: 0 };
     if (!rt.complete) return { ok: false, error: "This brain can't run a test prompt.", ms: 0 };
     const model = p.defaultModel || p.models[0]?.id;
+    const complete = rt.complete.bind(rt);
     try {
-      const reply = await Promise.race([
-        rt.complete("Reply with the single word OK.", { model: model ? { id: model } : undefined }),
-        new Promise<string>((_, reject) => setTimeout(() => reject(new Error("No answer within 90 seconds (a cold model can take longer to load).")), 90_000)),
-      ]);
+      const reply = await withDeadline(90_000, "No answer within 90 seconds (a cold model can take longer to load).", (signal) =>
+        complete("Reply with the single word OK.", { model: model ? { id: model } : undefined, signal }),
+      );
       return { ok: true, reply: oneLine(reply, 200), ms: Date.now() - started, model };
     } catch (err) {
       return { ok: false, error: String((err as Error)?.message ?? err), ms: Date.now() - started, model };
@@ -759,7 +771,7 @@ export class Harness {
       about: input.about?.trim() || undefined,
       avatar: { shape: input.avatar?.shape ?? AVATAR_SHAPES[shapeIdx]!, color: input.avatar?.color ?? colorFor(name), image: input.avatar?.image },
       model: input.model,
-      modelRuntime: input.model ? input.runtime || this.store.settings.runtime : undefined,
+      modelRuntime: input.model ? input.modelRuntime ?? (input.runtime || this.store.settings.runtime) : undefined,
       runtime: input.runtime,
       connectors: input.connectors ?? "all",
       disabledSkills: input.disabledSkills ?? [],
@@ -879,6 +891,8 @@ export class Harness {
       about: src.about,
       avatar: { ...src.avatar },
       model: src.model,
+      // Bots from before brains were per bot have Cursor models (as in modelFor).
+      modelRuntime: src.model ? src.modelRuntime ?? "cursor" : undefined,
       runtime: src.runtime,
       connectors: Array.isArray(src.connectors) ? [...src.connectors] : src.connectors,
       disabledSkills: [...src.disabledSkills],
@@ -921,6 +935,7 @@ export class Harness {
       about: bot.about,
       avatar: { shape: bot.avatar.shape, color: bot.avatar.color },
       model: bot.model,
+      modelRuntime: bot.model ? bot.modelRuntime ?? "cursor" : undefined,
       connectors: bot.connectors,
       disabledSkills: bot.disabledSkills,
       routines: this.scheduler
@@ -939,6 +954,7 @@ export class Harness {
       about: t.about,
       avatar: t.avatar,
       model: t.model,
+      modelRuntime: t.model ? (typeof t.modelRuntime === "string" && t.modelRuntime ? t.modelRuntime : "cursor") : undefined,
       connectors: t.connectors,
       disabledSkills: t.disabledSkills,
     });
@@ -1232,10 +1248,8 @@ export class Harness {
       `Answer with only the handle (without @) of the one teammate who should respond, or "everyone" if each of them must respond.`;
     // A provider picks its own routing model (its routerModel or default); Cursor uses settings.routerModel.
     const isProvider = this.store.settings.providers.some((p) => p.id === rt.id);
-    const answer = await Promise.race([
-      rt.complete(prompt, { model: isProvider ? undefined : this.store.settings.routerModel }),
-      new Promise<string>((_, reject) => setTimeout(() => reject(new Error("routing timeout")), 25_000)),
-    ]);
+    const complete = rt.complete.bind(rt);
+    const answer = await withDeadline(25_000, "routing timeout", (signal) => complete(prompt, { model: isProvider ? undefined : this.store.settings.routerModel, signal }));
     const a = answer.toLowerCase();
     if (/\beveryone\b/.test(a)) return "everyone";
     const ordered = conv.members.map((id) => this.store.bots.get(id)!).sort((x, y) => y.handle.length - x.handle.length);
@@ -1738,7 +1752,10 @@ export class Harness {
   scrubSecrets(text: string): string {
     let out = this.providerKeys.scrub(this.vault.scrub(text));
     // Keys from environment variables aren't in a vault; longest first, so one can't hide part of another.
-    for (const [name, v] of [...this.envKeys].sort((a, b) => b[1].length - a[1].length)) {
+    // The Cursor key too: a bot on another provider must not hand it to that provider.
+    const env = [...this.envKeys];
+    if (process.env.CURSOR_API_KEY) env.push(["CURSOR_API_KEY", process.env.CURSOR_API_KEY]);
+    for (const [name, v] of env.sort((a, b) => b[1].length - a[1].length)) {
       if (v.length >= 4) out = out.split(v).join(`[secret:${name}]`);
     }
     return out;
@@ -1969,6 +1986,23 @@ export class Harness {
 }
 
 /** Drop undefined fields so a preset's values aren't overwritten by missing ones. */
+/** `run(signal)` with a deadline: when it passes, the signal aborts (so the runtime lets go of its request and capacity) and this rejects. */
+async function withDeadline<T>(ms: number, message: string, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const ctrl = new AbortController();
+  let timer: NodeJS.Timeout | undefined;
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      ctrl.abort();
+      reject(new Error(message));
+    }, ms);
+  });
+  try {
+    return await Promise.race([run(ctrl.signal), late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function stripUndefined<T extends Record<string, unknown>>(o: T): Partial<T> {
   return Object.fromEntries(Object.entries(o ?? {}).filter(([, v]) => v !== undefined)) as Partial<T>;
 }

@@ -312,6 +312,8 @@ export interface ProviderModel {
 export interface ProviderConfig {
   /** Slug; also the runtime id bots refer to (e.g. "featherless"). */
   id: string;
+  /** The preset it was made from (its setup notes and key link are shown in the editor). */
+  preset?: string;
   label: string;
   /** e.g. "https://api.featherless.ai/v1" (http is fine for a local server). */
   baseUrl: string;

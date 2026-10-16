@@ -443,7 +443,8 @@ const TOOLS: ToolSpec[] = [
     required: ["name", "job"],
     run(args, { h, state }) {
       try {
-        const bot = h.createBot({ name: str(args.name), label: str(args.label) || undefined, about: str(args.job), createdBy: state.bot.id });
+        // A helper runs on its creator's brain (with that brain's default model).
+        const bot = h.createBot({ name: str(args.name), label: str(args.label) || undefined, about: str(args.job), runtime: state.bot.runtime || undefined, createdBy: state.bot.id });
         let extra = "";
         if (str(args.first_task).trim()) {
           h.handoff(state, bot, str(args.first_task).trim(), [], true);
