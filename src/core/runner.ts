@@ -398,7 +398,7 @@ export class BotRunner {
       const tools = buildTools(h, bot.id, () => this.current);
       if (!provides.workspaceTools) tools.push(...buildWorkspaceTools(h, bot.id, () => this.current));
       // Connectors can take a while to start (an npx download, a host that's down): a stop doesn't wait for them.
-      if (!provides.mcp) tools.push(...(await untilStopped(state, this.mcpHub().tools(h.mcpServersFor(bot)), [])));
+      if (!provides.mcp) tools.push(...(await untilStopped(state, this.mcpHub().tools(h.mcpServersFor(bot), state.stop?.signal), [])));
 
       if (state.cancelled) {
         // Stopped before anything reached the brain: send nothing.
