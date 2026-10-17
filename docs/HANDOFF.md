@@ -4,9 +4,9 @@ The lead (Claude) maintains this file. Contributors change only the **Status** l
 
 ## Current state
 
-Last updated by the lead on 2026-10-17, at integration-branch commit `738250c` plus this documentation.
+Last updated by the lead on 2026-10-17 at integration-branch commit `53ee7a9`. Session notes: `docs/worklog/2026-10-17-claude-runtime-backlog.md`.
 
-- **Integration branch:** `claude/tender-cori-t1ksnz` (also the default branch). `npm run typecheck && npm test` is clean, with 163 tests.
+- **Integration branch:** `claude/tender-cori-t1ksnz` (also the default branch). `npm run typecheck && npm test` is clean, with 170 tests.
 - **What the product is.** A self-hosted, Grok-Bot-style team of persistent AI bots:
   - each bot has its own chat, memory, skills, routines and approvals;
   - bots message each other and work in groups;
@@ -15,7 +15,8 @@ Last updated by the lead on 2026-10-17, at integration-branch commit `738250c` p
   See `README.md` and `docs/ARCHITECTURE.md`.
 - **What was built most recently: provider brains.** Bots can run on any OpenAI-compatible chat API instead of the Cursor SDK. The first target is Featherless AI; OpenRouter, xAI, OpenAI, Groq, Together, DeepInfra, Ollama, LM Studio and custom URLs are presets too. The owner has a Featherless key and wants to run open models such as Qwen3 on it, then add other providers.
 - **Never run against a real service.** Neither the Cursor runtime nor the provider runtime has been run against a real service; all testing used local fakes (see B6 and B7).
-- **Review status.** An adversarial review of provider brains found 32 confirmed defects; 27 are fixed with regression tests. The open ones are B1–B5.
+- **Review status.** An adversarial review of provider brains found 32 confirmed defects. All are fixed, each with a regression test (the last five were B1–B5).
+- **Next up.** B6 and B7 need the owner. B8 is a list of small gaps, each with the lead's decision.
 
 ### Map of the provider-brain code
 
@@ -94,7 +95,7 @@ Status values:
 
 ### B5. Token-ratio learning undoes what an overflow taught
 
-- **Status:** Done (lead; the commit "Token estimates keep what an overflow measured")
+- **Status:** Done @ 53ee7a9 (lead)
 - **Where:** `OpenAICompatRuntime.learn()` and `learnOverflow()`; `estimateRequest()` and `estimateStored()` in `src/runtimes/openai.ts`.
 - **Problem:** `learn()` caps the ratio at 2.5 and averages it. For dense scripts such as CJK, the estimate drifts back to about 30% low, and the conversation hits a context error every time it nears the window.
 - **Suggested fix:** use the same upper clamp as `learnOverflow` (4) and keep a floor from the last overflow (`q.overflowRatio`). Optionally count non-ASCII characters at about 1 token each.
