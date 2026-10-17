@@ -1528,13 +1528,17 @@ export class OpenAICompatRuntime implements AgentRuntime {
     return new OaiSession(this, id, new Transcript(this.transcriptFile(id)), spec.model);
   }
 
-  async complete(prompt: string, opts?: { model?: ModelChoice }): Promise<string> {
+  async complete(prompt: string, opts?: { model?: ModelChoice; signal?: AbortSignal }): Promise<string> {
     const p = this.opts.provider();
     const avail = this.available();
     if (!avail.ok) throw new Error(avail.reason);
     const modelId = opts?.model?.id || p.routerModel || p.defaultModel || p.models[0]?.id;
     if (!modelId) throw new Error(`${p.label} has no model to answer with.`);
     const ctrl = new AbortController();
+    // The caller giving up (group routing's deadline) frees the request and its capacity at once.
+    const onCallerAbort = () => ctrl.abort();
+    if (opts?.signal?.aborted) ctrl.abort();
+    else opts?.signal?.addEventListener("abort", onCallerAbort, { once: true });
     this.oneShots.add(ctrl);
     let timedOut = false;
     const timer = setTimeout(() => {
@@ -1555,6 +1559,7 @@ export class OpenAICompatRuntime implements AgentRuntime {
       throw err;
     } finally {
       clearTimeout(timer);
+      opts?.signal?.removeEventListener("abort", onCallerAbort);
       this.oneShots.delete(ctrl);
     }
   }

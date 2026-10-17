@@ -1366,6 +1366,41 @@ test("one semaphore per provider: two sessions never exceed maxConcurrency; comp
   }
 });
 
+test("complete(): a caller that gives up frees the request and its capacity at once", async () => {
+  const t = setup({ provider: { maxConcurrency: 1 } });
+  try {
+    // A slow router reply: held open until the test ends.
+    const g = gate();
+    server.push(async (r, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      await g.p;
+      res.end("{}");
+    });
+    const stop = new AbortController();
+    const routing = t.rt.complete("route this", { signal: stop.signal });
+    routing.catch(() => {});
+    await until(() => server.inFlight === 1);
+    const t0 = Date.now();
+    stop.abort();
+    await assert.rejects(routing, /cancelled/);
+    assert.ok(Date.now() - t0 < 500);
+    // The capacity is free again: a turn runs without waiting for the abandoned call.
+    server.push((r, res) => sse(res, textReply("next")));
+    const next = await turn(await t.open(), "hello");
+    assert.equal(next.outcome.text, "next");
+    assert.ok(!statuses(next.events).some((s) => /Waiting for/.test(s)));
+    g.open();
+    // Already aborted: nothing is sent.
+    const before = server.chats().length;
+    const dead = new AbortController();
+    dead.abort();
+    await assert.rejects(t.rt.complete("x", { signal: dead.signal }), /cancelled/);
+    assert.equal(server.chats().length, before);
+  } finally {
+    await t.cleanup();
+  }
+});
+
 test("UnitSemaphore: FIFO by units, cost clamped to capacity, aborted waiters leave the queue", async () => {
   const sem = new UnitSemaphore(() => 2);
   const r1 = await sem.acquire(1);
