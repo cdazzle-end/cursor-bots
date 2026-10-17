@@ -1737,6 +1737,8 @@ test("fetchModels() reads any list shape and normalizes the fields; lookupModel(
     );
     assert.equal(server.requests[0]!.path, "/v1/models");
     assert.equal(server.requests[0]!.headers.authorization, `Bearer ${KEY}`);
+    // Featherless answers Node's default "node" user agent with a 404.
+    assert.match(String(server.requests[0]!.headers["user-agent"]), /^cursor-bots\//);
     assert.equal(server.requests[3]!.path, "/v1/models", "no q= for providers other than Featherless");
 
     server.push(
@@ -1928,6 +1930,22 @@ test("tool calls written in text: Hermes, Qwen3-Coder XML, LM Studio, bare JSON;
   assert.equal(extractToolCalls('{"name": "Ann", "age": 3}', known, false).calls.length, 0);
   // Prompt mode: an unknown name still becomes a call (the model is told it doesn't exist).
   assert.equal(extractToolCalls('<tool_call>{"name": "rm_rf", "arguments": {}}</tool_call>', known, true).calls[0]!.name, "rm_rf");
+});
+
+test("an HTML page instead of an API answer is described by its title, not its markup", async () => {
+  const t = setup();
+  try {
+    server.push((r, res) => {
+      res.writeHead(403, { "content-type": "text/html" });
+      res.end('<!DOCTYPE html>\n<!--[if lt IE 7]> <html class="no-js ie6 oldie" lang="en-US"> <![endif]-->\n<head><title>Attention Required! | Cloudflare</title></head><body>blocked</body></html>');
+    });
+    const { outcome } = await turn(await t.open(), "hi");
+    assert.equal(outcome.status, "error");
+    assert.match(outcome.error ?? "", /web page titled "Attention Required! \| Cloudflare"/);
+    assert.doesNotMatch(outcome.error ?? "", /<!DOCTYPE|<html/i);
+  } finally {
+    await t.cleanup();
+  }
 });
 
 test("error classification follows the provider research", () => {

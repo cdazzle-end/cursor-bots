@@ -67,6 +67,7 @@ const DEFAULT_CONTEXT_WINDOW = 32_768;
 const DEFAULT_MAX_OUTPUT = 8192;
 const MIN_REPLY_TOKENS = 256;
 const CHARS_PER_TOKEN = 3.5;
+const USER_AGENT = "cursor-bots/0.1 (+https://github.com/cdazzle-end/cursor-bots)";
 const MESSAGE_OVERHEAD_TOKENS = 4;
 const IMAGE_TOKENS = 1000;
 const TOOL_RESULT_MAX_CHARS = 20_000;
@@ -1009,6 +1010,13 @@ function imagePart(img: Image): WirePart {
   return { type: "image_url", image_url: { url: `data:${img.mimeType};base64,${img.data}` } };
 }
 
+/** A web page instead of an API answer (a CDN or firewall in front of the API): its title, not its markup. */
+function htmlNote(text: string): string {
+  if (!/^\s*(<!doctype html|<html|<!--)/i.test(text)) return text;
+  const title = /<title[^>]*>([^<]{1,200})<\/title>/i.exec(text)?.[1]?.replace(/\s+/g, " ").trim();
+  return `the server sent a web page${title ? ` titled "${title}"` : ""} instead of an API answer (often a firewall or CDN block in front of the API)`;
+}
+
 function plural(n: number, one: string, many = `${one}s`): string {
   return `${n} ${n === 1 ? one : many}`;
 }
@@ -1822,6 +1830,8 @@ export class OpenAICompatRuntime implements AgentRuntime {
     const h = new Headers();
     if (json) h.set("content-type", "application/json");
     h.set("accept", "application/json");
+    // Node's default "node" user agent gets a 404 from some APIs (Featherless's model list); a provider's own headers can override this.
+    h.set("user-agent", USER_AGENT);
     if (this.opts.appUrl) h.set("HTTP-Referer", this.opts.appUrl);
     if (this.opts.appName) h.set("X-Title", this.opts.appName);
     for (const [k, v] of Object.entries(p.headers ?? {})) {
@@ -2046,7 +2056,7 @@ export class OpenAICompatRuntime implements AgentRuntime {
       // Not JSON: the text is the message.
     }
     if (Array.isArray(json)) json = json[0];
-    const e = json && typeof json === "object" ? (json.error ?? json) : text;
+    const e = json && typeof json === "object" ? (json.error ?? json) : htmlNote(text);
     const pe = this.bodyError(e || `HTTP ${status}`, status, modelId, candidates);
     pe.retryAfterMs = retryAfterMs(headers);
     return pe;

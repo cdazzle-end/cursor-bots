@@ -174,4 +174,5 @@ npm run dev        # restart on change
 npm test           # full suite on the demo brain
 npm run typecheck  # against the real @cursor/sdk types
 npm run live       # live check of providers whose keys are set (FEATHERLESS_API_KEY, PHALA_API_KEY, ROUTEWAY_API_KEY); real calls, small cost
+                   # (add -- --proxy-auth where a proxy adds the keys, e.g. network secrets in a cloud session)
 ```

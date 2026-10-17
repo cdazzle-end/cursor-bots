@@ -18,7 +18,7 @@
     "typecheck": "tsc -p tsconfig.json",
     "test": "node --test --test-concurrency=1 \"test/**/*.test.ts\"",
     "check": "npm run typecheck && npm test",
-    "live": "node scripts/live-providers.ts"
+    "live": "NODE_USE_ENV_PROXY=1 node scripts/live-providers.ts"
   },
   "dependencies": {
     "@cursor/sdk": "^1.0.37",

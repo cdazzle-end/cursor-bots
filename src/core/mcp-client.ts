@@ -1296,6 +1296,8 @@ async function fetchSameOrigin(url: URL, init: RequestInit, origin: string): Pro
 
 function buildHeaders(user: Record<string, string>, own: Record<string, string>): Headers {
   const h = new Headers();
+  // Node's default "node" user agent is turned away by some servers behind a CDN; a connector's own headers can replace this.
+  h.set("user-agent", `cursor-bots/${CLIENT_VERSION}`);
   for (const [k, v] of Object.entries(user)) {
     try {
       h.set(k, String(v));

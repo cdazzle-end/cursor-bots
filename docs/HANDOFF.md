@@ -111,7 +111,7 @@ Status values:
   - Phala and Routeway have no default model: set `LIVE_MODEL_PHALA` / `LIVE_MODEL_ROUTEWAY` to a model id from their catalogue. Otherwise the script picks a free model that can call tools, if the catalogue has one.
 - **Where to run it:**
   - **Simplest:** on the owner's own computer, with the keys exported in that terminal.
-  - **In a Claude Code cloud session:** the keys go in that environment's settings (the cloud environment menu in the session title bar → Edit), and only a new session sees them.
+  - **In a Claude Code cloud session:** the keys go in that environment's settings (the cloud environment menu in the session title bar → Edit), and only a new session sees them. Keys saved as **network secrets** never appear as environment variables: the session's proxy adds them to requests for their host. Run `npm run live -- --proxy-auth` there (the owner's keys are set up this way since 2026-10-17; the `LIVE_MODEL_*` variables are ordinary environment variables).
   - **Codex's environment:** the lead has no evidence of how it is configured.
 - **By hand,** for Featherless, on a scratch home (`node src/cli.ts start --home /tmp/cb-live --runtime mock`). Report each in a worklog, without the key:
   1. Add the Featherless preset; **Save and test** answers.

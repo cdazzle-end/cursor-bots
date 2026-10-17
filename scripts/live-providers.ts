@@ -6,6 +6,13 @@
  *   FEATHERLESS_API_KEY=… PHALA_API_KEY=… ROUTEWAY_API_KEY=… npm run live
  *   npm run live -- featherless            # only some providers
  *   LIVE_MODEL_ROUTEWAY=<model id> npm run live -- routeway
+ *   npm run live -- --proxy-auth           # keys stored as network secrets: the session's proxy adds them
+ *
+ * With --proxy-auth, a provider whose key variable isn't set sends no Authorization header, and
+ * the environment's outbound proxy adds the real key for that host (Claude Code cloud sessions do
+ * this for keys saved as network secrets, and only when the request carries no key of its own).
+ * Neither this script nor the app sees the key. `npm run live` sets NODE_USE_ENV_PROXY=1, because
+ * Node's fetch ignores HTTPS_PROXY otherwise (and then the proxy never sees the request).
  *
  * For each provider whose key is set:
  *   1. the model catalogue loads;
@@ -26,6 +33,8 @@ import { MockRuntime } from "../src/runtimes/mock.ts";
 import { OpenAICompatRuntime } from "../src/runtimes/openai.ts";
 
 const DEFAULT_TARGETS = ["featherless", "phala", "routeway"];
+const args = process.argv.slice(2);
+const proxyAuth = args.includes("--proxy-auth");
 const TURN_TIMEOUT_MS = 10 * 60_000; // a cold Featherless model can take minutes to load
 
 type Result = { provider: string; step: string; ok: boolean | "skipped"; detail: string };
@@ -44,12 +53,24 @@ async function idle(h: Harness, botId: string, timeoutMs: number): Promise<void>
 }
 
 async function main(): Promise<number> {
-  const targets = process.argv.slice(2).length ? process.argv.slice(2) : DEFAULT_TARGETS;
+  const named = args.filter((a) => !a.startsWith("--"));
+  const targets = named.length ? named : DEFAULT_TARGETS;
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "cursor-bots-live-"));
   const h = new Harness({
     home,
     runtimes: [new MockRuntime({ chunkDelayMs: 0 })],
-    providerRuntime: (deps) => new OpenAICompatRuntime({ ...deps, appName: "Cursor Bots", appUrl: "https://github.com/cdazzle-end/cursor-bots" }),
+    providerRuntime: (deps) => {
+      const rt = new OpenAICompatRuntime({ ...deps, appName: "Cursor Bots", appUrl: "https://github.com/cdazzle-end/cursor-bots" });
+      if (proxyAuth) {
+        // No key here is expected: the proxy adds it. Everything else available() checks still counts.
+        const available = rt.available.bind(rt);
+        rt.available = () => {
+          const a = available();
+          return !a.ok && /needs an API key/.test(a.reason ?? "") ? { ok: true } : a;
+        };
+      }
+      return rt;
+    },
   });
   h.store.settings.runtime = "mock";
   h.store.settings.groupRouting = "heuristic";
@@ -69,8 +90,9 @@ async function main(): Promise<number> {
         say({ provider: key, step: "setup", ok: false, detail: `no preset "${key}" (known: ${PROVIDER_PRESETS.map((p) => p.key).join(", ")})` });
         continue;
       }
-      if (preset.needsKey && (!preset.keyEnv || !process.env[preset.keyEnv])) {
-        say({ provider: key, step: "setup", ok: "skipped", detail: `${preset.keyEnv ?? "its key variable"} is not set in this environment` });
+      const fromEnv = !!(preset.keyEnv && process.env[preset.keyEnv]);
+      if (preset.needsKey && !fromEnv && !proxyAuth) {
+        say({ provider: key, step: "setup", ok: "skipped", detail: `${preset.keyEnv ?? "its key variable"} is not set in this environment (keys saved as network secrets: add --proxy-auth)` });
         continue;
       }
       const p = h.createProvider({ preset: key });
@@ -97,8 +119,10 @@ async function main(): Promise<number> {
 
       // 2. One test prompt.
       const t = await h.testProvider(p.id);
-      say({ provider: key, step: "prompt", ok: t.ok, detail: t.ok ? `answered "${t.reply}" in ${(t.ms / 1000).toFixed(1)} s` : t.error ?? "failed" });
-      if (!t.ok) continue;
+      // A one-shot prompt gives a cold model 20 s; a bot turn waits for it to load, so go on to that.
+      const cold = !t.ok && /still loading/i.test(t.error ?? "");
+      say({ provider: key, step: "prompt", ok: t.ok || (cold ? "skipped" : false), detail: t.ok ? `answered "${t.reply}" in ${(t.ms / 1000).toFixed(1)} s` : t.error ?? "failed" });
+      if (!t.ok && !cold) continue;
 
       // 3. A real turn with a tool call.
       const bot = h.createBot({ name: `Live ${key}`, runtime: p.id });

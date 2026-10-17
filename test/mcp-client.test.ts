@@ -497,7 +497,7 @@ test("tools(): a stopped turn gets no tools at once; slow starts finish in the b
  * Also: /deny (401, `pad` characters before it quotes the token), /away?to= (307 there), /moved (308 to /mcp).
  */
 async function fakeHttp() {
-  const seen = { auth: [] as string[], accept: [] as string[], versions: [] as string[], notes: [] as string[], deletes: 0, sessions: 0, hits: 0, lists: 0, drops: 0, open: 0 };
+  const seen = { auth: [] as string[], accept: [] as string[], agents: [] as string[], versions: [] as string[], notes: [] as string[], deletes: 0, sessions: 0, hits: 0, lists: 0, drops: 0, open: 0 };
   let session = "";
   let grown = false;
   const server = http.createServer(async (req, res) => {
@@ -521,6 +521,7 @@ async function fakeHttp() {
     if (req.method !== "POST") return void res.writeHead(405).end();
     seen.auth.push(String(req.headers.authorization));
     seen.accept.push(String(req.headers.accept));
+    seen.agents.push(String(req.headers["user-agent"]));
     const msg = JSON.parse(body);
     const reply = (result: unknown) => JSON.stringify({ jsonrpc: "2.0", id: msg.id, result });
     if (msg.method === "initialize") {
@@ -601,6 +602,8 @@ test("Streamable HTTP: JSON and SSE answers, session id, headers, session expiry
     assert.equal((await byName(tools, "remote__sse_echo").execute({ text: "b" })).text, "sse: b");
     assert.ok(srv.seen.auth.every((a) => a === "Bearer http-token-123"));
     assert.ok(srv.seen.accept.every((a) => a.includes("application/json") && a.includes("text/event-stream")));
+    // Not Node's default "node", which some servers behind a CDN turn away.
+    assert.ok(srv.seen.agents.every((a) => /^cursor-bots\//.test(a)), srv.seen.agents[0]);
     assert.deepEqual(srv.seen.notes, ["notifications/initialized"]);
     // The version the server answered with is sent on every later request.
     assert.ok(srv.seen.versions.length >= 3 && srv.seen.versions.every((v) => v === "2025-03-26"));
