@@ -2755,6 +2755,9 @@ class OaiRun implements RuntimeRun {
         // Cut only before a user message, so no tool call is separated from its results.
         if (msgs[i]!.role === "user") cut = i;
       }
+      // The turn that just finished stays verbatim, however long its tool results were (the next turn may refer to it).
+      const start = this.turnUser ? msgs.indexOf(this.turnUser) : -1;
+      if (start >= 0) cut = Math.min(cut, start);
     } else {
       cut = this.turnUser ? msgs.indexOf(this.turnUser) : -1;
       if (cut < 0) cut = msgs.findLastIndex((m) => m.role === "user");
@@ -2768,6 +2771,8 @@ class OaiRun implements RuntimeRun {
       summary = await this.summarize(head);
     } catch (err) {
       if (this.ctrl.signal.aborted || isAbortError(err)) throw abortError();
+      // At the end of a turn nothing needed the room yet: keep everything and try again later.
+      if (reason === "end") return false;
     }
     const kept = msgs.slice(cut);
     let note = summary ?? "(The earlier conversation was dropped to fit the model's context window; no summary could be made.)";

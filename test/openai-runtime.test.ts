@@ -1167,7 +1167,32 @@ test("end of turn over ~60% of the window: older history is summarized and a sum
   }
 });
 
-test("if the summary can't be made, the oldest messages are dropped instead", async () => {
+test("end of turn: the turn that just finished stays verbatim, however long its tool results", async () => {
+  const t = setup({ provider: { models: [{ id: "test-model", contextWindow: 6000 }] } });
+  try {
+    const session = await t.open();
+    server.push((r, res) => sse(res, textReply("ok")));
+    await turn(session, "A".repeat(3000));
+    const read = makeTool("read_file", () => "R".repeat(10000));
+    server.push(
+      (r, res) => sse(res, toolCallReply([{ id: "c1", name: "read_file", args: '{"path":"big.txt"}' }])),
+      (r, res) => sse(res, textReply("here is the patch")),
+      (r, res) => json(res, 200, completion("Earlier the user sent a block of A.")),
+    );
+    const second = await turn(session, "read big.txt and patch it", { tools: [read] });
+    assert.equal(second.outcome.text, "here is the patch");
+    const lines = t.lines(session.agentId);
+    const text = JSON.stringify(lines);
+    assert.ok(second.events.some((e) => e.type === "summary"), "the transcript was compacted");
+    assert.ok(text.includes("read big.txt and patch it") && text.includes("here is the patch") && text.includes("RRRR"), "this turn is kept verbatim");
+    assert.ok(!text.includes("AAAA"), "older turns are summarized");
+    assertValid(lines);
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test("if the summary can't be made: history stays at the end of a turn; only a request that doesn't fit drops the oldest", async () => {
   const t = setup({ provider: { models: [{ id: "test-model", contextWindow: 4000 }] } });
   try {
     const session = await t.open();
@@ -1181,7 +1206,16 @@ test("if the summary can't be made, the oldest messages are dropped instead", as
     );
     const third = await turn(session, "C".repeat(3000));
     assert.equal(third.outcome.status, "finished");
-    assert.ok(third.events.some((e) => e.type === "summary"));
+    // Nothing needed the room yet, so nothing is lost.
+    assert.ok(!third.events.some((e) => e.type === "summary"));
+    assert.ok(JSON.stringify(t.lines(session.agentId)).includes("AAAA"));
+
+    // The next request doesn't fit: now the oldest messages go.
+    const fail = (r: any, res: any) => json(res, 400, { error: { message: "bad things" } });
+    server.push(fail, (r, res) => sse(res, textReply("ok")), fail, fail);
+    const fourth = await turn(session, "D".repeat(3000));
+    assert.equal(fourth.outcome.status, "finished");
+    assert.ok(fourth.events.some((e) => e.type === "summary"));
     const lines = t.lines(session.agentId);
     assert.match(lines[0].content, /dropped to fit the model's context window/);
     assert.ok(!JSON.stringify(lines).includes("AAAA"));
