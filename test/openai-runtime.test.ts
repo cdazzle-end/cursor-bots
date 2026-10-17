@@ -1321,6 +1321,28 @@ test("the reply limit leaves room for estimate errors, and an overflow always ma
   }
 });
 
+test("a small window filled by instructions and tools doesn't compact every turn, and says so once", async () => {
+  const t = setup({ provider: { models: [{ id: "test-model", contextWindow: 8192 }] } });
+  try {
+    // About as much as the harness's own manual and tool schemas.
+    const tools = Array.from({ length: 30 }, (_, i) => ({ ...makeTool(`tool_${i}`), description: `Tool ${i}. ${"Explains what it does at length. ".repeat(18)}` }));
+    const session = await t.open();
+    const all: RuntimeEvent[] = [];
+    for (const text of ["one", "two", "three"]) {
+      server.push((r, res) => sse(res, textReply(`re ${text}`)));
+      const r = await turn(session, text, { tools, system: "S" });
+      assert.equal(r.outcome.text, `re ${text}`);
+      all.push(...r.events);
+    }
+    assert.ok(server.chats().every((c) => c.body.stream), "no summary calls");
+    assert.equal(all.filter((e) => e.type === "summary").length, 0);
+    assert.equal(statuses(all).filter((s) => /barely fits this bot's instructions and tools/.test(s)).length, 1);
+    assert.ok(server.chats().every((c) => (c.body.max_tokens as number) >= 256));
+  } finally {
+    await t.cleanup();
+  }
+});
+
 test("if the summary can't be made: history stays at the end of a turn; only a request that doesn't fit drops the oldest", async () => {
   const t = setup({ provider: { models: [{ id: "test-model", contextWindow: 4000 }] } });
   try {

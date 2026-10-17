@@ -56,7 +56,7 @@ Status values:
 
 ### B2. The reply limit fills the rest of the window
 
-- **Status:** Done (lead; the commit "Leave the reply room for estimate errors")
+- **Status:** Done @ d0ba669 (lead)
 - **Where:** `replyLimit()` and `learnOverflow()` in `src/runtimes/openai.ts`.
 - **Problem:**
   - max_tokens is `min(outputCap, window - estimate - 3%)`. With a large `maxOutputTokens` (Featherless lists some models with max_completion_tokens equal to their context), an estimate that is more than 3% low overflows. chars/3.5 undercounts code and JSON by about 15%.
@@ -69,7 +69,7 @@ Status values:
 
 ### B3. Small context windows compact on every turn
 
-- **Status:** Open
+- **Status:** Done (lead; the commit "Small windows take shorter replies instead of compacting every turn")
 - **Where:** `OaiRun.fitBudget()` and `promptBudget()` in `src/runtimes/openai.ts`.
 - **Problem:**
   - On 8k windows (the Ollama and LM Studio preset default), the fixed system prompt plus about 29 tool schemas (about 23k characters) already exceed the prompt budget. So every turn runs `compact("budget")`, doubling the requests, and the runner resends identity every turn.

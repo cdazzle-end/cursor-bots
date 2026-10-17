@@ -1691,11 +1691,19 @@ export class OpenAICompatRuntime implements AgentRuntime {
   /** @internal The reply limit for a prompt of this size: never more than fits, never less than 256. */
   replyLimit(id: string, promptTokens: number, choice?: ModelChoice): number {
     const w = this.windowFor(id);
-    // chars/3.5 undercounts code and JSON: keep a wider margin until a reply has calibrated the estimate.
-    const margin = Math.max(256, Math.ceil(w * (this.quirk(id).ratio === undefined ? 0.1 : 0.03)));
     // Never the whole rest of the window (some catalogues list a model's reply limit as its full context).
     const cap = Math.min(this.outputCap(id, choice), Math.floor(w * 0.5));
-    return Math.max(MIN_REPLY_TOKENS, Math.min(cap, w - promptTokens - margin));
+    return Math.max(MIN_REPLY_TOKENS, Math.min(cap, w - promptTokens - this.replyMargin(id)));
+  }
+
+  /** @internal Room left for estimate errors. chars/3.5 undercounts code and JSON: wider until a reply has calibrated it. */
+  replyMargin(id: string): number {
+    return Math.max(256, Math.ceil(this.windowFor(id) * (this.quirk(id).ratio === undefined ? 0.1 : 0.03)));
+  }
+
+  /** @internal The largest prompt that still leaves the smallest reply (what a small window can take without compacting). */
+  hardPromptLimit(id: string): number {
+    return this.windowFor(id) - MIN_REPLY_TOKENS - this.replyMargin(id);
   }
 
   /** @internal Largest prompt that leaves the reply its reserve inside ~90% of the window. */
@@ -2237,6 +2245,8 @@ class OaiSession implements RuntimeSession {
   private closed = false;
   /** End-of-turn compaction still running after its turn was answered. */
   compaction?: Promise<void>;
+  /** The "context window too small for the tools" status was shown. */
+  warnedSmallWindow = false;
 
   constructor(rt: OpenAICompatRuntime, agentId: string, transcript: Transcript, model?: ModelChoice) {
     this.rt = rt;
@@ -2756,6 +2766,9 @@ class OaiRun implements RuntimeRun {
     const budget = this.rt.promptBudget(this.modelId, this.choice);
     const over = () => this.estimateFor(mode) > budget;
     if (!over()) return;
+    // A small window whose instructions and tool schemas take most of the budget would compact on every
+    // turn: while the request still fits, take a shorter reply instead (replyLimit shrinks it).
+    if (this.smallWindow(mode) && this.estimateFor(mode) <= this.rt.hardPromptLimit(this.modelId)) return;
     if (this.shorten("before-turn", 1500) && !over()) return;
     await this.compact("budget");
     if (!over()) return;
@@ -2767,13 +2780,33 @@ class OaiRun implements RuntimeRun {
   private endOfTurnBudget(): { need: boolean; keep: number } {
     const mode = this.rt.toolModeFor(this.modelId, this.input.tools.length > 0);
     const window = this.rt.windowFor(this.modelId);
-    const fixed = this.rt.scaled(this.modelId, estimateRequest(this.systemText(mode), [], this.toolSpecs(mode)));
+    const fixed = this.fixedTokens(mode);
     const used = this.rt.scaled(
       this.modelId,
       this.s.transcript.messages.reduce((n, m) => n + estimateStored(m), 0),
     );
-    const budget = Math.max(window * END_OF_TURN_COMPACT_AT - fixed, window * 0.15);
+    // In a small window, compact only when the next request wouldn't fit at all (see fitBudget).
+    const budget = this.smallWindow(mode) ? Math.max(this.rt.hardPromptLimit(this.modelId) - fixed, 0) : Math.max(window * END_OF_TURN_COMPACT_AT - fixed, window * 0.15);
     return { need: used > budget, keep: budget * 0.4 };
+  }
+
+  /** Tokens the instructions and tool schemas take before any conversation. */
+  private fixedTokens(mode: WireMode): number {
+    return this.rt.scaled(this.modelId, estimateRequest(this.systemText(mode), [], this.toolSpecs(mode)));
+  }
+
+  /** The instructions and tool schemas leave less than 15% of the window for the conversation. Says so once per session. */
+  private smallWindow(mode: WireMode): boolean {
+    const window = this.rt.windowFor(this.modelId);
+    const fixed = this.fixedTokens(mode);
+    const small = this.rt.promptBudget(this.modelId, this.choice) - fixed < window * 0.15;
+    if (small && !this.s.warnedSmallWindow) {
+      this.s.warnedSmallWindow = true;
+      this.status(
+        `${this.modelId}'s context window (${window} tokens) barely fits this bot's instructions and tools (about ${fixed} tokens), so little of the conversation fits. Raise the model's context size (in Ollama, num_ctx) or pick a model with a larger window.`,
+      );
+    }
+    return small;
   }
 
   /** Shorten long tool results: before this turn, or within it (all but the newest round unless `newest`). */
