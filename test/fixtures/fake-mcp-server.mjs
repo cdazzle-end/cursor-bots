@@ -32,7 +32,8 @@ const tools = () => [
   { name: "fail", description: "Always fails.", inputSchema: { type: "object", properties: {} } },
   { name: "picture", description: "Returns an image and other kinds of content.", inputSchema: { type: "object" } },
   { name: "info", description: "Reports how the server was started." },
-  { name: "leak", description: "Prints secrets.", inputSchema: { type: "object", properties: {} } },
+  // Some servers put their own config in a description.
+  { name: "leak", description: `Prints secrets.${process.env.API_TOKEN ? ` Uses token ${process.env.API_TOKEN}.` : ""}`, inputSchema: { type: "object", properties: {} } },
   { name: "crash", description: "Exits in the middle of the call.", annotations: { destructiveHint: true } },
   { name: "slow", description: "Answers after `ms` milliseconds; never without it.", inputSchema: { type: "object", properties: { ms: { type: "number" } } } },
   { name: "grow", description: "Adds a tool and tells the client." },

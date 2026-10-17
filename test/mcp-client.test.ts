@@ -291,6 +291,8 @@ test("output goes through scrub, and the connector's own credentials are redacte
     const tools = await hub.tools({ fake: stdio({ API_TOKEN: "hdr-secret-123" }) });
     const out = await byName(tools, "fake__leak").execute({});
     assert.equal(out.text, "the key is [secret:KEY] and the header is [redacted]");
+    // A description the server built from its own config is cleaned too: it goes to the model with every request.
+    assert.equal(byName(tools, "fake__leak").description, "[fake] Prints secrets. Uses token [redacted].");
   } finally {
     await cleanup();
   }

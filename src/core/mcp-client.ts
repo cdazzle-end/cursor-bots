@@ -279,7 +279,7 @@ export class McpHub {
     const ann = def.annotations && typeof def.annotations === "object" ? def.annotations : {};
     return {
       name,
-      description: toolDescription(server, def),
+      description: toolDescription(server, def, (t) => this.clean(t, e.secrets)),
       inputSchema: toolInputSchema(def.inputSchema),
       readOnly: typeof ann.readOnlyHint === "boolean" ? ann.readOnlyHint : undefined,
       destructive: typeof ann.destructiveHint === "boolean" ? ann.destructiveHint : undefined,
@@ -345,9 +345,10 @@ export function toolInputSchema(schema: unknown): Record<string, unknown> {
   return out;
 }
 
-function toolDescription(server: string, def: McpToolDef): string {
+/** The model-facing description; `clean` removes secrets before it is cut (a server can echo its own config). */
+function toolDescription(server: string, def: McpToolDef, clean: (text: string) => string = (t) => t): string {
   const text = (typeof def.description === "string" && def.description.trim()) || (typeof def.title === "string" && def.title.trim()) || def.name;
-  return truncate(`[${server}] ${text}`, MAX_DESCRIPTION);
+  return truncate(clean(`[${server}] ${text}`), MAX_DESCRIPTION);
 }
 
 /** Turn a tools/call result into what the model gets; `clean` removes secrets from its text. */
