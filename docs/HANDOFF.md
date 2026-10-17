@@ -6,7 +6,7 @@ The lead (Claude) maintains this file. Contributors change only the **Status** l
 
 Last updated by the lead on 2026-10-17. Session notes are the newest files in `docs/worklog/`.
 
-- **Integration branch:** `claude/tender-cori-t1ksnz` (also the default branch). `npm run typecheck && npm test` is clean, with 181 tests.
+- **Integration branch:** `claude/tender-cori-t1ksnz` (also the default branch). `npm run typecheck && npm test` is clean, with 182 tests.
 - **What the product is.** A self-hosted, Grok-Bot-style team of persistent AI bots:
   - each bot has its own chat, memory, skills, routines and approvals;
   - bots message each other and work in groups;
@@ -16,7 +16,7 @@ Last updated by the lead on 2026-10-17. Session notes are the newest files in `d
 - **What was built most recently: provider brains.** Bots can run on any OpenAI-compatible chat API instead of the Cursor SDK. The first target is Featherless AI; OpenRouter, xAI, OpenAI, Groq, Together, DeepInfra, Ollama, LM Studio and custom URLs are presets too. The owner has a Featherless key and wants to run open models such as Qwen3 on it, then add other providers.
 - **Never run against a real service.** Neither the Cursor runtime nor the provider runtime has been run against a real service; all testing used local fakes (see B6 and B7).
 - **Review status.** An adversarial review of provider brains found 32 confirmed defects. All are fixed, each with a regression test (the last five were B1–B5).
-- **Next up.** B6, the live check of Featherless, Phala and Routeway with `npm run live`, needs the owner's keys. B7 (Cursor) needs a Cursor key. Nothing else is open. Ask the lead (or the owner) for the next feature rather than inventing one.
+- **Next up.** B6: Phala and Routeway pass the live check, and Featherless's bot turn is still to run (live tests are paused by the owner). B7 (Cursor) needs a Cursor key. Nothing else is open. Ask the lead (or the owner) for the next feature rather than inventing one.
 
 ### Map of the provider-brain code
 
@@ -101,9 +101,18 @@ Status values:
 - **Suggested fix:** use the same upper clamp as `learnOverflow` (4) and keep a floor from the last overflow (`q.overflowRatio`). Optionally count non-ASCII characters at about 1 token each.
 - **Done when:** a test where an overflow teaches a ratio of about 3.5, followed by successful replies, keeps the ratio at least that high.
 
-### B6. Live check of Featherless, Phala and Routeway (needs the owner's keys)
+### B6. Live check of Featherless, Phala and Routeway
 
-- **Status:** Blocked: needs the keys in the environment of whoever runs it: `FEATHERLESS_API_KEY`, `PHALA_API_KEY` (base URL `https://inference.phala.com/v1`) and `ROUTEWAY_API_KEY` (`https://api.routeway.ai/v1`). Agents never store keys or ask for them in chat. On 2026-10-17 all three model lists answered from the lead's cloud session (no key needed for those), so the network isn't the blocker; the keys are.
+- **Status:** Partly done. Run by the lead on 2026-10-17 in a cloud session, with the owner's keys as network secrets (`npm run live -- --proxy-auth`):
+  - **Phala** `phala/qwen3.8-27b-uncensored`: all four checks pass. The catalogue lists 22 models; the test prompt answers in 1.3 s; a bot called `read_file` and reported the word; `git push` stopped for approval.
+  - **Routeway** `glm-5.3-flash-uncensored`: all four pass. 290 models; the prompt answers in 2.7 s; tool turn and approval pass.
+  - **Featherless** `DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NM-DAU`: the catalogue passes (5,000 models, our cap). The model was cold, so the test prompt gave up at its 20 s limit, and that run stopped there. The script now goes on to the bot turn, which waits up to 10 minutes. **Next: run `npm run live -- --proxy-auth featherless` once the owner allows more live tests.** The owner also listed other models to try (below).
+  - Bugs this found, fixed in b84b3d8: Featherless 404s Node's default user agent; HTML error pages were shown as markup; Node's fetch skipped the session proxy.
+- **Keys:** `FEATHERLESS_API_KEY`, `PHALA_API_KEY` (base URL `https://inference.phala.com/v1`) and `ROUTEWAY_API_KEY` (`https://api.routeway.ai/v1`). Agents never store keys or ask for them in chat. The owner's `LIVE_MODEL_*` defaults are set as environment variables in the cloud session.
+- **Other models the owner can use:**
+  - Featherless: `gemma-4-31b-gembrain-uncensored-heretic`, `huihui-ai/Huihui-Qwen3.8-27B-abliterated`, `wangzhang/gemma-4-31B-it-abliterated`, `DavidAU/gemma-4-31B-it-The-DECKARD-HERETIC-UNCENSORED-Thinking`.
+  - Phala: `phala/gemma-4-26b-a4b-uncensored`.
+  - Routeway: `qwen3.8-27b-uncensored`, `gemma-4-31b-gembrain-uncensored-heretic`.
 - **The automatic part:** `npm run live` (`scripts/live-providers.ts`).
   - For each provider whose key is set, it checks four things: the catalogue loads, one test prompt answers, a bot reads a file with `read_file` and reports a word only that file holds, and `git push` stops for approval.
   - It prints PASS/FAIL/SKIP lines, never the key, and exits non-zero on a failure.
