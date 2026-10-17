@@ -1566,10 +1566,30 @@ test("SSE parser: split CRLF, comments, multi-line data, no trailing blank line"
 
 test("think filter keeps partial tags back and handles <thought>", () => {
   const f = new ThinkFilter();
-  const parts = ["Hi <", "thought>secret</tho", "ught> there", "<thi"].map((s) => f.push(s));
+  const parts = ["  <", "thought>secret</tho", "ught>Hi there", "<thi"].map((s) => f.push(s));
   const end = f.end();
-  assert.equal(parts.map((p) => p.text).join("") + end.text, "Hi  there<thi");
+  assert.equal(parts.map((p) => p.text).join("") + end.text, "  Hi there<thi");
   assert.equal(parts.map((p) => p.thinking).join(""), "secret");
+});
+
+test("think filter: tags only count at the start; an answer or a file can mention them", () => {
+  const run = (chunks: string[], startInThink = false) => {
+    const f = new ThinkFilter(startInThink);
+    const parts = chunks.map((c) => f.push(c));
+    const end = f.end();
+    return { text: parts.map((p) => p.text).join("") + end.text + (end.toText ?? ""), thinking: parts.map((p) => p.thinking).join("") + end.thinking, reset: parts.some((p) => p.reset) };
+  };
+  // A prompt-mode call writing code that strips think tags keeps them.
+  const call = '<tool_call>{"name": "write_file", "arguments": {"content": "s.replace(\'<think>\', \'\').replace(\'</think>\', \'\')"}}</tool_call>';
+  assert.deepEqual(run([call.slice(0, 40), call.slice(40)]), { text: call, thinking: "", reset: false });
+  // An answer that mentions an unclosed <think> keeps everything after it.
+  assert.equal(run(["Models wrap reasoning in <think> tags; ", "the rest stays."]).text, "Models wrap reasoning in <think> tags; the rest stays.");
+  // A </think> after a code fence isn't the end of reasoning.
+  const fenced = "Use this:\n```\ntext.split('</think>')[1]\n```";
+  assert.deepEqual(run([fenced]), { text: fenced, thinking: "", reset: false });
+  // Reasoning first still works: an opened block, and a lone close from a template that opens it.
+  assert.deepEqual(run(["<think>plan</think>", "Answer <think> literal"]), { text: "Answer <think> literal", thinking: "plan", reset: false });
+  assert.deepEqual(run(["plan it</think>Answer"]), { text: "Answer", thinking: "plan it", reset: true });
 });
 
 test("tool arguments: empty, fenced, double-encoded, doubled, broken", () => {

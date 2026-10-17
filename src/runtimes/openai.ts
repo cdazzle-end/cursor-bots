@@ -561,6 +561,8 @@ function partialTail(s: string, tags: string[]): number {
 }
 
 const THINK_OPEN = ["<think>", "<thought>"];
+/** Once these appear, think tags are part of what the model writes. */
+const MARKUP_OR_FENCE = /<tool_call>|<function=|\[TOOL_REQUEST\]|```/;
 const THINK_CLOSE = ["</think>", "</thought>"];
 
 /**
@@ -568,12 +570,22 @@ const THINK_CLOSE = ["</think>", "</thought>"];
  * <think>…</think> (tags may be split across chunks). A lone </think> means
  * the chat template opened the block in the prompt (Qwen3/R1 style): what came
  * before it was reasoning, and `reset` says so.
+ *
+ * Reasoning comes first, so a tag only counts there: an opening tag before any
+ * visible text, a closing tag before any tool-call markup or code fence, and
+ * nothing after a think block has ended. Tags later in the reply are text
+ * (an answer, or a file the model writes, can mention <think>).
  */
 export class ThinkFilter {
   private inThink: boolean;
   private implicit: boolean;
   private buf = "";
   private implicitText = "";
+  /** Visible text so far (only the end is kept, to spot markup across chunks). */
+  private shownTail = "";
+  private shown = false;
+  /** Past the reasoning: every later tag is text. */
+  private literal = false;
 
   /** `startInThink`: the model is known to start its replies inside an unopened think block. */
   constructor(startInThink = false) {
@@ -595,6 +607,7 @@ export class ThinkFilter {
           this.inThink = false;
           this.implicit = false;
           this.implicitText = "";
+          this.literal = true;
           continue;
         }
         const keep = partialTail(buf, THINK_CLOSE);
@@ -602,17 +615,40 @@ export class ThinkFilter {
         buf = buf.slice(buf.length - keep);
         break;
       }
+      if (this.literal || MARKUP_OR_FENCE.test(this.shownTail + text)) {
+        this.literal = true;
+        text += buf;
+        buf = "";
+        break;
+      }
       const open = findFirst(buf, THINK_OPEN);
       const close = findFirst(buf, THINK_CLOSE);
       if (close && (!open || close.index < open.index)) {
-        thinking += text + buf.slice(0, close.index);
+        const before = text + buf.slice(0, close.index);
+        if (MARKUP_OR_FENCE.test(this.shownTail + before)) {
+          // Markup came first: the tag is part of what the model is writing.
+          this.literal = true;
+          continue;
+        }
+        thinking += before;
         text = "";
+        this.shownTail = "";
+        this.shown = false;
         reset = true;
+        this.literal = true;
         buf = buf.slice(close.index + close.tag.length);
         continue;
       }
       if (open) {
-        text += buf.slice(0, open.index);
+        const before = buf.slice(0, open.index);
+        if (this.shown || (text + before).trim()) {
+          // Visible text came first: the tag is text.
+          text += buf.slice(0, open.index + open.tag.length);
+          buf = buf.slice(open.index + open.tag.length);
+          this.shown = true;
+          continue;
+        }
+        text += before;
         buf = buf.slice(open.index + open.tag.length);
         this.inThink = true;
         continue;
@@ -623,6 +659,9 @@ export class ThinkFilter {
       break;
     }
     this.buf = buf;
+    if (text.trim()) this.shown = true;
+    if (MARKUP_OR_FENCE.test(this.shownTail + text)) this.literal = true;
+    this.shownTail = (this.shownTail + text).slice(-32);
     thinking = thinking.replace(/<think>|<thought>/g, "");
     if (this.implicit) this.implicitText += thinking;
     return { text, thinking, reset };
