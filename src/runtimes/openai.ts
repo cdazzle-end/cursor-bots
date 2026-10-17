@@ -1039,18 +1039,28 @@ function isSummaryMessage(m: TranscriptMessage | undefined): boolean {
   return !!m && m.role === "user" && m.content.startsWith("<conversation_summary>");
 }
 
-function estimateStored(m: TranscriptMessage): number {
-  return MESSAGE_OVERHEAD_TOKENS + (m.content.length + (m.tool_calls ? JSON.stringify(m.tool_calls).length : 0)) / CHARS_PER_TOKEN;
+/**
+ * Characters weighted for the chars/3.5 estimate: a non-ASCII character (CJK,
+ * most accented and emoji) is about a token on its own, so it counts as 3.5.
+ */
+function weightedChars(s: string): number {
+  let extra = 0;
+  for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) > 0x7f) extra++;
+  return s.length + extra * (CHARS_PER_TOKEN - 1);
 }
 
-/** Rough token count of a request: chars/3.5 plus a few tokens per message (calibrated per model later). */
-function estimateRequest(system: string, wire: WireMessage[], tools?: unknown[]): number {
-  let chars = system.length;
+function estimateStored(m: TranscriptMessage): number {
+  return MESSAGE_OVERHEAD_TOKENS + (weightedChars(m.content) + (m.tool_calls ? JSON.stringify(m.tool_calls).length : 0)) / CHARS_PER_TOKEN;
+}
+
+/** @internal Rough token count of a request: chars/3.5 plus a few tokens per message (calibrated per model later). */
+export function estimateRequest(system: string, wire: WireMessage[], tools?: unknown[]): number {
+  let chars = weightedChars(system);
   let tokens = system ? MESSAGE_OVERHEAD_TOKENS : 0;
   for (const m of wire) {
     tokens += MESSAGE_OVERHEAD_TOKENS;
-    if (typeof m.content === "string") chars += m.content.length;
-    else for (const p of m.content) p.type === "text" ? (chars += p.text.length) : (tokens += IMAGE_TOKENS);
+    if (typeof m.content === "string") chars += weightedChars(m.content);
+    else for (const p of m.content) p.type === "text" ? (chars += weightedChars(p.text)) : (tokens += IMAGE_TOKENS);
     if (m.tool_calls) chars += JSON.stringify(m.tool_calls).length;
     for (const k of ["reasoning_content", "reasoning"]) if (typeof m[k] === "string") chars += (m[k] as string).length;
   }
@@ -1502,6 +1512,8 @@ interface ModelQuirks {
   reasoningField?: "reasoning_content" | "reasoning";
   /** Reported prompt tokens / our estimate. */
   ratio?: number;
+  /** The ratio an overflow error measured: a floor for later calibration. */
+  overflowRatio?: number;
   /** A smaller context window learned from an overflow error. */
   window?: number;
 }
@@ -1784,6 +1796,7 @@ export class OpenAICompatRuntime implements AgentRuntime {
       const r = Number(used[1]) / estimate;
       if (Number.isFinite(r) && r > 0) {
         q.ratio = Math.min(4, Math.max(q.ratio ?? 1, r));
+        q.overflowRatio = Math.max(q.overflowRatio ?? 0, Math.min(4, r));
         learned = true;
       }
     }
@@ -2001,8 +2014,9 @@ export class OpenAICompatRuntime implements AgentRuntime {
     const reported = Number(res.usage?.prompt_tokens);
     // Small prompts are mostly template overhead; calibrate on real ones.
     if (call.estimate && call.estimate > 500 && reported > 0) {
-      const r = Math.min(2.5, Math.max(0.5, reported / call.estimate));
-      q.ratio = q.ratio ? q.ratio * 0.5 + r * 0.5 : r;
+      const r = Math.min(4, Math.max(0.5, reported / call.estimate));
+      // An overflow measured the real ratio: ordinary replies (shorter, more ASCII) don't pull it back below that.
+      q.ratio = Math.max(q.overflowRatio ?? 0, q.ratio ? q.ratio * 0.5 + r * 0.5 : r);
     }
   }
 

@@ -81,7 +81,7 @@ Status values:
 
 ### B4. Provider fields needed in tool loops are dropped
 
-- **Status:** Done (lead; the commit "Send provider data on tool calls back during the tool loop"). Tested against the documented shapes only; confirm on a live Gemini or OpenRouter model when one is used.
+- **Status:** Done @ eee8155 (lead). Tested against the documented shapes only; confirm on a live Gemini or OpenRouter model when one is used.
 - **Where:** `ReplyBuilder.addToolCall()`, `interpret()`, `normalizeStored()`, `serialize()` and `toWire()` in `src/runtimes/openai.ts`.
 - **Problem** (taken from provider docs, not reproduced live):
   - Gemini 3 behind its OpenAI-compatible endpoint puts `extra_content.google.thought_signature` on tool calls, and rejects the next request in the loop without it.
@@ -94,7 +94,7 @@ Status values:
 
 ### B5. Token-ratio learning undoes what an overflow taught
 
-- **Status:** Open
+- **Status:** Done (lead; the commit "Token estimates keep what an overflow measured")
 - **Where:** `OpenAICompatRuntime.learn()` and `learnOverflow()`; `estimateRequest()` and `estimateStored()` in `src/runtimes/openai.ts`.
 - **Problem:** `learn()` caps the ratio at 2.5 and averages it. For dense scripts such as CJK, the estimate drifts back to about 30% low, and the conversation hits a context error every time it nears the window.
 - **Suggested fix:** use the same upper clamp as `learnOverflow` (4) and keep a floor from the last overflow (`q.overflowRatio`). Optionally count non-ASCII characters at about 1 token each.

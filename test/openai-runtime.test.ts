@@ -11,6 +11,7 @@ import {
   ThinkFilter,
   UnitSemaphore,
   classifyError,
+  estimateRequest,
   extractToolCalls,
   parseToolArguments,
   repairToolPairs,
@@ -1382,6 +1383,30 @@ test("provider data on tool calls (extra_content, reasoning_details) goes back d
     assert.equal((await turn(session, "again", { tools: [read] })).outcome.text, "fine");
     const retried = server.chats().at(-1)!.body.messages.filter((m: any) => m.tool_calls);
     assert.ok(retried.every((m: any) => m.tool_calls.every((c: any) => c.extra_content === undefined) && m.reasoning_details === undefined));
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test("token ratios: what an overflow measured isn't undone by later replies; non-ASCII text counts as denser", async () => {
+  const t = setup();
+  try {
+    const rt = t.rt as unknown as {
+      learnOverflow(id: string, detail: string, estimate: number): void;
+      learn(call: { modelId: string; estimate: number }, res: { usage: { prompt_tokens: number }; loneClose: boolean }): void;
+      ratio(id: string): number;
+    };
+    rt.learnOverflow("test-model", "This model's maximum context length is 32768 tokens. However, your messages resulted in 14000 tokens (14000 in the messages, 0 in the completion).", 4000);
+    assert.equal(rt.ratio("test-model"), 3.5);
+    // Shorter, more ASCII replies report a lower ratio; the measured floor holds.
+    for (let i = 0; i < 6; i++) rt.learn({ modelId: "test-model", estimate: 4000 }, { usage: { prompt_tokens: 10400 }, loneClose: false });
+    assert.ok(rt.ratio("test-model") >= 3.5, `still at least 3.5 (${rt.ratio("test-model")})`);
+
+    // A CJK character is about a token; ASCII is about 3.5 characters per token.
+    const cjk = estimateRequest("", [{ role: "user", content: "漢".repeat(1000) }]);
+    const ascii = estimateRequest("", [{ role: "user", content: "a".repeat(1000) }]);
+    assert.ok(cjk >= 1000, `CJK ${cjk}`);
+    assert.ok(ascii < 300, `ASCII ${ascii}`);
   } finally {
     await t.cleanup();
   }
