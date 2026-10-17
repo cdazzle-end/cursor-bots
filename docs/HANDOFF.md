@@ -43,7 +43,7 @@ Status values:
 
 ### B1. A finished answer can be lost behind the end-of-turn summary
 
-- **Status:** Done (lead, 2026-10-17); see the commit "Post the answer before the end-of-turn summary"
+- **Status:** Done @ 0cf2ca6 (lead)
 - **Where:** `src/runtimes/openai.ts`, in `OaiRun.turn()`, `OaiRun.compact()` and `OaiSession.send()`, plus the outcome handling in `Harness.finishRun`.
 - **Problem:**
   - `turn()` appends the final answer to the transcript, then awaits `compact("end")`, a non-streamed summary call that queues for capacity and can retry for minutes. Until it finishes, `run.wait()` doesn't resolve, so the runner posts nothing.
@@ -56,7 +56,7 @@ Status values:
 
 ### B2. The reply limit fills the rest of the window
 
-- **Status:** Open
+- **Status:** Done (lead; the commit "Leave the reply room for estimate errors")
 - **Where:** `replyLimit()` and `learnOverflow()` in `src/runtimes/openai.ts`.
 - **Problem:**
   - max_tokens is `min(outputCap, window - estimate - 3%)`. With a large `maxOutputTokens` (Featherless lists some models with max_completion_tokens equal to their context), an estimate that is more than 3% low overflows. chars/3.5 undercounts code and JSON by about 15%.

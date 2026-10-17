@@ -1286,6 +1286,41 @@ test("end of turn: the turn that just finished stays verbatim, however long its 
   }
 });
 
+test("the reply limit leaves room for estimate errors, and an overflow always makes the retry ask for less", async () => {
+  // Some catalogues list a model's reply limit as its whole context.
+  const big = { provider: { models: [{ id: "test-model", contextWindow: 8192, maxOutputTokens: 8192 }] } };
+  const t = setup(big);
+  const t2 = setup(big);
+  try {
+    server.push((r, res) => sse(res, textReply("ok")));
+    await turn(await t.open(), "hello");
+    assert.ok(server.chats()[0]!.body.max_tokens <= 4096, `capped at half the window (${server.chats()[0]!.body.max_tokens})`);
+
+    // vLLM's wording: the input count is learned, so the retry fits. (A fresh session: nothing older to summarize.)
+    server.push(
+      (r, res) => json(res, 400, { error: { message: "'max_tokens' is too large: 4000. This model's maximum context length is 8192 tokens and your request has 7000 input tokens (4000 > 8192 - 7000)." } }),
+      (r, res) => sse(res, textReply("fits")),
+    );
+    const vllm = await turn(await t.open(), "x".repeat(12000));
+    assert.equal(vllm.outcome.text, "fits");
+    const [a1, a2] = server.chats().slice(-2).map((c) => c.body.max_tokens as number);
+    assert.ok(a2! < a1!, `the retry asks for less (${a1} → ${a2})`);
+
+    // A message with no numbers at all still makes the retry smaller instead of repeating it.
+    server.push(
+      (r, res) => json(res, 400, { error: { message: "Input is too long for this model." } }),
+      (r, res) => sse(res, textReply("fits too")),
+    );
+    const vague = await turn(await t2.open(), "y".repeat(12000));
+    assert.equal(vague.outcome.text, "fits too");
+    const [b1, b2] = server.chats().slice(-2).map((c) => c.body.max_tokens as number);
+    assert.ok(b2! < b1!, `the retry asks for less (${b1} → ${b2})`);
+  } finally {
+    await t.cleanup();
+    await t2.cleanup();
+  }
+});
+
 test("if the summary can't be made: history stays at the end of a turn; only a request that doesn't fit drops the oldest", async () => {
   const t = setup({ provider: { models: [{ id: "test-model", contextWindow: 4000 }] } });
   try {

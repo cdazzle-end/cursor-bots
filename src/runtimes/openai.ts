@@ -1691,8 +1691,11 @@ export class OpenAICompatRuntime implements AgentRuntime {
   /** @internal The reply limit for a prompt of this size: never more than fits, never less than 256. */
   replyLimit(id: string, promptTokens: number, choice?: ModelChoice): number {
     const w = this.windowFor(id);
-    const margin = Math.max(256, Math.ceil(w * 0.03));
-    return Math.max(MIN_REPLY_TOKENS, Math.min(this.outputCap(id, choice), w - promptTokens - margin));
+    // chars/3.5 undercounts code and JSON: keep a wider margin until a reply has calibrated the estimate.
+    const margin = Math.max(256, Math.ceil(w * (this.quirk(id).ratio === undefined ? 0.1 : 0.03)));
+    // Never the whole rest of the window (some catalogues list a model's reply limit as its full context).
+    const cap = Math.min(this.outputCap(id, choice), Math.floor(w * 0.5));
+    return Math.max(MIN_REPLY_TOKENS, Math.min(cap, w - promptTokens - margin));
   }
 
   /** @internal Largest prompt that leaves the reply its reserve inside ~90% of the window. */
@@ -1728,11 +1731,23 @@ export class OpenAICompatRuntime implements AgentRuntime {
       const n = Number(w[1]);
       if (n >= 512 && n < this.windowFor(id)) q.window = n;
     }
-    const used = /(\d+) (?:tokens )?in the messages/i.exec(detail) ?? /request \((\d+) tokens\)/i.exec(detail) ?? /n_prompt_tokens[^0-9]{0,5}(\d+)/i.exec(detail);
+    const used =
+      /(\d+) (?:tokens )?in the messages/i.exec(detail) ??
+      /request \((\d+) tokens\)/i.exec(detail) ??
+      /n_prompt_tokens[^0-9]{0,5}(\d+)/i.exec(detail) ??
+      /request has (\d+) input tokens/i.exec(detail) ??
+      /\((\d+) of text input/i.exec(detail) ??
+      /prompt is too long: (\d+) tokens/i.exec(detail);
+    let learned = false;
     if (used && estimate > 0) {
       const r = Number(used[1]) / estimate;
-      if (Number.isFinite(r) && r > 0) q.ratio = Math.min(4, Math.max(q.ratio ?? 1, r));
+      if (Number.isFinite(r) && r > 0) {
+        q.ratio = Math.min(4, Math.max(q.ratio ?? 1, r));
+        learned = true;
+      }
     }
+    // Nothing to go on: assume the estimate is low, so the retry asks for less instead of repeating itself.
+    if (!learned) q.ratio = Math.min(4, (q.ratio ?? 1) * 1.25);
   }
 
   /** @internal Remove the API key from text that came back from the provider. */
