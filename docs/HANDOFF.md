@@ -7,6 +7,7 @@ The lead (Claude) maintains this file. Contributors change only the **Status** l
 Last updated by the lead on 2026-10-17. Session notes are the newest files in `docs/worklog/`.
 
 - **Integration branch:** `claude/tender-cori-t1ksnz` (also the default branch). `npm run typecheck && npm test` is clean, with 182 tests.
+- **Lead's working branch:** `claude/bold-knuth-kcf7i1` holds the lead's 2026-10-17 review session (B6, B9): a fast-forward of the integration branch, clean, with 185 tests. Until it's merged, branch new work from it if it needs those fixes.
 - **What the product is.** A self-hosted, Grok-Bot-style team of persistent AI bots:
   - each bot has its own chat, memory, skills, routines and approvals;
   - bots message each other and work in groups;
@@ -14,9 +15,14 @@ Last updated by the lead on 2026-10-17. Session notes are the newest files in `d
 
   See `README.md` and `docs/ARCHITECTURE.md`.
 - **What was built most recently: provider brains.** Bots can run on any OpenAI-compatible chat API instead of the Cursor SDK. The first target is Featherless AI; OpenRouter, xAI, OpenAI, Groq, Together, DeepInfra, Ollama, LM Studio and custom URLs are presets too. The owner has a Featherless key and wants to run open models such as Qwen3 on it, then add other providers.
-- **Never run against a real service.** Neither the Cursor runtime nor the provider runtime has been run against a real service; all testing used local fakes (see B6 and B7).
-- **Review status.** An adversarial review of provider brains found 32 confirmed defects. All are fixed, each with a regression test (the last five were B1–B5).
-- **Next up.** B6: Phala and Routeway pass the live check, and Featherless's bot turn is still to run (live tests are paused by the owner). B7 (Cursor) needs a Cursor key. Nothing else is open. Ask the lead (or the owner) for the next feature rather than inventing one.
+- **Live checks.** The provider runtime passes the automatic live check on Featherless, Phala and Routeway (B6). The Cursor runtime has never run against the real service (B7). `npm test` uses only local fakes.
+- **Review status.**
+  - An adversarial review of provider brains found 32 confirmed defects. All are fixed, each with a regression test (the last five were B1–B5).
+  - A lead review of the Team MCP endpoint, the HTTP API, the scheduler and approvals found three more (B9). All are fixed with regression tests.
+- **Next up.**
+  - B6's manual checks (steps 2 and 4–7), when the owner allows more live tests.
+  - B7 (Cursor) needs a Cursor key.
+  - Nothing else is open. Ask the lead (or the owner) for the next feature rather than inventing one.
 
 ### Map of the provider-brain code
 
@@ -106,7 +112,12 @@ Status values:
 - **Status:** Partly done. Run by the lead on 2026-10-17 in a cloud session, with the owner's keys as network secrets (`npm run live -- --proxy-auth`):
   - **Phala** `phala/qwen3.8-27b-uncensored`: all four checks pass. The catalogue lists 22 models; the test prompt answers in 1.3 s; a bot called `read_file` and reported the word; `git push` stopped for approval.
   - **Routeway** `glm-5.3-flash-uncensored`: all four pass. 290 models; the prompt answers in 2.7 s; tool turn and approval pass.
-  - **Featherless** `DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NM-DAU`: the catalogue passes (5,000 models, our cap). The model was cold, so the test prompt gave up at its 20 s limit, and that run stopped there. The script now goes on to the bot turn, which waits up to 10 minutes. **Next: run `npm run live -- --proxy-auth featherless` once the owner allows more live tests.** The owner also listed other models to try (below).
+  - **Featherless** `DavidAU/Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882-Heretic-Uncensored-NM-DAU`: three checks pass and one is skipped (rerun with the owner's go-ahead, 2026-10-17).
+    - The catalogue loads: 5,000 models, our cap.
+    - The model was still cold, so the 20 s test prompt was skipped.
+    - The bot turn then waited for the model to load, called `read_file` and replied with the word.
+    - `git push` stopped for approval.
+    - The model isn't on the catalogue's first page, so the run used the preset's default context window. The live script could look it up the way the editor does (`providerLookup`).
   - Bugs this found, fixed in b84b3d8: Featherless 404s Node's default user agent; HTML error pages were shown as markup; Node's fetch skipped the session proxy.
 - **Keys:** `FEATHERLESS_API_KEY`, `PHALA_API_KEY` (base URL `https://inference.phala.com/v1`) and `ROUTEWAY_API_KEY` (`https://api.routeway.ai/v1`). Agents never store keys or ask for them in chat. The owner's `LIVE_MODEL_*` defaults are set as environment variables in the cloud session.
 - **Other models the owner can use:**
@@ -131,6 +142,7 @@ Status values:
   6. A long conversation compacts, with a "summary" event, and keeps working.
   7. A Kimi-K2 or Llama model in auto tool mode either calls tools natively or switches to text tool calls.
 - **Done when:** every step is reported, and each failure is a new backlog item with what was seen.
+- **Still to do:** the automatic checks cover step 3 on all three providers. Steps 1–2 (in the app and `npm run doctor`) and 4–7 aren't reported yet.
 
 ### B7. Live smoke test with Cursor (needs the owner)
 
@@ -149,6 +161,18 @@ Status values:
   - **Group routing on a reasoning model is slow.** No code change: the deadline now aborts the call and frees capacity. Recommend setting a fast routing model (Settings → Brain & models → the provider → Routing model), or extra request fields with `{"chat_template_kwargs": {"enable_thinking": false}}` on that model.
   - **Old worktrees in `.claude/worktrees/`.** Removed by the lead.
 
+### B9. Review of the Team MCP endpoint, HTTP API, scheduler and approvals
+
+- **Status:** Done (lead, 2026-10-17, on `claude/bold-knuth-kcf7i1`). See `docs/worklog/2026-10-17-claude-review-api-approvals.md`.
+- **Fixed, each with a regression test:**
+  - **"Always allow" lapsed after six hours.** @ 0df0339. In auto mode a shell card only appears when an ask rule matches, and ask rules beat allow rules. So the saved rule never applied, and the command ran only on the decision's six-hour grant. An allow rule for exactly that text now beats ask rules.
+  - **The file browser.** @ a65e444.
+    - A folder with a broken symlink (every browser profile's `SingletonLock`) didn't list.
+    - A file whose name isn't Latin-1 couldn't be opened, and the cut-off error reply corrupted the next reply on that connection.
+    - A read error after `stat` crashed the gateway.
+  - **Team MCP arguments.** @ c049a49. `message_bot` without `text` posted "undefined" as you, and `create_bot` without a name made `@undefined`.
+- **Checked and fine:** token and origin checks, webhook keys, the snapshot's masking, approval expiry and waits, routine runs after a stop, restart or deletion, and the Team MCP's reply wait.
+
 ## Adding another provider
 
 The owner plans more providers. A new OpenAI-compatible service needs no new code:
@@ -164,6 +188,10 @@ A service that is not OpenAI-compatible (for example the Anthropic Messages API 
 ## Decisions
 
 The lead records answers to escalated questions here, newest first.
+
+- 2026-10-17: An allow rule whose pattern is exactly one command (`^…$` of the escaped text, which "Always allow" saves) beats ask rules. Broader allow patterns still lose to ask rules. "Always allow" no longer also leaves a six-hour grant, so deleting its rule takes it back.
+- 2026-10-17: Won't fix: the default `curl` ask rule and the `/proc/…/environ` check are quadratic on crafted input: 150–190 KB of command text takes about 2–3 s. A model's tool call is rarely that long, and a bot that wants to disrupt the gateway can already do worse with plain commands (`pkill`, a fork bomb).
+- 2026-10-17: Won't fix: an upload written through a dangling symlink a bot planted in `uploads/`. Planting it needs the shell, where an obfuscated command could already write the same place.
 
 - 2026-10-17: Phala and Routeway are presets (`PHALA_API_KEY`, `ROUTEWAY_API_KEY`). Routeway asks with `max_completion_tokens`, as its catalogue lists, and the runtime switches per model if needed. No key links are shown, since none were verified.
 - 2026-10-17: B8 resolved (see the item). `web_fetch` keeps pinning addresses over proxy support.
