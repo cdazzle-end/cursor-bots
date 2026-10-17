@@ -122,7 +122,7 @@ Status values:
 
 ### B8. Smaller known gaps (ask the lead before starting any of these)
 
-- **Status:** Open, but each needs a lead decision first.
+- **Status:** In review: codex/cursor-routing-cancellation @ c9cac02 (Cursor cancellation only; owner selected it on 2026-10-17. Other items still need a lead decision.)
 - **Items:**
   - `CursorRuntime.complete()` ignores the new `signal` option.
   - Tool descriptions from MCP servers are cut at 4000 characters but not redacted.

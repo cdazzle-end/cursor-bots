@@ -132,6 +132,8 @@ The app always requires its access token, which is printed on start (`http://hos
 
 Everything else is in the app's Settings: your name and label, time zone, default and routing models, group routing, approval mode and rules, Cursor Auto-review and sandbox, limits, secrets.
 
+Model-based group routing falls back to name matching or the group lead after 25 seconds and cancels the routing request.
+
 ## Security model
 
 - Bots run with **your** permissions on the machine running the gateway, inside the shared workspace by convention (not by enforcement). For stronger isolation, run the gateway in a container or VM, or enable the Cursor sandbox in Settings (note: with the sandbox or Auto-review on, the Cursor SDK refuses connector/MCP tool calls in local runs).
