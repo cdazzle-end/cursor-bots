@@ -6,6 +6,7 @@ import { test } from "node:test";
 import { Harness } from "../src/core/harness.ts";
 import { parseFrontmatter } from "../src/core/skills.ts";
 import { MockRuntime } from "../src/runtimes/mock.ts";
+import type { AgentRuntime } from "../src/runtimes/types.ts";
 import { makeHarness, settle, texts } from "./helpers.ts";
 
 // Regression tests for defects found in review. Each test names the behavior it pins down.
@@ -929,6 +930,39 @@ test("stop works while a provider bot's connectors are still starting, and nothi
     assert.ok(Date.now() - t0 < 2000, "the stop didn't wait for the connector");
     const session = [...mock.sessions.values()][0];
     assert.equal(session?.prompts.length ?? 0, 0, "the stopped message was never sent to the brain");
+  } finally {
+    await h.stop();
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("an answer that was complete before an error is posted, then the error card", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "cb-answer-err-"));
+  // A brain whose turn answers, then fails on a steered follow-up.
+  const rt: AgentRuntime = {
+    id: "flaky",
+    label: "Flaky",
+    available: () => ({ ok: true }),
+    open: async () => ({
+      agentId: "flaky-1",
+      close: async () => {},
+      send: async () => ({
+        id: "flaky-run",
+        cancel: async () => {},
+        wait: async () => ({ status: "error" as const, text: "Here is the answer.", error: "the follow-up call failed" }),
+      }),
+    }),
+  };
+  const h = new Harness({ home, runtimes: [rt] });
+  h.store.settings.runtime = "flaky";
+  await h.start({ gatewayUrl: "http://127.0.0.1:1" });
+  try {
+    const bot = h.createBot({ name: "Flaky" });
+    const dm = h.store.dmFor(bot.id)!;
+    await h.postUserMessage(dm.id, { text: "hi" });
+    await settle(h);
+    const posted = h.store.messages(dm.id).filter((m) => m.author.kind === "bot").map((m) => `${m.kind}: ${m.text}`);
+    assert.deepEqual(posted, ["message: Here is the answer.", "error: I couldn't finish that: the follow-up call failed"]);
   } finally {
     await h.stop();
     fs.rmSync(home, { recursive: true, force: true });

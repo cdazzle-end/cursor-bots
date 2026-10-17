@@ -1454,6 +1454,8 @@ export class Harness {
       return undefined;
     }
     if (outcome.status === "error") {
+      // An answer that was complete before the error (a steered follow-up failed) is posted first.
+      const answered = outcome.text?.trim() ? this.postAnswer(state, conv, outcome.text, meta) : undefined;
       const msg = this.postMessage({
         convId,
         author,
@@ -1462,18 +1464,25 @@ export class Harness {
         runId: state.runId,
         meta,
       });
-      if (state.wake.replyTo) this.deliverHandoffReply(state, { text: outcome.error ?? "error", failed: true });
-      return msg;
+      if (state.wake.replyTo && !answered) this.deliverHandoffReply(state, { text: outcome.error ?? "error", failed: true });
+      return answered ?? msg;
     }
+    return this.postAnswer(state, conv, outcome.text || state.text, meta);
+  }
 
-    let text = (outcome.text || state.text).trim();
+  /** Post a turn's reply (or nothing for NO_REPLY), route its @mentions and answer the handoff it came from. */
+  private postAnswer(state: RunState, conv: Conversation, reply: string, meta: Record<string, unknown>): Message | undefined {
+    const convId = conv.id;
+    const author: Author = { kind: "bot", id: state.bot.id };
+    const worked = state.activity.size > 0;
+    let text = reply.trim();
     const silent = /^NO_REPLY\.?$/i.test(text) || (state.wake.allowSilence && !text && !state.attachments.length);
     text = text.replace(/\n*NO_REPLY\.?\s*$/i, "").trim();
     if (silent) {
       if (state.wake.replyTo) this.deliverHandoffReply(state, { text: "(no reply)" });
       return undefined;
     }
-    if (!text && !state.attachments.length) text = activity.length ? "Done." : "(no reply)";
+    if (!text && !state.attachments.length) text = worked ? "Done." : "(no reply)";
     const mentions = this.parseMentions(text, conv.kind === "group" ? conv.members : undefined).ids;
     const msg = this.postMessage({
       convId,

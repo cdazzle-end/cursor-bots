@@ -129,9 +129,12 @@ async function start(session: RuntimeSession, text: string, o: Partial<SendInput
   return { run, events };
 }
 
+/** One whole turn, including the end-of-turn compaction that runs after the outcome. */
 async function turn(session: RuntimeSession, text: string, o: Partial<SendInput> = {}): Promise<Turn> {
   const { run, events } = await start(session, text, o);
-  return { run, events, outcome: await run.wait() };
+  const outcome = await run.wait();
+  await (session as RuntimeSession & { settled?: () => Promise<void> }).settled?.();
+  return { run, events, outcome };
 }
 
 function joined(events: RuntimeEvent[], type: "text" | "thinking"): string {
@@ -1092,6 +1095,97 @@ test("steer during a tool round: delivered as a user message before the next mod
       { role: "user", content: "Message from Boss while you work:\nalso b.md" },
     ]);
     assert.equal(await run.steer!("too late"), false);
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test("end-of-turn compaction runs after the answer: the outcome doesn't wait, and the next message or close stops it", async () => {
+  const t = setup({ provider: { models: [{ id: "test-model", contextWindow: 4000 }] } });
+  try {
+    const session = await t.open();
+    for (const ch of ["A", "B"]) {
+      server.push((r, res) => sse(res, textReply("ok")));
+      await turn(session, ch.repeat(3000));
+    }
+    // The summary request hangs until the client gives up on it.
+    const held = gate();
+    server.push(
+      (r, res) => sse(res, textReply("the answer")),
+      async (r, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.on("close", () => held.open());
+        await held.p;
+      },
+    );
+    const { run, events } = await start(session, "C".repeat(3000));
+    const outcome = await run.wait();
+    assert.equal(outcome.status, "finished");
+    assert.equal(outcome.text, "the answer", "posted without waiting for the summary");
+    await until(() => server.chats().length === 4 && server.inFlight === 1);
+
+    // The next message doesn't wait for it: the summary is abandoned and the history stays as it was.
+    server.push((r, res) => sse(res, textReply("next")));
+    const t0 = Date.now();
+    const next = await turn(session, "D");
+    assert.ok(Date.now() - t0 < 1500);
+    assert.equal(next.outcome.text, "next");
+    assert.ok(!events.some((e) => e.type === "summary"));
+    const lines = t.lines(session.agentId);
+    assert.ok(JSON.stringify(lines).includes("the answer"));
+    assertValid(lines);
+
+    // close() stops a pending compaction too, promptly (a fresh session with the same history size).
+    const other = await t.open();
+    for (const ch of ["A", "B"]) {
+      server.push((r, res) => sse(res, textReply("ok")));
+      await turn(other, ch.repeat(3000));
+    }
+    const again = gate();
+    server.push(
+      (r, res) => sse(res, textReply("last")),
+      async (r, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.on("close", () => again.open());
+        await again.p;
+      },
+    );
+    const before = server.chats().length;
+    const last = await start(other, "C".repeat(3000));
+    assert.equal((await last.run.wait()).text, "last");
+    await until(() => server.chats().length === before + 2 && server.inFlight === 1);
+    const t1 = Date.now();
+    await other.close();
+    assert.ok(Date.now() - t1 < 1500);
+    assertValid(t.lines(other.agentId));
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test("a steered follow-up that fails keeps the answer that was already complete", async () => {
+  const t = setup();
+  try {
+    const g = gate();
+    server.push(
+      async (r, res) => {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write(`data: ${JSON.stringify(delta({ content: "First " }))}\n\n`);
+        await g.p;
+        res.write(`data: ${JSON.stringify(delta({ content: "answer" }))}\n\ndata: ${JSON.stringify(finish("stop"))}\n\ndata: [DONE]\n\n`);
+        res.end();
+      },
+      (r, res) => json(res, 401, { error: { message: "key revoked" } }),
+    );
+    const session = await t.open();
+    const { run, events } = await start(session, "go");
+    await until(() => joined(events, "text").includes("First"));
+    assert.equal(await run.steer!("and one more thing"), true);
+    g.open();
+    const outcome = await run.wait();
+    assert.equal(outcome.status, "error");
+    assert.equal(outcome.text, "First answer");
+    assert.match(outcome.error ?? "", /key revoked|401/);
   } finally {
     await t.cleanup();
   }

@@ -43,7 +43,7 @@ Status values:
 
 ### B1. A finished answer can be lost behind the end-of-turn summary
 
-- **Status:** Open
+- **Status:** Done (lead, 2026-10-17); see the commit "Post the answer before the end-of-turn summary"
 - **Where:** `src/runtimes/openai.ts`, in `OaiRun.turn()`, `OaiRun.compact()` and `OaiSession.send()`, plus the outcome handling in `Harness.finishRun`.
 - **Problem:**
   - `turn()` appends the final answer to the transcript, then awaits `compact("end")`, a non-streamed summary call that queues for capacity and can retry for minutes. Until it finishes, `run.wait()` doesn't resolve, so the runner posts nothing.

@@ -277,7 +277,8 @@ class CursorRun implements RuntimeRun {
     await this.streamDone;
     return {
       status: result.status,
-      text: result.result ?? "",
+      // A failed run's text may be cut off part way: only a finished run's is a reply.
+      text: result.status === "finished" ? (result.result ?? "") : "",
       error: result.error?.message,
       requestId: result.requestId,
       model: result.model?.id,

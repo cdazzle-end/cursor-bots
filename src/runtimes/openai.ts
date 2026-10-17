@@ -2220,6 +2220,8 @@ class OaiSession implements RuntimeSession {
   private model?: ModelChoice;
   private active?: OaiRun;
   private closed = false;
+  /** End-of-turn compaction still running after its turn was answered. */
+  compaction?: Promise<void>;
 
   constructor(rt: OpenAICompatRuntime, agentId: string, transcript: Transcript, model?: ModelChoice) {
     this.rt = rt;
@@ -2233,6 +2235,8 @@ class OaiSession implements RuntimeSession {
     if (this.closed) throw new Error("This session is closed.");
     // The runner takes one turn at a time; a leftover run is stopped before the next starts.
     if (this.active && !this.active.isFinished) await this.active.cancel();
+    // An end-of-turn compaction is optional: stop it rather than make the next message wait (fitBudget compacts if it must).
+    await this.stopCompaction();
     const choice = input.model?.id ? input.model : this.model?.id ? this.model : undefined;
     const modelId = choice?.id || this.rt.defaultModelId();
     if (!modelId) throw new Error(`${this.rt.providerConfig().label} has no model set: pick one in the bot's details or set the provider's default model.`);
@@ -2246,6 +2250,18 @@ class OaiSession implements RuntimeSession {
   async close(): Promise<void> {
     this.closed = true;
     await this.active?.cancel();
+    await this.stopCompaction();
+  }
+
+  /** @internal Resolves when background work (an end-of-turn compaction) is done. */
+  async settled(): Promise<void> {
+    await this.compaction;
+  }
+
+  private async stopCompaction(): Promise<void> {
+    if (!this.compaction) return;
+    this.active?.abort();
+    await this.compaction;
   }
 }
 
@@ -2337,6 +2353,8 @@ class OaiRun implements RuntimeRun {
   /** Images sent with this turn's messages; only placeholders are stored. */
   private images = new Map<TranscriptMessage, Image[]>();
   private lastMaxTokens = 0;
+  /** Answers completed this turn (a steered message gets its own); kept if a later call fails. */
+  private answers: string[] = [];
 
   constructor(rt: OpenAICompatRuntime, s: OaiSession, input: SendInput, modelId: string, choice?: ModelChoice) {
     this.rt = rt;
@@ -2387,9 +2405,12 @@ class OaiRun implements RuntimeRun {
   // ---------------------------------------------------------------- the loop
 
   private async execute(): Promise<RunOutcome> {
+    let background = false;
     try {
       const text = await this.turn();
-      return this.outcome("finished", text);
+      const out = this.outcome("finished", text);
+      background = this.compactLater();
+      return out;
     } catch (err) {
       const stopped = this.cancelled || isAbortError(err);
       const message = stopped ? "" : this.rt.scrub(String((err as Error)?.message ?? err));
@@ -2400,18 +2421,42 @@ class OaiRun implements RuntimeRun {
       } catch {
         // A write failure here must not hide the real outcome.
       }
-      return stopped ? this.outcome("cancelled", "") : this.outcome("error", "", message);
+      // An answer finished before the error (a steered follow-up failed) is still the bot's reply.
+      return stopped ? this.outcome("cancelled", "") : this.outcome("error", this.answers.join("\n\n"), message);
     } finally {
       this.finished = true;
       this.accepting = false;
       this.steers = [];
-      this.images.clear();
-      this.rt.untrack(this);
+      if (!background) {
+        this.images.clear();
+        this.rt.untrack(this);
+      }
     }
   }
 
+  /**
+   * End-of-turn compaction runs after the outcome is settled, so the answer is
+   * posted at once and a stop can't lose it. The next send() or close() stops it.
+   */
+  private compactLater(): boolean {
+    const end = this.endOfTurnBudget();
+    if (!end.need) return false;
+    const done: Promise<void> = this.compact("end", end.keep)
+      .then(
+        () => {},
+        () => {},
+      )
+      .finally(() => {
+        if (this.s.compaction === done) this.s.compaction = undefined;
+        this.images.clear();
+        this.rt.untrack(this);
+      });
+    this.s.compaction = done;
+    return true;
+  }
+
   private async turn(): Promise<string> {
-    const answers: string[] = [];
+    const answers = this.answers;
     for (let calls = 1; ; calls++) {
       this.checkAbort();
       this.deliverSteers();
@@ -2432,8 +2477,6 @@ class OaiRun implements RuntimeRun {
       }
       await this.runCalls(step.calls, r.finishReason === "length");
     }
-    const end = this.endOfTurnBudget();
-    if (end.need) await this.compact("end", end.keep);
     return answers.join("\n\n");
   }
 
@@ -2781,10 +2824,10 @@ class OaiRun implements RuntimeRun {
     }
     const kept = msgs.slice(cut);
     let note = summary ?? "(The earlier conversation was dropped to fit the model's context window; no summary could be made.)";
-    if (reason !== "end") {
-      const identity = carryIdentity(head, kept);
-      if (identity) note += `\n\nThe identity and memory you were given most recently:\n${identity}`;
-    }
+    // Always, even at the end of a turn: that compaction runs in the background, possibly after the
+    // harness built the next prompt without identity, so the summary event alone can come too late.
+    const identity = carryIdentity(head, kept);
+    if (identity) note += `\n\nThe identity and memory you were given most recently:\n${identity}`;
     t.replace([{ role: "user", content: `<conversation_summary>\n${note}\n</conversation_summary>` }, { role: "assistant", content: SUMMARY_ACK }, ...kept]);
     this.emit({ type: "summary" });
     return true;

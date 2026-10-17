@@ -118,6 +118,7 @@ export interface RuntimeRun {
 
 export interface RunOutcome {
   status: "finished" | "error" | "cancelled";
+  /** The reply. With "error", only an answer that was complete before the error (it is posted before the error card); otherwise "". */
   text: string;
   error?: string;
   requestId?: string;
