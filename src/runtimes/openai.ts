@@ -88,6 +88,8 @@ export interface ChatToolCall {
   id: string;
   type: "function";
   function: { name: string; arguments: string };
+  /** Provider data that must come back with the call during a tool loop (Gemini's thought_signature). */
+  extra_content?: Record<string, unknown>;
 }
 
 /** One transcript entry: an OpenAI chat message as stored (one JSON object per line). */
@@ -98,6 +100,8 @@ export interface TranscriptMessage {
   tool_call_id?: string;
   name?: string;
   reasoning_content?: string;
+  /** OpenRouter's structured reasoning, sent back unchanged during a tool loop. */
+  reasoning_details?: unknown[];
 }
 
 type Image = { data: string; mimeType: string };
@@ -143,7 +147,9 @@ function normalizeStored(v: any): TranscriptMessage | undefined {
     for (const c of v.tool_calls) {
       if (typeof c?.id !== "string" || typeof c?.function?.name !== "string") continue;
       const a = c.function.arguments;
-      calls.push({ id: c.id, type: "function", function: { name: c.function.name, arguments: typeof a === "string" ? a : JSON.stringify(a ?? {}) } });
+      const call: ChatToolCall = { id: c.id, type: "function", function: { name: c.function.name, arguments: typeof a === "string" ? a : JSON.stringify(a ?? {}) } };
+      if (isPlainObject(c.extra_content)) call.extra_content = c.extra_content;
+      calls.push(call);
     }
     if (calls.length) m.tool_calls = calls;
   }
@@ -153,6 +159,7 @@ function normalizeStored(v: any): TranscriptMessage | undefined {
   }
   if (typeof v.name === "string" && v.name) m.name = v.name;
   if (typeof v.reasoning_content === "string" && v.reasoning_content) m.reasoning_content = v.reasoning_content;
+  if (v.role === "assistant" && Array.isArray(v.reasoning_details) && v.reasoning_details.length) m.reasoning_details = v.reasoning_details;
   return m;
 }
 
@@ -162,6 +169,7 @@ function serialize(m: TranscriptMessage): string {
   if (m.tool_call_id) o.tool_call_id = m.tool_call_id;
   if (m.name) o.name = m.name;
   if (m.reasoning_content) o.reasoning_content = m.reasoning_content;
+  if (m.reasoning_details?.length) o.reasoning_details = m.reasoning_details;
   return JSON.stringify(o);
 }
 
@@ -1133,9 +1141,14 @@ function toWire(
     const calls = m.tool_calls ?? [];
     const w: WireMessage = { role: "assistant", content: m.content };
     if (calls.length && textual) w.content = [m.content, ...calls.map(callAsText)].filter(Boolean).join("\n\n");
-    else if (calls.length) w.tool_calls = calls.map((c) => ({ id: c.id, type: "function", function: { name: c.function.name, arguments: c.function.arguments } }));
+    else if (calls.length) {
+      // Provider data on a call (Gemini's thought_signature) goes back during this turn's tool loop, where it's required.
+      const inTurn = i > o.turnStart;
+      w.tool_calls = calls.map((c) => ({ id: c.id, type: "function", function: { name: c.function.name, arguments: c.function.arguments }, ...(inTurn && c.extra_content ? { extra_content: c.extra_content } : {}) }));
+    }
     // Reasoning models do better when their reasoning comes back during a tool loop (this turn only).
     if (!textual && calls.length && o.reasoningField && m.reasoning_content && i > o.turnStart) w[o.reasoningField] = m.reasoning_content;
+    if (!textual && calls.length && m.reasoning_details?.length && i > o.turnStart) w.reasoning_details = m.reasoning_details;
     const last = out[out.length - 1];
     if (last && last.role === "assistant" && !last.tool_calls && typeof last.content === "string" && typeof w.content === "string") {
       Object.assign(last, w, { content: [last.content, w.content].filter(Boolean).join("\n\n") });
@@ -1262,6 +1275,7 @@ interface PendingCall {
   id?: string;
   name: string;
   args: string;
+  extra?: Record<string, unknown>;
 }
 
 interface ChatResult {
@@ -1269,6 +1283,8 @@ interface ChatResult {
   text: string;
   reasoning: string;
   reasoningField?: "reasoning_content" | "reasoning";
+  /** OpenRouter's reasoning_details, merged by index. */
+  reasoningDetails?: unknown[];
   calls: PendingCall[];
   finishReason?: string;
   usage?: Usage;
@@ -1307,6 +1323,7 @@ class ReplyBuilder {
   tagReasoning = "";
   reasoningField?: "reasoning_content" | "reasoning";
   calls: PendingCall[] = [];
+  details: Array<Record<string, unknown>> = [];
   finishReason?: string;
   usage?: Usage;
   model?: string;
@@ -1365,6 +1382,19 @@ class ReplyBuilder {
     if (shown) this.emit({ type: "text", text: shown });
   }
 
+  /** Streamed pieces of one entry share an index: their text joins, the other fields come from the first piece. */
+  private addReasoningDetails(list: unknown[]): void {
+    for (const r of list) {
+      if (!isPlainObject(r)) continue;
+      const prev = typeof r.index === "number" ? this.details.find((x) => x.index === r.index) : undefined;
+      if (!prev) {
+        this.details.push({ ...r });
+        continue;
+      }
+      for (const k of ["text", "summary", "data", "signature"]) if (typeof r[k] === "string") prev[k] = (typeof prev[k] === "string" ? prev[k] : "") + r[k];
+    }
+  }
+
   private addToolCall(tc: any): void {
     if (!tc || typeof tc !== "object") return;
     const fn = tc.function && typeof tc.function === "object" ? tc.function : {};
@@ -1382,6 +1412,7 @@ class ReplyBuilder {
     }
     if (id && !t.id) t.id = id;
     if (name && !t.name) t.name = name;
+    if (isPlainObject(tc.extra_content)) t.extra = { ...t.extra, ...tc.extra_content };
     const a = fn.arguments;
     if (typeof a === "string") t.args += a;
     else if (a && typeof a === "object") t.args = JSON.stringify(a);
@@ -1409,6 +1440,7 @@ class ReplyBuilder {
     } else if (Array.isArray(d.reasoning_details)) {
       for (const r of d.reasoning_details) this.thinking(typeof r?.text === "string" ? r.text : typeof r?.summary === "string" ? r.summary : "", true);
     }
+    if (Array.isArray(d.reasoning_details)) this.addReasoningDetails(d.reasoning_details);
     if (typeof d.content === "string") this.addContent(d.content);
     else if (Array.isArray(d.content)) {
       // Mistral: [{type:"thinking", thinking:[{type:"text", text}]}, {type:"text", text}]
@@ -1444,6 +1476,7 @@ class ReplyBuilder {
       text: this.content,
       reasoning: [this.fieldReasoning.trim(), this.tagReasoning.trim()].filter(Boolean).join("\n\n"),
       reasoningField: this.reasoningField,
+      reasoningDetails: this.details.length ? this.details : undefined,
       calls: this.calls.filter((c) => c.name),
       finishReason: this.finishReason,
       usage: this.usage,
@@ -1463,7 +1496,7 @@ interface ModelQuirks {
   maxTokensKey?: "max_tokens" | "max_completion_tokens";
   maxTokensSwapped?: boolean;
   noSystem?: boolean;
-  /** The server rejected reasoning sent back on assistant messages. */
+  /** The server rejected reasoning (or a call's extra_content) sent back on assistant messages. */
   noReasoningEcho?: boolean;
   implicitThink?: boolean;
   reasoningField?: "reasoning_content" | "reasoning";
@@ -1826,8 +1859,10 @@ export class OpenAICompatRuntime implements AgentRuntime {
       let messages = b.messages as WireMessage[];
       if (q.noReasoningEcho)
         messages = messages.map((m) => {
-          if (!("reasoning_content" in m) && !("reasoning" in m)) return m;
-          const { reasoning_content: _a, reasoning: _b, ...rest } = m;
+          const calls = m.tool_calls?.some((c) => c.extra_content);
+          if (!("reasoning_content" in m) && !("reasoning" in m) && !("reasoning_details" in m) && !calls) return m;
+          const { reasoning_content: _a, reasoning: _b, reasoning_details: _c, ...rest } = m;
+          if (calls) rest.tool_calls = m.tool_calls!.map(({ extra_content: _e, ...c }) => c);
           return rest as WireMessage;
         });
       if (q.noSystem) messages = foldSystem(messages);
@@ -1880,7 +1915,7 @@ export class OpenAICompatRuntime implements AgentRuntime {
       // A request the server can't take as is: change it and go again at once.
       if (pe.kind === "param" && pe.param && (tries.param ?? 0) < 4) {
         tries.param = (tries.param ?? 0) + 1;
-        if (pe.param === "reasoning_content" || pe.param === "reasoning") q.noReasoningEcho = true;
+        if (["reasoning_content", "reasoning", "reasoning_details", "extra_content"].includes(pe.param)) q.noReasoningEcho = true;
         else if ((pe.param === "max_tokens" || pe.param === "max_completion_tokens") && !q.maxTokensSwapped) {
           q.maxTokensSwapped = true;
           q.maxTokensKey = pe.param === "max_tokens" ? "max_completion_tokens" : "max_tokens";
@@ -2057,8 +2092,8 @@ export class OpenAICompatRuntime implements AgentRuntime {
     const idle = this.opts.idleTimeoutMs ?? 120_000;
     const candidates = Object.keys(body).filter((k) => k !== "model" && k !== "messages" && k !== "stream");
     // Reasoning sent back on assistant messages is a field a strict server may name in its error.
-    if (Array.isArray(body.messages) && (body.messages as WireMessage[]).some((m) => "reasoning_content" in m || "reasoning" in m))
-      candidates.push("reasoning_content", "reasoning");
+    if (Array.isArray(body.messages) && (body.messages as WireMessage[]).some((m) => "reasoning_content" in m || "reasoning" in m || "reasoning_details" in m || m.tool_calls?.some((c) => c.extra_content)))
+      candidates.push("reasoning_content", "reasoning", "reasoning_details", "extra_content");
     const builder = new ReplyBuilder({
       emit: call.emit,
       startInThink: !!this.quirk(call.modelId).implicitThink,
@@ -2298,6 +2333,8 @@ interface PreparedCall {
   args?: Record<string, unknown>;
   /** Set when the call can't run (bad JSON, unreadable block): the result for the model. */
   error?: string;
+  /** Provider data to send back with the call (extra_content). */
+  extra?: Record<string, unknown>;
 }
 
 const SUMMARY_SYSTEM = "You write compact, faithful summaries of an AI assistant's conversation, so it can continue its work with a much shorter context.";
@@ -2643,7 +2680,7 @@ class OaiRun implements RuntimeRun {
   private interpret(r: ChatResult & { mode: WireMode }): { assistant?: TranscriptMessage; calls: PreparedCall[]; text: string } {
     const names = new Set(this.tools.keys());
     let text = r.text;
-    let raw: Array<{ name: string; args: string; id?: string; malformed?: string }> = r.calls.map((c) => ({ name: c.name, args: c.args, id: c.id }));
+    let raw: Array<{ name: string; args: string; id?: string; malformed?: string; extra?: Record<string, unknown> }> = r.calls.map((c) => ({ name: c.name, args: c.args, id: c.id, extra: c.extra }));
     if (r.mode === "prompt") {
       const ex = extractToolCalls(text, names, true);
       text = ex.rest;
@@ -2668,17 +2705,20 @@ class OaiRun implements RuntimeRun {
     const calls = raw.map((c) => this.prepare(c));
     if (!text && !calls.length) return { calls, text };
     const assistant: TranscriptMessage = { role: "assistant", content: text };
-    if (calls.length) assistant.tool_calls = calls.map((c) => ({ id: c.id, type: "function", function: { name: c.name, arguments: c.storedArgs } }));
+    if (calls.length)
+      assistant.tool_calls = calls.map((c) => ({ id: c.id, type: "function", function: { name: c.name, arguments: c.storedArgs }, ...(c.extra ? { extra_content: c.extra } : {}) }));
     if (r.reasoning) assistant.reasoning_content = r.reasoning;
+    if (calls.length && r.reasoningDetails?.length) assistant.reasoning_details = r.reasoningDetails;
     return { assistant, calls, text };
   }
 
-  private prepare(c: { name: string; args: string; id?: string; malformed?: string }): PreparedCall {
+  private prepare(c: { name: string; args: string; id?: string; malformed?: string; extra?: Record<string, unknown> }): PreparedCall {
     const used = this.s.callIds;
     const id = c.id && /^[A-Za-z0-9_.:-]{1,64}$/.test(c.id) && !used.has(c.id) ? c.id : newCallId(used);
     used.add(id);
     const name = c.name || "invalid_tool_call";
-    if (c.malformed) return { id, name, storedArgs: "{}", error: c.malformed };
+    const extra = c.extra ? { extra: c.extra } : {};
+    if (c.malformed) return { id, name, storedArgs: "{}", error: c.malformed, ...extra };
     const parsed = parseToolArguments(c.args);
     if (!parsed.ok)
       return {
@@ -2687,8 +2727,9 @@ class OaiRun implements RuntimeRun {
         // Stored history must stay valid JSON: some servers parse it and reject the whole request otherwise.
         storedArgs: "{}",
         error: `Your arguments for ${name} weren't valid JSON (${parsed.error}), so the tool didn't run. You sent: ${excerpt(c.args, 300)}. Call it again with the arguments as one JSON object.`,
+        ...extra,
       };
-    return { id, name, storedArgs: JSON.stringify(parsed.value), args: parsed.value };
+    return { id, name, storedArgs: JSON.stringify(parsed.value), args: parsed.value, ...extra };
   }
 
   private async runCalls(calls: PreparedCall[], cutOff: boolean): Promise<void> {

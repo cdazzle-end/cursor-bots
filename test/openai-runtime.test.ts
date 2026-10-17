@@ -1343,6 +1343,50 @@ test("a small window filled by instructions and tools doesn't compact every turn
   }
 });
 
+test("provider data on tool calls (extra_content, reasoning_details) goes back during the turn's tool loop, not after", async () => {
+  const t = setup();
+  try {
+    const signature = { google: { thought_signature: "sig-abc123" } };
+    const looped = () => [
+      delta({ role: "assistant", content: null, reasoning_details: [{ type: "reasoning.encrypted", index: 0, data: "enc-" }] }),
+      delta({ reasoning_details: [{ type: "reasoning.encrypted", index: 0, data: "part2" }] }),
+      delta({ tool_calls: [{ index: 0, id: "c1", type: "function", function: { name: "read_file", arguments: '{"path":"a"}' }, extra_content: signature }] }),
+      finish("tool_calls"),
+    ];
+    server.push(
+      (r, res) => sse(res, looped()),
+      (r, res) => sse(res, textReply("done")),
+    );
+    const session = await t.open();
+    const read = makeTool("read_file", () => "A");
+    assert.equal((await turn(session, "go", { tools: [read] })).outcome.text, "done");
+    const back = server.chats()[1]!.body.messages.find((m: any) => m.tool_calls);
+    assert.deepEqual(back.tool_calls[0].extra_content, signature);
+    assert.deepEqual(back.reasoning_details, [{ type: "reasoning.encrypted", index: 0, data: "enc-part2" }]);
+    // Kept in the transcript (it survives a restart) ...
+    const stored = t.lines(session.agentId).find((m: any) => m.tool_calls);
+    assert.deepEqual(stored.tool_calls[0].extra_content, signature);
+    // ... but not sent with later turns.
+    server.push((r, res) => sse(res, textReply("ok")));
+    await turn(session, "next", { tools: [read] });
+    const later = server.chats()[2]!.body.messages.find((m: any) => m.tool_calls);
+    assert.equal(later.tool_calls[0].extra_content, undefined);
+    assert.equal(later.reasoning_details, undefined);
+
+    // A server that rejects the fields gets the request again without them.
+    server.push(
+      (r, res) => sse(res, looped()),
+      (r, res) => json(res, 400, { error: { message: "Unrecognized request argument supplied: extra_content" } }),
+      (r, res) => sse(res, textReply("fine")),
+    );
+    assert.equal((await turn(session, "again", { tools: [read] })).outcome.text, "fine");
+    const retried = server.chats().at(-1)!.body.messages.filter((m: any) => m.tool_calls);
+    assert.ok(retried.every((m: any) => m.tool_calls.every((c: any) => c.extra_content === undefined) && m.reasoning_details === undefined));
+  } finally {
+    await t.cleanup();
+  }
+});
+
 test("if the summary can't be made: history stays at the end of a turn; only a request that doesn't fit drops the oldest", async () => {
   const t = setup({ provider: { models: [{ id: "test-model", contextWindow: 4000 }] } });
   try {
