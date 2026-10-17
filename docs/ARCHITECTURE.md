@@ -163,6 +163,8 @@ Your message in a group wakes:
 - the author of the message you **Reply** to;
 - otherwise one bot chosen by `settings.groupRouting`: `llm` (a quick one-shot routing prompt, which is how "the Bots decide who responds"), `lead`, or `heuristic` (name match, lead, then the most recent speaker).
 
+Model routing has a 25-second deadline. If it fails or times out, the harness uses heuristic routing. The deadline aborts the completion: Cursor cancels its SDK run and closes and deletes its scratch agent. If SDK setup or sending is still pending, the caller stops waiting immediately; a late agent is cleaned up and a late run is cancelled without starting more routing work.
+
 A bot's group post that @mentions a teammate wakes that teammate. That's how visible handoffs happen inside a group.
 
 ### Loop protection
@@ -212,7 +214,7 @@ Defense in depth: Cursor's **Auto-review** classifier and **sandbox** (bubblewra
 interface AgentRuntime {
   provides?: { workspaceTools?, projectContext?, mcp? };                        // what the brain brings itself
   open(spec: { botId, agentId?, name, cwd, model? }): Promise<RuntimeSession>;  // create or resume
-  complete?(prompt, { model? }): Promise<string>;                               // optional one-shot (group routing)
+  complete?(prompt, { model?, signal? }): Promise<string>;                      // optional one-shot (group routing)
   listModels?(), fetchModels?({ search }), lookupModel?(id);                    // the model picker and catalogue
 }
 interface RuntimeSession { agentId; send({ text, images, system, tools, mcpServers, model, onEvent }): Promise<RuntimeRun> }

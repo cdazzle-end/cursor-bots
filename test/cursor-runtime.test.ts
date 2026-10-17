@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
 import { Harness } from "../src/core/harness.ts";
 import { CursorRuntime, type Sdk } from "../src/runtimes/cursor.ts";
-import type { RuntimeEvent } from "../src/runtimes/types.ts";
+import type { AgentRuntime, RuntimeEvent } from "../src/runtimes/types.ts";
 import { settle } from "./helpers.ts";
 
 /**
@@ -104,6 +105,200 @@ function runtime(fake: ReturnType<typeof fakeSdk>, dir: string) {
     openStore: fake.openStore,
   });
 }
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+const nextTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+/** A routing-only SDK fake whose setup and run can each pause independently. */
+function routingRuntime(opts: { pause?: "load" | "store" | "create" | "send" | "wait"; sendError?: Error; waitError?: Error } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cb-cursor-routing-"));
+  const gate = deferred();
+  const entered = { load: deferred(), store: deferred(), create: deferred(), send: deferred(), wait: deferred() };
+  const calls = { loads: 0, stores: 0, creates: [] as any[], sends: [] as string[], waits: 0, cancels: 0, closes: 0, deletes: [] as string[] };
+  const pause = async (phase: keyof typeof entered) => {
+    entered[phase].resolve();
+    if (opts.pause === phase) await gate.promise;
+  };
+  const run = {
+    async cancel() { calls.cancels++; },
+    async wait() {
+      calls.waits++;
+      await pause("wait");
+      if (opts.waitError) throw opts.waitError;
+      return { status: "finished", result: "bot-a" };
+    },
+  };
+  const agent = {
+    agentId: "scratch-agent",
+    async send(prompt: string) {
+      calls.sends.push(prompt);
+      await pause("send");
+      if (opts.sendError) throw opts.sendError;
+      return run;
+    },
+    close() { calls.closes++; },
+  };
+  const sdk = {
+    Agent: {
+      async create(o: unknown) {
+        calls.creates.push(o);
+        await pause("create");
+        return agent;
+      },
+      async delete(id: string) { calls.deletes.push(id); },
+    },
+  } as unknown as Sdk;
+  const rt = new CursorRuntime({
+    apiKey: "key_test",
+    storeDir: path.join(dir, "store"),
+    scratchDir: path.join(dir, "scratch"),
+    settings: () => ({ defaultModel: { id: "composer-2.5" }, autoReview: true, sandbox: false }),
+    loadSdk: async () => { calls.loads++; await pause("load"); return sdk; },
+    openStore: async () => { calls.stores++; await pause("store"); return {} as any; },
+  });
+  // Exercise the same completion contract used by harness routing.
+  const complete: NonNullable<AgentRuntime["complete"]> = rt.complete.bind(rt);
+  return {
+    complete, calls, entered,
+    release: gate.resolve,
+    async cleanup() {
+      gate.resolve();
+      await nextTurn();
+      await rt.dispose();
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+async function assertRoutingAbort(pending: Promise<string>) {
+  const outcome = await Promise.race([
+    pending.then((value) => ({ status: "fulfilled" as const, value }), (error: unknown) => ({ status: "rejected" as const, error })),
+    nextTurn().then(() => ({ status: "pending" as const })),
+  ]);
+  assert.equal(outcome.status, "rejected", "routing must reject on abort without waiting for the SDK");
+  if (outcome.status === "rejected") {
+    assert.ok(outcome.error instanceof Error);
+    assert.equal(outcome.error.name, "AbortError");
+  }
+}
+
+test("Cursor routing: a pre-aborted signal starts no SDK work", async () => {
+  const t = routingRuntime();
+  const ctrl = new AbortController();
+  ctrl.abort();
+  try {
+    await assertRoutingAbort(t.complete("pick a bot", { signal: ctrl.signal }));
+    assert.equal(t.calls.loads, 0);
+    assert.equal(t.calls.stores, 0);
+    assert.equal(t.calls.creates.length, 0);
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test("Cursor routing: abort during setup prevents downstream work and cleans a late agent", async (parent) => {
+  for (const phase of ["load", "store", "create"] as const) {
+    await parent.test(phase, async () => {
+      const t = routingRuntime({ pause: phase });
+      const ctrl = new AbortController();
+      const pending = t.complete("pick a bot", { signal: ctrl.signal });
+      try {
+        await t.entered[phase].promise;
+        ctrl.abort();
+        await assertRoutingAbort(pending);
+        t.release();
+        await nextTurn();
+        assert.equal(t.calls.sends.length, 0, "an abandoned routing prompt must never be sent");
+        if (phase === "load") assert.equal(t.calls.stores, 0);
+        if (phase !== "create") assert.equal(t.calls.creates.length, 0);
+        assert.equal(t.calls.closes, phase === "create" ? 1 : 0);
+        assert.deepEqual(t.calls.deletes, phase === "create" ? ["scratch-agent"] : []);
+        assert.equal(getEventListeners(ctrl.signal, "abort").length, 0);
+      } finally {
+        await t.cleanup();
+      }
+    });
+  }
+});
+
+test("Cursor routing: abort while send is pending cancels its late run", async () => {
+  const t = routingRuntime({ pause: "send" });
+  const ctrl = new AbortController();
+  const pending = t.complete("pick a bot", { signal: ctrl.signal });
+  try {
+    await t.entered.send.promise;
+    ctrl.abort();
+    await assertRoutingAbort(pending);
+    t.release();
+    await nextTurn();
+    assert.equal(t.calls.cancels, 1);
+    assert.equal(t.calls.closes, 1);
+    assert.deepEqual(t.calls.deletes, ["scratch-agent"]);
+    assert.equal(getEventListeners(ctrl.signal, "abort").length, 0);
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test("Cursor routing: abort rejects promptly when cancelling does not settle wait", async () => {
+  const t = routingRuntime({ pause: "wait" });
+  const ctrl = new AbortController();
+  const pending = t.complete("pick a bot", { signal: ctrl.signal });
+  try {
+    await t.entered.wait.promise;
+    ctrl.abort();
+    await assertRoutingAbort(pending);
+    assert.equal(t.calls.cancels, 1);
+    assert.equal(t.calls.closes, 1);
+    assert.deepEqual(t.calls.deletes, ["scratch-agent"]);
+    assert.equal(getEventListeners(ctrl.signal, "abort").length, 0);
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test("Cursor routing: a completed answer keeps cleanup and removes the abort listener", async () => {
+  const t = routingRuntime();
+  const ctrl = new AbortController();
+  try {
+    assert.equal(await t.complete("pick a bot", { model: { id: "gpt-5.5" }, signal: ctrl.signal }), "bot-a");
+    assert.equal(t.calls.creates[0].model.id, "gpt-5.5");
+    assert.deepEqual(t.calls.creates[0].tools, []);
+    assert.deepEqual(t.calls.creates[0].local.settingSources, []);
+    assert.equal(t.calls.closes, 1);
+    assert.deepEqual(t.calls.deletes, ["scratch-agent"]);
+    assert.equal(getEventListeners(ctrl.signal, "abort").length, 0);
+    ctrl.abort();
+    assert.equal(t.calls.cancels, 0, "a later abort must not cancel a completed run");
+  } finally {
+    await t.cleanup();
+  }
+});
+
+test("Cursor routing: send and wait failures preserve the error and clean the scratch agent", async (parent) => {
+  for (const phase of ["send", "wait"] as const) {
+    await parent.test(phase, async () => {
+      const error = new Error(`${phase} failed`);
+      const t = routingRuntime(phase === "send" ? { sendError: error } : { waitError: error });
+      const ctrl = new AbortController();
+      try {
+        await assert.rejects(t.complete("pick a bot", { signal: ctrl.signal }), (err) => err === error);
+        assert.equal(t.calls.closes, 1);
+        assert.deepEqual(t.calls.deletes, ["scratch-agent"]);
+        assert.equal(getEventListeners(ctrl.signal, "abort").length, 0);
+        ctrl.abort();
+        assert.equal(t.calls.cancels, 0);
+      } finally {
+        await t.cleanup();
+      }
+    });
+  }
+});
 
 test("Cursor runtime: create, custom tools, streaming, outcome mapping", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cb-cursor-"));

@@ -73,6 +73,31 @@ async function openSqliteStore(o: { workspaceRef: string; stateRoot: string }): 
   return SqliteLocalAgentStore.open(o);
 }
 
+/** The SDK cannot abort setup/send, so stop waiting and clean up anything returned later. */
+async function routingStep<T>(start: () => Promise<T>, signal?: AbortSignal, onLate?: (value: T) => void): Promise<T> {
+  const cancelled = () => new DOMException("Cursor routing cancelled.", "AbortError");
+  if (signal?.aborted) throw cancelled();
+  if (!signal) return start();
+  const pending = start().then((value) => {
+    if (signal.aborted) {
+      onLate?.(value);
+      throw cancelled();
+    }
+    return value;
+  });
+  let onAbort!: () => void;
+  const stopped = new Promise<never>((_, reject) => {
+    onAbort = () => reject(cancelled());
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([pending, stopped]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
 /**
  * Bots run on the Cursor SDK's *local* runtime: the agent loop runs inside
  * this process, files come from the shared workspace on disk, and inference
@@ -160,24 +185,41 @@ export class CursorRuntime implements AgentRuntime {
     return new CursorSession(agent, model);
   }
 
-  async complete(prompt: string, opts?: { model?: ModelChoice }): Promise<string> {
-    const sdk = await this.load();
-    fs.mkdirSync(this.opts.scratchDir, { recursive: true });
-    const scratchStore = await this.storeFor(this.opts.scratchDir, path.join(this.opts.scratchDir, ".store"));
-    const agent = await sdk.Agent.create({
+  async complete(prompt: string, opts?: { model?: ModelChoice; signal?: AbortSignal }): Promise<string> {
+    const signal = opts?.signal;
+    const sdk = await routingStep(() => this.load(), signal);
+    const scratchStore = await routingStep(() => {
+      fs.mkdirSync(this.opts.scratchDir, { recursive: true });
+      return this.storeFor(this.opts.scratchDir, path.join(this.opts.scratchDir, ".store"));
+    }, signal);
+    const cleanup = (agent: SDKAgent) => {
+      try {
+        agent.close();
+      } finally {
+        sdk.Agent.delete(agent.agentId, { cwd: this.opts.scratchDir, store: scratchStore }).catch(() => {});
+      }
+    };
+    const agent = await routingStep(() => sdk.Agent.create({
       apiKey: this.apiKey(),
       name: "cursor-bots-router",
       model: opts?.model ?? this.opts.settings().defaultModel,
       tools: [],
       local: { cwd: this.opts.scratchDir, store: scratchStore, settingSources: [] },
-    });
+    }), signal, cleanup);
     try {
-      const run = await agent.send(prompt);
-      const result = await run.wait();
-      return result.result ?? "";
+      const cancel = (run: Run) => { run.cancel().catch(() => {}); };
+      const run = await routingStep(() => agent.send(prompt), signal, cancel);
+      const onAbort = () => cancel(run);
+      if (signal?.aborted) onAbort();
+      else signal?.addEventListener("abort", onAbort, { once: true });
+      try {
+        const result = await routingStep(() => run.wait(), signal);
+        return result.result ?? "";
+      } finally {
+        signal?.removeEventListener("abort", onAbort);
+      }
     } finally {
-      agent.close();
-      sdk.Agent.delete(agent.agentId, { cwd: this.opts.scratchDir, store: scratchStore }).catch(() => {});
+      cleanup(agent);
     }
   }
 
