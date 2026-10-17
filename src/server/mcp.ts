@@ -58,10 +58,11 @@ export function mcpTools(h: Harness): Tool[] {
         required: ["to", "text"],
       },
       async run(args, client) {
+        const message = required(args, "text");
         const conv = resolve(args.to);
         if (!conv) return `No bot or group called ${args.to}. Call list_bots first.`;
         const wait = Math.min(900, Math.max(0, Number(args.wait_seconds ?? 180)));
-        const sent = await h.postUserMessage(conv.id, { text: `${String(args.text)}\n\n(sent via ${client})` });
+        const sent = await h.postUserMessage(conv.id, { text: `${message}\n\n(sent via ${client})` });
         if (!wait) return `Sent to ${h.conversationTitle(conv)}. Read replies later with read_chat.`;
         const reply = await waitForReply(h, conv.id, sent.ts, wait * 1000);
         if (!reply.length) return `Sent. No reply within ${wait}s; the bot may still be working. Check later with read_chat("${args.to}").`;
@@ -93,11 +94,18 @@ export function mcpTools(h: Harness): Tool[] {
         required: ["name", "job"],
       },
       async run(args) {
-        const b = h.createBot({ name: String(args.name), label: args.label ? String(args.label) : undefined, about: String(args.job) });
+        const b = h.createBot({ name: required(args, "name"), label: args.label ? String(args.label) : undefined, about: required(args, "job") });
         return `Created @${b.handle}. Message it with message_bot("@${b.handle}", ...).`;
       },
     },
   ];
+}
+
+/** A required text argument. Clients don't always check the schema, and "undefined" must never reach a bot. */
+function required(args: Record<string, any>, name: string): string {
+  const v = args?.[name];
+  if (typeof v !== "string" || !v.trim()) throw new Error(`${name} is required (a non-empty string).`);
+  return v;
 }
 
 /** Resolve with the bot replies posted after `afterTs`, once the bots in that chat go quiet. */

@@ -250,3 +250,29 @@ test("Files: a broken symlink doesn't hide its folder, any file name opens, and 
     await s.close();
   }
 });
+
+test("Team MCP: a call missing a required argument is an error, and nothing reaches the bots", async () => {
+  const s = await boot();
+  try {
+    const bot = s.h.createBot({ name: "Critic" });
+    const call = async (name: string, args: unknown) => {
+      const res = await fetch(s.base + "/mcp", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${s.h.mcpToken}` },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }),
+      });
+      return (await res.json()).result;
+    };
+    const noText = await call("message_bot", { to: "@critic", wait_seconds: 0 });
+    assert.equal(noText.isError, true);
+    assert.match(noText.content[0].text, /text is required/);
+    assert.equal(s.h.store.messages(s.h.store.dmFor(bot.id)!.id).filter((m) => m.author.kind === "user").length, 0, "no message was posted");
+
+    const noJob = await call("create_bot", { name: "Helper" });
+    assert.equal(noJob.isError, true);
+    assert.equal((await call("create_bot", { job: "Help" })).isError, true);
+    assert.equal(s.h.store.bots.size, 1, "no bot was created");
+  } finally {
+    await s.close();
+  }
+});
