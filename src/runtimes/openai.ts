@@ -1263,15 +1263,16 @@ export function normalizeCatalogModel(x: any): CatalogModel | undefined {
   if (label) m.label = label.trim();
   const ctx = posInt(x.context_length, x.max_model_len, x.context_window, x.max_context_length, x.top_provider?.context_length, x.loaded_instances?.[0]?.config?.context_length);
   if (ctx) m.contextWindow = ctx;
-  const out = posInt(x.max_completion_tokens, x.top_provider?.max_completion_tokens, x.max_output_tokens);
+  const out = posInt(x.max_completion_tokens, x.top_provider?.max_completion_tokens, x.max_output_tokens, x.max_output_length);
   if (out) m.maxOutputTokens = out;
   const modalities = [x.architecture?.input_modalities, x.input_modalities, x.modalities?.input].find(Array.isArray) as unknown[] | undefined;
   const vision = flag(x.features?.image_input, x.vision_supported, x.capabilities?.vision, x.vision) ?? (modalities ? modalities.includes("image") : undefined);
   if (vision !== undefined) m.vision = vision;
-  const supported = Array.isArray(x.supported_parameters) ? (x.supported_parameters as unknown[]) : undefined;
+  // Lists of what a model takes: supported_parameters (OpenRouter style), supported_features (Phala).
+  const lists = [x.supported_parameters, x.supported_features].filter(Array.isArray) as unknown[][];
   const tools =
-    flag(x.features?.tool_use, x.capabilities?.function_calling, x.capabilities?.tool_use, x.capabilities?.tools, x.trained_for_tool_use, x.capabilities?.trained_for_tool_use) ??
-    (supported ? supported.includes("tools") : undefined);
+    flag(x.features?.tool_use, x.capabilities?.function_calling, x.capabilities?.function_call, x.capabilities?.tool_use, x.capabilities?.tools, x.trained_for_tool_use, x.capabilities?.trained_for_tool_use) ??
+    (lists.length ? lists.some((l) => l.includes("tools")) : undefined);
   if (tools !== undefined) m.toolUse = tools;
   const cost = posInt(x.concurrency_cost);
   if (cost) m.concurrencyCost = cost;

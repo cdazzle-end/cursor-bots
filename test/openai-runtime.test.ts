@@ -1708,6 +1708,10 @@ test("fetchModels() reads any list shape and normalizes the fields; lookupModel(
       { id: "Qwen/Qwen3-8B", object: "model", max_model_len: 40960 },
       { id: "mistral-large-latest", max_context_length: 131072, capabilities: { function_calling: true, vision: false } },
       { id: "llama-3.1-8b-instant", context_window: 131072 },
+      // Phala: max_output_length, top-level input_modalities, supported_features.
+      { id: "z-ai/glm-5.2", name: "Z.ai: GLM 5.2", context_length: 1048576, max_output_length: 131072, input_modalities: ["text"], supported_features: ["reasoning", "tools"], supported_parameters: [] },
+      // Routeway: capabilities.function_call.
+      { id: "gpt-6.1-sol", name: "OpenAI: GPT 6.1 Sol", context_length: 1050000, capabilities: { vision: true, function_call: true } },
     ];
     const expected = [
       { id: "google/gemma-4-31B-it", contextWindow: 32768, maxOutputTokens: 32768, vision: true, toolUse: true, concurrencyCost: 2 },
@@ -1715,6 +1719,8 @@ test("fetchModels() reads any list shape and normalizes the fields; lookupModel(
       { id: "Qwen/Qwen3-8B", contextWindow: 40960 },
       { id: "mistral-large-latest", contextWindow: 131072, vision: false, toolUse: true },
       { id: "llama-3.1-8b-instant", contextWindow: 131072 },
+      { id: "z-ai/glm-5.2", label: "Z.ai: GLM 5.2", contextWindow: 1048576, maxOutputTokens: 131072, vision: false, toolUse: true },
+      { id: "gpt-6.1-sol", label: "OpenAI: GPT 6.1 Sol", contextWindow: 1050000, vision: true, toolUse: true },
     ];
     server.push(
       (r, res) => json(res, 200, { object: "list", data: entries }),

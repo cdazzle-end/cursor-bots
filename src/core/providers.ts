@@ -54,6 +54,28 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     models: [],
   },
   {
+    key: "phala",
+    label: "Phala (confidential AI)",
+    baseUrl: "https://inference.phala.com/v1",
+    keyEnv: "PHALA_API_KEY",
+    needsKey: true,
+    maxConcurrency: 4,
+    toolMode: "auto",
+    models: [],
+  },
+  {
+    key: "routeway",
+    label: "Routeway",
+    baseUrl: "https://api.routeway.ai/v1",
+    keyEnv: "ROUTEWAY_API_KEY",
+    needsKey: true,
+    maxConcurrency: 4,
+    toolMode: "auto",
+    // Its catalogue lists max_completion_tokens; the runtime switches if a model wants max_tokens.
+    maxTokensParam: "max_completion_tokens",
+    models: [],
+  },
+  {
     key: "xai",
     label: "xAI (Grok)",
     baseUrl: "https://api.x.ai/v1",

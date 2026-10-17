@@ -4,9 +4,9 @@ The lead (Claude) maintains this file. Contributors change only the **Status** l
 
 ## Current state
 
-Last updated by the lead on 2026-10-17 at integration-branch commit `53ee7a9`. Session notes: `docs/worklog/2026-10-17-claude-runtime-backlog.md`.
+Last updated by the lead on 2026-10-17. Session notes are the newest files in `docs/worklog/`.
 
-- **Integration branch:** `claude/tender-cori-t1ksnz` (also the default branch). `npm run typecheck && npm test` is clean, with 170 tests.
+- **Integration branch:** `claude/tender-cori-t1ksnz` (also the default branch). `npm run typecheck && npm test` is clean, with 181 tests.
 - **What the product is.** A self-hosted, Grok-Bot-style team of persistent AI bots:
   - each bot has its own chat, memory, skills, routines and approvals;
   - bots message each other and work in groups;
@@ -16,7 +16,7 @@ Last updated by the lead on 2026-10-17 at integration-branch commit `53ee7a9`. S
 - **What was built most recently: provider brains.** Bots can run on any OpenAI-compatible chat API instead of the Cursor SDK. The first target is Featherless AI; OpenRouter, xAI, OpenAI, Groq, Together, DeepInfra, Ollama, LM Studio and custom URLs are presets too. The owner has a Featherless key and wants to run open models such as Qwen3 on it, then add other providers.
 - **Never run against a real service.** Neither the Cursor runtime nor the provider runtime has been run against a real service; all testing used local fakes (see B6 and B7).
 - **Review status.** An adversarial review of provider brains found 32 confirmed defects. All are fixed, each with a regression test (the last five were B1–B5).
-- **Next up.** B6 and B7 need the owner. B8 is a list of small gaps, each with the lead's decision.
+- **Next up.** B6, the live check of Featherless, Phala and Routeway with `npm run live`, needs the owner's keys. B7 (Cursor) needs a Cursor key. Nothing else is open. Ask the lead (or the owner) for the next feature rather than inventing one.
 
 ### Map of the provider-brain code
 
@@ -101,10 +101,19 @@ Status values:
 - **Suggested fix:** use the same upper clamp as `learnOverflow` (4) and keep a floor from the last overflow (`q.overflowRatio`). Optionally count non-ASCII characters at about 1 token each.
 - **Done when:** a test where an overflow teaches a ratio of about 3.5, followed by successful replies, keeps the ratio at least that high.
 
-### B6. Live smoke test with Featherless (needs the owner)
+### B6. Live check of Featherless, Phala and Routeway (needs the owner's keys)
 
-- **Status:** Blocked: needs the owner's key in the session environment (`FEATHERLESS_API_KEY`). Agents never store it.
-- **Checklist,** to run on a scratch home (`node src/cli.ts start --home /tmp/cb-live --runtime mock`), and to report in a worklog without the key:
+- **Status:** Blocked: needs the keys in the environment of whoever runs it: `FEATHERLESS_API_KEY`, `PHALA_API_KEY` (base URL `https://inference.phala.com/v1`) and `ROUTEWAY_API_KEY` (`https://api.routeway.ai/v1`). Agents never store keys or ask for them in chat. On 2026-10-17 all three model lists answered from the lead's cloud session (no key needed for those), so the network isn't the blocker; the keys are.
+- **The automatic part:** `npm run live` (`scripts/live-providers.ts`).
+  - For each provider whose key is set, it checks four things: the catalogue loads, one test prompt answers, a bot reads a file with `read_file` and reports a word only that file holds, and `git push` stops for approval.
+  - It prints PASS/FAIL/SKIP lines, never the key, and exits non-zero on a failure.
+  - It uses a scratch home, removed afterwards. `npm run live -- featherless` runs one provider.
+  - Phala and Routeway have no default model: set `LIVE_MODEL_PHALA` / `LIVE_MODEL_ROUTEWAY` to a model id from their catalogue. Otherwise the script picks a free model that can call tools, if the catalogue has one.
+- **Where to run it:**
+  - **Simplest:** on the owner's own computer, with the keys exported in that terminal.
+  - **In a Claude Code cloud session:** the keys go in that environment's settings (the cloud environment menu in the session title bar → Edit), and only a new session sees them.
+  - **Codex's environment:** the lead has no evidence of how it is configured.
+- **By hand,** for Featherless, on a scratch home (`node src/cli.ts start --home /tmp/cb-live --runtime mock`). Report each in a worklog, without the key:
   1. Add the Featherless preset; **Save and test** answers.
   2. `npm run doctor` reports the provider and its test prompt.
   3. A bot on Qwen/Qwen3-32B answers a DM, uses `read_file` and `shell`, and stops for approval on `git push`.
@@ -122,14 +131,14 @@ Status values:
 
 ### B8. Smaller known gaps (ask the lead before starting any of these)
 
-- **Status:** In review: codex/cursor-routing-cancellation @ c9cac02 (Cursor cancellation only; owner selected it on 2026-10-17. Other items still need a lead decision.)
+- **Status:** Done or decided (2026-10-17). Nothing here is open for work without a new lead decision.
 - **Items:**
-  - `CursorRuntime.complete()` ignores the new `signal` option.
-  - Tool descriptions from MCP servers are cut at 4000 characters but not redacted.
-  - `web_fetch` ignores `HTTPS_PROXY`, because it pins the checked address. Behind a mandatory proxy, bots fall back to `curl`.
-  - Without a search term, only the first page of Featherless's catalogue is read.
-  - Group routing on a reasoning model (Qwen3 thinks by default) can take most of its 25 s deadline. Possible preset change: a routing model, or `{"chat_template_kwargs": {"enable_thinking": false}}` for routing calls.
-  - `.claude/worktrees/` holds old, merged worktrees from parallel agents. It's gitignored; remove them with `git worktree remove`.
+  - **`CursorRuntime.complete()` ignores the `signal` option.** Done by Codex (owner's pick), reviewed and merged in 2f5feb8.
+  - **MCP tool descriptions weren't redacted.** Done @ 1429d06.
+  - **`web_fetch` ignores `HTTPS_PROXY`.** Won't fix: pinning the checked address is what stops DNS rebinding. Behind a mandatory proxy, bots use `curl` in the shell (text-gated).
+  - **Featherless's unsearched catalogue is only the first page.** Won't fix: the editor shows "narrow the search", and searching (`q=`) reaches every model.
+  - **Group routing on a reasoning model is slow.** No code change: the deadline now aborts the call and frees capacity. Recommend setting a fast routing model (Settings → Brain & models → the provider → Routing model), or extra request fields with `{"chat_template_kwargs": {"enable_thinking": false}}` on that model.
+  - **Old worktrees in `.claude/worktrees/`.** Removed by the lead.
 
 ## Adding another provider
 
@@ -146,6 +155,10 @@ A service that is not OpenAI-compatible (for example the Anthropic Messages API 
 ## Decisions
 
 The lead records answers to escalated questions here, newest first.
+
+- 2026-10-17: Phala and Routeway are presets (`PHALA_API_KEY`, `ROUTEWAY_API_KEY`). Routeway asks with `max_completion_tokens`, as its catalogue lists, and the runtime switches per model if needed. No key links are shown, since none were verified.
+- 2026-10-17: B8 resolved (see the item). `web_fetch` keeps pinning addresses over proxy support.
+- 2026-10-17: Codex's Cursor routing cancellation was accepted. Owner-selected work may skip the "ask the lead first" step; it still comes in on a `codex/` branch for review.
 
 - 2026-10-17: Contributors work on `codex/<topic>` branches; only the lead merges into the integration branch (`docs/COLLABORATION.md`).
 - 2026-10-17: Outside prompt mode, a text tool call counts only when the calls end the reply, and a fenced bare-JSON call is an example. Quoted calls never run, in any mode.

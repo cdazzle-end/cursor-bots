@@ -85,6 +85,12 @@ test("providers: a preset becomes a brain; its key is write-only and kept away f
     assert.ok(s.h.touchesHarness("cat ../state/provider-keys.vault"));
     assert.ok(s.h.touchesHarness("base64 provider-keys.json"));
 
+    // Phala and Routeway presets are valid providers with their own key variables.
+    const phala = s.h.createProvider({ preset: "phala" });
+    assert.deepEqual([phala.id, phala.baseUrl, phala.keyEnv], ["phala", "https://inference.phala.com/v1", "PHALA_API_KEY"]);
+    const routeway = s.h.createProvider({ preset: "routeway" });
+    assert.deepEqual([routeway.id, routeway.baseUrl, routeway.keyEnv, routeway.maxTokensParam], ["routeway", "https://api.routeway.ai/v1", "ROUTEWAY_API_KEY", "max_completion_tokens"]);
+
     // A second provider from the same preset gets its own id.
     assert.equal(s.h.createProvider({ preset: "featherless" }).id, "featherless-2");
     // Reserved and invalid input.
