@@ -1,6 +1,8 @@
 # Working on this repo
 
-Cursor Bots is a Grok-Bot-style harness on the Cursor SDK. Read `docs/ARCHITECTURE.md` before changing behavior.
+Cursor Bots is a Grok-Bot-style harness on the Cursor SDK (bots can also run on any OpenAI-compatible model API). Read `docs/ARCHITECTURE.md` before changing behavior.
+
+Work in progress: `docs/HANDOFF.md` lists where the model-provider work stands and what is left, in priority order.
 
 - TypeScript runs directly on Node 22.18+ (type stripping): use erasable syntax only (no enums, namespaces or constructor parameter properties) and import local files with the `.ts` extension.
 - `web/` is plain ES modules with no build step. Keep it dependency-free.
