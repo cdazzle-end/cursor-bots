@@ -10,6 +10,11 @@ export interface ApprovalHost {
   onDeferredDecision(approval: Approval): void;
 }
 
+/** The rule "Always allow" saves: this text and nothing else. */
+function exactPattern(subject: string): string {
+  return `^${escapeRegExp(subject.trim())}$`;
+}
+
 export type GateResult =
   | { permission: "allow"; approvalId?: Id }
   | { permission: "deny"; approvalId?: Id; reason: "denied" | "pending" | "expired"; message: string };
@@ -53,10 +58,15 @@ export class ApprovalService {
     return this.store.settings.approvals.rules;
   }
 
-  /** Decide whether a subject needs your approval. "ask" rules win over "allow" rules. */
+  /**
+   * Decide whether a subject needs your approval. "ask" rules win over "allow" rules, except an
+   * allow rule for exactly this text (what "Always allow" saves): you approved that very command.
+   */
   evaluate(target: "shell" | "action", subject: string): "allow" | "ask" {
     const { mode } = this.store.settings.approvals;
     if (mode === "off") return "allow";
+    const exact = exactPattern(subject);
+    if (this.rules.some((r) => r.target === target && r.effect === "allow" && r.pattern === exact)) return "allow";
     let allowed = false;
     for (const rule of this.rules) {
       if (rule.target !== target) continue;
@@ -168,7 +178,7 @@ export class ApprovalService {
         id: newId("rule"),
         effect: "allow",
         target: a.kind === "shell" ? "shell" : "action",
-        pattern: `^${escapeRegExp(subject.trim())}$`,
+        pattern: exactPattern(subject),
         note: `Always allowed from an approval card (${a.kind})`,
         createdAt: Date.now(),
       });
@@ -192,17 +202,18 @@ export class ApprovalService {
     return a;
   }
 
-  /** A granted one-time approval is used up by the first matching retry. */
+  /**
+   * A granted one-time approval is used up by the first matching retry. "Always allow" lives in
+   * its rule instead, so deleting the rule in Settings takes it back at once.
+   */
   consumeGrant(botId: Id | undefined, subject: string): Approval | undefined {
     const cutoff = Date.now() - 6 * 3600_000;
     for (const a of this.store.approvals.values()) {
-      if (a.status !== "allowed" || a.consumed || (a.decidedAt ?? 0) < cutoff) continue;
+      if (a.status !== "allowed" || a.decision !== "once" || a.consumed || (a.decidedAt ?? 0) < cutoff) continue;
       if (botId && a.botId !== botId) continue;
       if ((a.command ?? a.title).trim() !== subject.trim()) continue;
-      if (a.decision === "once") {
-        a.consumed = true;
-        this.store.saveApprovals();
-      }
+      a.consumed = true;
+      this.store.saveApprovals();
       return a;
     }
     return undefined;

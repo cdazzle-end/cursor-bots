@@ -1496,7 +1496,7 @@ function openSettings(tab = "general") {
       );
     } else if (t === "approvals") {
       const rules = s.approvals.rules;
-      body.innerHTML = `<div class="muted">Bots ask before consequential actions. Shell commands are checked by a Cursor hook installed in the workspace (for bots on Cursor) or by the gateway itself (for bots on a model provider); other actions go through the bot's request_approval tool. “Ask first” wins when rules conflict.</div>
+      body.innerHTML = `<div class="muted">Bots ask before consequential actions. Shell commands are checked by a Cursor hook installed in the workspace (for bots on Cursor) or by the gateway itself (for bots on a model provider); other actions go through the bot's request_approval tool. “Ask first” wins when rules conflict, except over an “Always allow” rule, which matches only the exact command you allowed.</div>
         <div class="grid2"><div class="field">Mode<select id="a-mode"><option value="auto" ${s.approvals.mode === "auto" ? "selected" : ""}>Auto: only “ask first” rules stop shell commands</option><option value="ask" ${s.approvals.mode === "ask" ? "selected" : ""}>Ask: every shell command stops unless allowed</option><option value="off" ${s.approvals.mode === "off" ? "selected" : ""}>Off: never stop (not recommended)</option></select></div>
         <div class="field">Background approvals expire after (minutes)<input id="a-exp" type="number" min="1" value="${s.approvals.backgroundExpiryMinutes}"></div></div>
         <div class="field">Seconds a bot waits inline for your answer before ending its turn<input id="a-wait" type="number" min="0" max="120" value="${s.approvals.inlineWaitSeconds}"></div>

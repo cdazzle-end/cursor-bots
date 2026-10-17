@@ -968,3 +968,38 @@ test("an answer that was complete before an error is posted, then the error card
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("'Always allow' on a command an ask rule caught keeps it allowed, for exactly that command", async () => {
+  const { h, cleanup } = await makeHarness();
+  try {
+    const bot = h.createBot({ name: "Shipper" });
+    const dm = h.store.dmFor(bot.id)!;
+    await h.postUserMessage(dm.id, { text: "hi" });
+    await settle(h);
+    const gate = (command: string) => h.gateShell({ command, conversation_id: h.store.bots.get(bot.id)!.agentId! });
+
+    assert.equal((await gate("git push origin main")).permission, "deny", "the default git push rule asks");
+    const card = h.approvals.pendingFor(bot.id)[0]!;
+    h.decideApproval(card.id, "always");
+    await settle(h);
+    // A day later: the saved rule is what allows it, not a recent grant.
+    card.decidedAt = Date.now() - 24 * 3600_000;
+    assert.equal((await gate("git push origin main")).permission, "allow");
+    assert.equal(h.approvals.pendingFor(bot.id).length, 0, "no new card");
+
+    // Only that exact command: the ask rule still catches anything else.
+    for (const other of ["git push origin main --force", "git push origin main; rm -rf ~", "GIT PUSH ORIGIN MAIN", "git push origin dev"]) {
+      assert.equal((await gate(other)).permission, "deny", other);
+    }
+    // A broader allow rule still loses to an ask rule.
+    h.store.settings.approvals.rules.push({ id: "rule_broad", effect: "allow", target: "shell", pattern: "^git push", createdAt: Date.now() });
+    assert.equal((await gate("git push origin staging")).permission, "deny");
+
+    // Deleting the saved rule in Settings takes effect at once, even right after the decision.
+    card.decidedAt = Date.now();
+    h.store.settings.approvals.rules = h.store.settings.approvals.rules.filter((r) => r.pattern !== "^git push origin main$");
+    assert.equal((await gate("git push origin main")).permission, "deny");
+  } finally {
+    await cleanup();
+  }
+});
