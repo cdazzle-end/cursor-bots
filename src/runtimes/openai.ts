@@ -805,9 +805,14 @@ function parseCallBody(body: string): TextToolCall[] {
   return out;
 }
 
-/** A reply that is nothing but a call written as bare JSON ({"name": ..., "arguments": {...}}). */
-function parseBareCall(text: string, known: Set<string>): TextToolCall[] | undefined {
-  const s = stripFences(text.trim())
+/**
+ * A reply that is nothing but a call written as bare JSON ({"name": ..., "arguments": {...}}).
+ * Outside prompt mode a fenced one is an example being shown, not a call.
+ */
+function parseBareCall(text: string, known: Set<string>, promptMode: boolean): TextToolCall[] | undefined {
+  const t = text.trim();
+  if (!promptMode && t.startsWith("```")) return undefined;
+  const s = stripFences(t)
     .replace(/^tool_call\s*/i, "")
     .trim();
   if (!s.startsWith("{") && !s.startsWith("[")) return undefined;
@@ -829,18 +834,36 @@ function parseBareCall(text: string, known: Set<string>): TextToolCall[] | undef
   return calls;
 }
 
+/** Where the model shows text rather than says it: ``` fences, `inline code` and "> " quoted lines. */
+function quotedRanges(text: string): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
+  for (const m of text.matchAll(/```[\s\S]*?(?:```|$)/g)) out.push([m.index, m.index + m[0].length]);
+  const inFence = (i: number) => out.some(([a, b]) => i >= a && i < b);
+  for (const m of text.matchAll(/`[^`\n]+`/g)) if (!inFence(m.index)) out.push([m.index, m.index + m[0].length]);
+  for (const m of text.matchAll(/^[ \t]*>.*$/gm)) if (!inFence(m.index)) out.push([m.index, m.index + m[0].length]);
+  return out;
+}
+
 /**
- * Tool calls written into the reply text. In prompt mode every block counts
- * (a broken one becomes an error for the model to fix); otherwise only
- * well-formed calls to known tools do, so ordinary prose is never executed.
+ * Tool calls written into the reply text. A call inside a code fence, inline
+ * code or a quote is being shown (a page or file the model is quoting can
+ * contain one), so it never runs; in prompt mode a reply that is a single fence
+ * still counts. In prompt mode every other block counts (a broken one becomes
+ * an error for the model to fix). Otherwise only well-formed calls to known
+ * tools count, and only when the calls are the reply or end it.
  */
 export function extractToolCalls(text: string, known: Set<string>, promptMode: boolean): { calls: TextToolCall[]; rest: string } {
   const calls: TextToolCall[] = [];
   let rest = "";
   let pos = 0;
+  const whole = text.trim();
+  const oneFence = promptMode && whole.startsWith("```") && whole.endsWith("```") && whole.split("```").length === 3;
+  const quoted = oneFence ? [] : quotedRanges(text);
   const re = /<tool_call>|\[TOOL_REQUEST\]|<function=([^>\s]+)>/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text))) {
+    const at = m.index;
+    if (quoted.some(([a, b]) => at >= a && at < b)) continue;
     const open = m[0];
     const close = open === "<tool_call>" ? "</tool_call>" : open === "[TOOL_REQUEST]" ? "[END_TOOL_REQUEST]" : "</function>";
     const bodyStart = m.index + open.length;
@@ -862,9 +885,12 @@ export function extractToolCalls(text: string, known: Set<string>, promptMode: b
     }
     re.lastIndex = blockEnd;
   }
-  rest += text.slice(pos);
+  const tail = text.slice(pos);
+  rest += tail;
+  // A native-mode model that writes its calls as text ends its reply with them; calls followed by more prose are being discussed.
+  if (!promptMode && calls.length && tail.trim()) return { calls: [], rest: text };
   if (!calls.length) {
-    const bare = parseBareCall(text, known);
+    const bare = parseBareCall(text, known, promptMode);
     if (bare) return { calls: bare, rest: "" };
   }
   return { calls, rest };

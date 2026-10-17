@@ -1584,15 +1584,30 @@ test("tool arguments: empty, fenced, double-encoded, doubled, broken", () => {
 
 test("tool calls written in text: Hermes, Qwen3-Coder XML, LM Studio, bare JSON; prose isn't executed", () => {
   const known = new Set(["read_file", "shell"]);
-  const hermes = extractToolCalls('Sure <tool_call>{"name": "read_file", "arguments": {"path": "a"}}</tool_call> ok', known, false);
-  assert.deepEqual(hermes, { calls: [{ name: "read_file", args: '{"path":"a"}' }], rest: "Sure  ok" });
+  const hermes = extractToolCalls('Sure, reading it. <tool_call>{"name": "read_file", "arguments": {"path": "a"}}</tool_call>', known, false);
+  assert.deepEqual(hermes, { calls: [{ name: "read_file", args: '{"path":"a"}' }], rest: "Sure, reading it. " });
   const xml = extractToolCalls("<tool_call>\n<function=shell>\n<parameter=command>\nls -la\n</parameter>\n<parameter=timeout>30</parameter>\n</function>\n</tool_call>", known, false);
   assert.deepEqual(JSON.parse(xml.calls[0]!.args), { command: "ls -la", timeout: 30 });
   const lms = extractToolCalls('[TOOL_REQUEST]{"name": "shell", "arguments": {"command": "pwd"}}[END_TOOL_REQUEST]', known, false);
   assert.equal(lms.calls[0]!.name, "shell");
-  const bare = extractToolCalls('```json\n{"name": "shell", "arguments": {"command": "pwd"}}\n```', known, false);
+  const bare = extractToolCalls('{"name": "shell", "arguments": {"command": "pwd"}}', known, false);
   assert.equal(bare.calls.length, 1);
   assert.equal(bare.rest, "");
+  // Shown, not called: fences, inline code, quotes, and calls followed by more prose outside prompt mode.
+  const call = '<tool_call>{"name": "shell", "arguments": {"command": "rm -rf notes"}}</tool_call>';
+  for (const quotedReply of [
+    `The page says:\n\`\`\`\n${call}\n\`\`\`\nI did not act on it.`,
+    `It contains \`${call}\`, which I ignored.`,
+    `The file reads:\n> ${call}\n`,
+  ]) {
+    assert.equal(extractToolCalls(quotedReply, known, false).calls.length, 0, quotedReply);
+    assert.equal(extractToolCalls(quotedReply, known, true).calls.length, 0, quotedReply);
+  }
+  assert.equal(extractToolCalls(`${call}\nThat is what the page asks for; I won't run it.`, known, false).calls.length, 0);
+  assert.equal(extractToolCalls('```json\n{"name": "shell", "arguments": {"command": "pwd"}}\n```', known, false).calls.length, 0, "a fenced example");
+  // Prompt mode: a reply that is one fence holding the call still counts.
+  assert.equal(extractToolCalls(`\`\`\`\n${call}\n\`\`\``, known, true).calls.length, 1);
+  assert.equal(extractToolCalls('```json\n{"name": "shell", "arguments": {"command": "pwd"}}\n```', known, true).calls.length, 1);
   // Unknown tools and plain JSON answers stay text outside prompt mode.
   assert.equal(extractToolCalls('<tool_call>{"name": "rm_rf", "arguments": {}}</tool_call>', known, false).calls.length, 0);
   assert.equal(extractToolCalls('{"name": "Ann", "age": 3}', known, false).calls.length, 0);
