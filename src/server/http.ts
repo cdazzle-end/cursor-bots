@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as path from "node:path";
+import { pipeline } from "node:stream";
 import { fileURLToPath } from "node:url";
 import type { Harness, BotTemplate } from "../core/harness.ts";
 import { PROVIDER_PRESETS } from "../core/providers.ts";
@@ -171,28 +172,39 @@ export function createServer(h: Harness, opts: ServerOptions): http.Server {
   route("GET", "/api/files", ({ url }) => {
     const rel = url.searchParams.get("path") ?? "";
     const abs = resolveInside(h.store.paths.workspace, rel);
-    const entries = fs.readdirSync(abs, { withFileTypes: true }).map((e) => {
-      const st = fs.statSync(path.join(abs, e.name));
-      return { name: e.name, dir: e.isDirectory(), size: st.size, mtime: st.mtimeMs };
+    const entries = fs.readdirSync(abs, { withFileTypes: true }).flatMap((e) => {
+      const st = entryStat(path.join(abs, e.name));
+      return st ? [{ name: e.name, dir: e.isDirectory(), size: st.size, mtime: st.mtimeMs }] : [];
     });
     entries.sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name));
     return { path: path.relative(h.store.paths.workspace, abs), entries };
   });
   route("GET", "/api/files/raw", ({ url, res }) => {
     const abs = resolveInside(h.store.paths.workspace, url.searchParams.get("path") ?? "");
-    const st = fs.statSync(abs);
-    if (!st.isFile()) throw new HttpError(400, "Not a file");
+    // Opened before answering, so an unreadable file gets an error reply. Non-blocking, so a FIFO
+    // can't hang the gateway; fstat then checks what was really opened.
+    const fd = fs.openSync(abs, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0));
+    let st: fs.Stats;
+    try {
+      st = fs.fstatSync(fd);
+      if (!st.isFile()) throw new HttpError(400, "Not a file");
+    } catch (err) {
+      fs.closeSync(fd);
+      throw err;
+    }
     const mime = mimeFor(abs);
     // Serve HTML and SVG as plain text so a file a bot wrote can't script this app.
     const safe = /^(text\/html|image\/svg)/.test(mime) ? "text/plain; charset=utf-8" : mime;
     res.writeHead(200, {
       "content-type": safe,
       "content-length": st.size,
-      "content-disposition": `${url.searchParams.get("download") ? "attachment" : "inline"}; filename="${path.basename(abs).replace(/"/g, "")}"`,
+      "content-disposition": contentDisposition(url.searchParams.get("download") ? "attachment" : "inline", path.basename(abs)),
       "x-content-type-options": "nosniff",
       "content-security-policy": "default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'; sandbox",
     });
-    fs.createReadStream(abs).pipe(res);
+    // A read that fails part way (a disk error, /proc) cuts the reply short instead of crashing the
+    // gateway, and a viewer that goes away closes the file.
+    pipeline(fs.createReadStream("", { fd }), res, () => {});
     return KEEP_OPEN;
   });
   route("PUT", "/api/files/raw", async ({ url, raw }) => {
@@ -439,6 +451,25 @@ export function createServer(h: Harness, opts: ServerOptions): http.Server {
 }
 
 const KEEP_OPEN = Symbol("keep-open");
+
+/** A folder entry's details. A broken or looping symlink describes itself; an entry that vanished is left out. */
+function entryStat(p: string): fs.Stats | undefined {
+  try {
+    return fs.statSync(p);
+  } catch {
+    try {
+      return fs.lstatSync(p);
+    } catch {
+      return undefined;
+    }
+  }
+}
+
+/** Content-Disposition for any file name: an ASCII fallback plus the exact UTF-8 name (RFC 6266). */
+function contentDisposition(type: "inline" | "attachment", name: string): string {
+  const fallback = name.replace(/[^\x20-\x7e]|["\\]/g, "_");
+  return `${type}; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(name).replace(/['()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase())}`;
+}
 
 function serveStatic(req: http.IncomingMessage, res: http.ServerResponse, url: URL, setToken?: string): void {
   let rel = decodeURIComponent(url.pathname);

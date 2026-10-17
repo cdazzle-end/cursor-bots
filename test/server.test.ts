@@ -218,3 +218,35 @@ test("Team MCP: outside agents can list bots, message one and get its reply", as
     await s.close();
   }
 });
+
+test("Files: a broken symlink doesn't hide its folder, any file name opens, and a failed read doesn't take the gateway down", async () => {
+  const s = await boot();
+  try {
+    const ws = s.h.store.paths.workspace;
+    // A browser profile keeps SingletonLock as a symlink to a name that isn't a file.
+    fs.mkdirSync(path.join(ws, "profile"));
+    fs.writeFileSync(path.join(ws, "profile", "Preferences"), "{}");
+    fs.symlinkSync("myhost-1234", path.join(ws, "profile", "SingletonLock"));
+    const listing = await s.call("GET", "/api/files?path=profile");
+    assert.equal(listing.status, 200);
+    assert.deepEqual(listing.data.entries.map((e: any) => e.name).sort(), ["Preferences", "SingletonLock"]);
+
+    fs.writeFileSync(path.join(ws, "报告 \"v2\".md"), "# 你好");
+    const raw = await fetch(s.base + "/api/files/raw?download=1&path=" + encodeURIComponent("报告 \"v2\".md"));
+    assert.equal(raw.status, 200);
+    assert.equal(await raw.text(), "# 你好");
+    const disposition = raw.headers.get("content-disposition") ?? "";
+    assert.match(disposition, /^attachment; filename="__ _v2_\.md"; filename\*=UTF-8''/);
+    assert.equal(decodeURIComponent(disposition.split("UTF-8''")[1]!), "报告 \"v2\".md");
+
+    if (fs.existsSync("/proc/self/mem")) {
+      // stat says it's a file; reading it fails with EIO.
+      fs.symlinkSync("/proc/self/mem", path.join(ws, "mem.txt"));
+      await fetch(s.base + "/api/files/raw?path=mem.txt").then((r) => r.arrayBuffer()).catch(() => undefined);
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal((await s.call("GET", "/api/files?path=profile")).status, 200, "the gateway still answers");
+    }
+  } finally {
+    await s.close();
+  }
+});
