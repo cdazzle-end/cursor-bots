@@ -409,6 +409,7 @@ const CONTEXT_RE =
   /context_length_exceeded|exceed_context_size|context length|context window|context size|maximum context|exceeds the available context|larger than the max context|reduce the length|too many tokens|prompt is too long|input is too long|prompt too long|maximum prompt length|max_model_len/;
 const TOOLS_RE =
   /does not support tools|doesn'?t support tools|tools? (?:is|are) not supported|tool[_ ]use is not supported|tool calling is not supported|function calling is not supported|does not support function|enable-auto-tool-choice|"auto" tool choice|tool[_ ]choice.{0,40}not supported|tools? not supported|not support tool/;
+const CAPACITY_RE = /\bat capacity\b|capacity[_ ]exhausted|no (?:available )?capacity|over capacity/;
 const COLD_RE = /\bcold\b|not ready|warming|warm(?:ing)? up|loading model|model is loading|is being loaded|still loading|currently loading|not (?:yet )?loaded|model loading/;
 const BILLING_RE =
   /insufficient_quota|credit_balance|insufficient (?:credit|balance|fund|quota)|out of credits|no credits|payment required|exceeded your current quota|billing|spend limit/;
@@ -453,6 +454,8 @@ export function classifyError(status: number | undefined, text: string, candidat
   if (s === 404) return { kind: "notfound" };
   if (s === 429 || s === 498 || (s !== 400 && /engine_overloaded|rate[_ ]limit|too many requests/.test(t))) return { kind: "rate" };
   if ((s === 400 || s === 503 || s === 409 || s === 425 || !s) && COLD_RE.test(t)) return { kind: "cold" };
+  // Featherless sends "<model> is temporarily at capacity" as a 503, or as an error frame inside a 200 stream (no status).
+  if ((!s || s >= 500) && CAPACITY_RE.test(t)) return { kind: "unavailable" };
   if (s === 503) return { kind: "unavailable" };
   if ([408, 409, 425, 500, 502, 504, 520, 521, 522, 523, 524, 525, 526, 527, 529].includes(s)) return { kind: "transient" };
   return { kind: "fatal" };

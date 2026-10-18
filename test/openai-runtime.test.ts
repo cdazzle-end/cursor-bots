@@ -817,6 +817,23 @@ test("5xx: 500 is retried twice, 503 three times, then a clear error", async () 
   }
 });
 
+test("Featherless 'temporarily at capacity' inside a 200 stream is retried like a 503", async () => {
+  const t = setup();
+  try {
+    // Featherless can accept the request, then send the error as a stream frame (no HTTP status).
+    const full = (r: unknown, res: any) =>
+      sse(res, [delta({ role: "assistant", content: "" }), { error: { message: "test-model is temporarily at capacity. Please try again shortly." } }], { done: false });
+    server.push(full, full, (r, res) => sse(res, textReply("got through")));
+    const { outcome, events } = await turn(await t.open(), "hi");
+    assert.equal(outcome.status, "finished");
+    assert.equal(outcome.text, "got through");
+    assert.deepEqual(t.sleeps, [2000, 5000]);
+    assert.equal(statuses(events).filter((s) => /Fake AI has no capacity for test-model right now; retrying/.test(s)).length, 2);
+  } finally {
+    await t.cleanup();
+  }
+});
+
 test("Featherless cold model: waits with status events and retries, giving up after about 10 minutes", async () => {
   let t = setup();
   try {
@@ -1959,6 +1976,8 @@ test("error classification follows the provider research", () => {
   assert.equal(classifyError(400, "Model is cold").kind, "cold");
   assert.equal(classifyError(503, "Loading model").kind, "cold");
   assert.equal(classifyError(503, "No valid Executor").kind, "unavailable");
+  assert.equal(classifyError(undefined, "Qwen3.8-27B is temporarily at capacity. Please try again shortly.").kind, "unavailable");
+  assert.equal(classifyError(undefined, "capacity_exhausted").kind, "unavailable");
   assert.deepEqual(classifyError(422, "Extra inputs are not permitted: repetition_penalty", ["repetition_penalty", "top_k"]), { kind: "param", param: "repetition_penalty" });
   assert.equal(classifyError(400, "System role not supported").kind, "system_role");
   assert.equal(classifyError(401, "nope").kind, "auth");
