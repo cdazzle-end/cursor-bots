@@ -6,8 +6,7 @@ The lead (Claude) maintains this file. Contributors change only the **Status** l
 
 Last updated by the lead on 2026-10-17. Session notes are the newest files in `docs/worklog/`.
 
-- **Integration branch:** `claude/tender-cori-t1ksnz` (also the default branch). `npm run typecheck && npm test` is clean, with 182 tests.
-- **Lead's working branch:** `claude/bold-knuth-kcf7i1` holds the lead's 2026-10-17 review session (B6, B9): a fast-forward of the integration branch, clean, with 185 tests. Until it's merged, branch new work from it if it needs those fixes.
+- **Integration branch:** `claude/tender-cori-t1ksnz` (also the default branch). `npm run typecheck && npm test` is clean, with 185 tests. The lead's 2026-10-17 review session (B6, B9) was done on `claude/bold-knuth-kcf7i1` and fast-forwarded into it with the owner's approval.
 - **What the product is.** A self-hosted, Grok-Bot-style team of persistent AI bots:
   - each bot has its own chat, memory, skills, routines and approvals;
   - bots message each other and work in groups;
@@ -163,7 +162,7 @@ Status values:
 
 ### B9. Review of the Team MCP endpoint, HTTP API, scheduler and approvals
 
-- **Status:** Done (lead, 2026-10-17, on `claude/bold-knuth-kcf7i1`). See `docs/worklog/2026-10-17-claude-review-api-approvals.md`.
+- **Status:** Done (lead, 2026-10-17; on the integration branch). See `docs/worklog/2026-10-17-claude-review-api-approvals.md`.
 - **Fixed, each with a regression test:**
   - **"Always allow" lapsed after six hours.** @ 0df0339. In auto mode a shell card only appears when an ask rule matches, and ask rules beat allow rules. So the saved rule never applied, and the command ran only on the decision's six-hour grant. An allow rule for exactly that text now beats ask rules.
   - **The file browser.** @ a65e444.

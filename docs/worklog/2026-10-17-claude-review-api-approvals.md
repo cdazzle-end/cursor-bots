@@ -64,7 +64,7 @@
 - The `Content-Disposition` form follows RFC 6266. I didn't check how each browser shows the name.
 
 ## Questions for the lead
-None (lead entry). For the owner: should this branch be merged into `claude/tender-cori-t1ksnz`? It's a fast-forward.
+None (lead entry). The owner approved fast-forwarding `claude/tender-cori-t1ksnz` to this branch (2026-10-18).
 
 ## Next step
 - B6's manual steps when the owner allows more live tests, B7 when a Cursor key is set.
