@@ -6,7 +6,7 @@ The lead (Claude) maintains this file. Contributors change only the **Status** l
 
 Last updated by the lead on 2026-10-17. Session notes are the newest files in `docs/worklog/`.
 
-- **Integration branch:** `claude/tender-cori-t1ksnz` (also the default branch). `npm run typecheck && npm test` is clean, with 185 tests. The lead's 2026-10-17 review session (B6, B9) was done on `claude/bold-knuth-kcf7i1` and fast-forwarded into it with the owner's approval.
+- **Integration branch:** `claude/tender-cori-t1ksnz` (also the default branch). `npm run typecheck && npm test` is clean, with 186 tests. The lead's 2026-10-17 review session (B6, B9) was done on `claude/bold-knuth-kcf7i1` and fast-forwarded into it with the owner's approval.
 - **What the product is.** A self-hosted, Grok-Bot-style team of persistent AI bots:
   - each bot has its own chat, memory, skills, routines and approvals;
   - bots message each other and work in groups;
@@ -21,7 +21,7 @@ Last updated by the lead on 2026-10-17. Session notes are the newest files in `d
 - **Next up.**
   - B6's manual checks (steps 2 and 4–7), when the owner allows more live tests.
   - B7 (Cursor) needs a Cursor key.
-  - Nothing else is open. Ask the lead (or the owner) for the next feature rather than inventing one.
+  - B11–B14 are proposals from the owner's Grok Bot export (2026-10-18). The owner picks which to build; none is open for work until then.
 
 ### Map of the provider-brain code
 
@@ -160,6 +160,12 @@ Status values:
   - **Group routing on a reasoning model is slow.** No code change: the deadline now aborts the call and frees capacity. Recommend setting a fast routing model (Settings → Brain & models → the provider → Routing model), or extra request fields with `{"chat_template_kwargs": {"enable_thinking": false}}` on that model.
   - **Old worktrees in `.claude/worktrees/`.** Removed by the lead.
 
+### B10. Featherless capacity errors inside the stream
+
+- **Status:** Done @ a948994 (lead, 2026-10-18)
+- **Found in** the live logs from the owner's earlier Hermes-based attempt (see `docs/RESEARCH.md` §6). Featherless accepted the request (HTTP 200), then sent "*model* is temporarily at capacity" as an error frame in the stream. Our `classifyError` called that fatal, so the turn failed instead of retrying.
+- **Fix:** capacity wording with no status or a 5xx counts as "unavailable": three retries with backoff, as for a 503.
+
 ### B9. Review of the Team MCP endpoint, HTTP API, scheduler and approvals
 
 - **Status:** Done (lead, 2026-10-17; on the integration branch). See `docs/worklog/2026-10-17-claude-review-api-approvals.md`.
@@ -171,6 +177,48 @@ Status values:
     - A read error after `stat` crashed the gateway.
   - **Team MCP arguments.** @ c049a49. `message_bot` without `text` posted "undefined" as you, and `create_bot` without a name made `@undefined`.
 - **Checked and fine:** token and origin checks, webhook keys, the snapshot's masking, approval expiry and waits, routine runs after a stop, restart or deletion, and the Team MCP's reply wait.
+
+### B11. Import a Grok Bot team (proposal; owner to pick)
+
+- **Status:** Open, waiting for the owner's go-ahead.
+- **Why:** the owner runs a Grok Bot team and has its export (profiles, groups, skills; no secrets). Importing it would bring their bots over with their instructions, instead of recreating them by hand.
+- **The export's shape:**
+  - `bots/<name>/profile.json` holds `name`, `description` (the instructions), `title` (the label), `avatarShape` and `avatarColor` (named colors).
+  - Group folders also have `group.json` with `memberIds`. Ids are in each bot's `agent-id.txt`.
+  - Skills are `my-skills/<slug>/SKILL.md`.
+- **Suggested fix:**
+  - A CLI command (`node src/cli.ts import-grok <folder>`) plus the same thing in the UI's import.
+  - Map the description to the job, the title to the label, and the avatar to the nearest of our shapes and colors.
+  - Create groups by member, copy skills, and skip anything already imported.
+- **Done when:** a fixture shaped like the export, with invented names, imports idempotently. CLI changes are a contract change, so the lead designs the flags.
+
+### B12. Let a bot update another bot's job (proposal)
+
+- **Status:** Open, waiting for the owner's go-ahead.
+- **Why:** Grok Bot's lead-bot pattern relies on rewriting a teammate's instructions when it underperforms. We have `create_bot` but no `update_bot`.
+- **Open question:** a bot rewriting another bot's instructions spreads a prompt injection further. Suggest an approval card for every change, with the diff shown.
+
+### B13. Routine conventions from Grok Bot (proposal)
+
+- **Status:** Open, waiting for the owner's go-ahead.
+- **What:** mostly manual rules (`src/core/manual.ts`), plus small scheduler help:
+  - avoid :00 and :30 when the user named no minute;
+  - by default, keep routines inside weekday waking hours;
+  - end every routine prompt with who gets the result and what to do when nothing is new;
+  - make finite watches delete themselves;
+  - pause a routine that keeps failing for the same sign-in reason.
+
+  Details are in `docs/RESEARCH.md` §6.
+
+### B14. Featherless context windows and a fallback model (proposal; needs live tests)
+
+- **Status:** Open, waiting for the owner's go-ahead.
+- **Context.**
+  - The owner's notes say Featherless lists many models at 32k but serves up to 256k on their plan.
+  - Featherless advertised 131,072 tokens for the DavidAU Qwen3.8 model, and the live check's model wasn't on the catalogue's first page.
+  - A model's window can already be raised by hand in the provider editor.
+  - Next: one live request just over the listed window, to see whether Featherless accepts it.
+- **Fallback.** The earlier attempt switched to a second model when the first stayed at capacity. The owner prefers their own Qwen3.8 fine-tunes, so a fallback would be another of those. It needs a design: a per-provider fallback model, used only after the capacity retries run out.
 
 ## Adding another provider
 
@@ -187,6 +235,8 @@ A service that is not OpenAI-compatible (for example the Anthropic Messages API 
 ## Decisions
 
 The lead records answers to escalated questions here, newest first.
+
+- 2026-10-18: The owner's Grok Bot export (in their Google Drive) is reference material only. It never goes into this public repo: only design facts, in our own words, go in `docs/RESEARCH.md` §6. The owner's preferences, from their bots' instructions: Featherless is the main provider, and suggestions shouldn't steer them away from their Qwen3.8 fine-tunes.
 
 - 2026-10-17: An allow rule whose pattern is exactly one command (`^…$` of the escaped text, which "Always allow" saves) beats ask rules. Broader allow patterns still lose to ask rules. "Always allow" no longer also leaves a six-hour grant, so deleting its rule takes it back.
 - 2026-10-17: Won't fix: the default `curl` ask rule and the `/proc/…/environ` check are quadratic on crafted input: 150–190 KB of command text takes about 2–3 s. A model's tool call is rarely that long, and a bot that wants to disrupt the gateway can already do worse with plain commands (`pkill`, a fork bomb).

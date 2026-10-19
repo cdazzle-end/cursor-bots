@@ -146,3 +146,43 @@ These options aren't exclusive. Cursor Bots exposes a **Team MCP** endpoint, so 
 | No model picker | Per-bot model from your Cursor catalog | That's the point of bringing your own agents. |
 | Auto Review model | Your rules + optional Cursor Auto-review classifier + optional sandbox | Rules are explicit and editable in Settings → Approvals. |
 | Per-bot conversation | One durable agent session per bot sees its DM, groups and handoffs, each labelled in the prompt | One brain per bot is simpler and keeps context coherent. Hermes instead keeps a separate session per room. |
+
+---
+
+## 6. What a real Grok Bot setup shows (October 2026)
+
+The owner exported their own Grok Bot setup, leaving out secrets, chats and images. The export holds the bots' profiles and settings, the group chats, the owner's skills, and the built-in skills Grok Bot gives every bot. This section records design facts from it, in our own words. The export itself stays out of this public repo.
+
+**Data model.**
+- A bot is a small profile: a name, a description that holds all of its standing instructions, a title (the label under the name), an avatar shape and a named color, and a notification switch.
+- Memory, routines and chats live on the server, not in these files.
+- A group chat is a profile with a name and a list of member ids. Groups get their title from the first message unless you name them.
+
+**How people write bots.** The owner's best bots follow one pattern:
+- **One job.** What the bot owns, in operational terms.
+- **Anti-jobs.** What it never does: hand-offs to other bots, and anything that needs approval.
+- **How it works.** Steps and proof of done.
+- **When it wakes.** On demand, a routine, or both.
+- **Voice.** Short, results first.
+- **Files.** Which workspace folder is its own, with no loose files at the top.
+
+A lead bot coordinates the rest. It creates bots, rewrites another bot's instructions when it underperforms, and hands work out. So Grok Bot gives bots tools to create a bot, update another bot, and message a bot.
+
+**Built-in skills are the manual.** Grok Bot ships about 50 built-in skills that load when a situation calls for them, rather than one long always-on rule. Some cover how the harness works: group-chat turns, routines, outside channels, secure forms, signing in, sending as the user, writing skills and exporting a bot as a template. The rest are site playbooks (shopping, travel, shipping), each with deep links and stop rules.
+
+**Conventions worth copying:**
+- **Group turns.** A bot's text in a group turn is private working space. Only an explicit post reaches the room, so silence is the default rather than a special answer. A turn posts at most a few short messages that react to what was just said. A bot can send its own user a private note during a group turn. It never reads a teammate's private chat or memory.
+- **Routine prompts.**
+  - A routine's saved prompt ends with one plain line saying who gets the result and where, and what to do when nothing is new. A run messages no one else.
+  - Schedules avoid :00 and :30: the minute comes from the moment the routine was created.
+  - Unless asked otherwise, a schedule stays inside weekday waking hours (about 8 am to 7 pm). "Daily" isn't taken to mean weekends or 3 am.
+  - A finite watch ("tell me when this merges") deletes itself when it's done or its deadline passes.
+  - A routine that keeps failing for the same sign-in reason is paused, and the user is told what to reconnect.
+- **Sending as the user.** A message that goes out under the user's name is shown as an editable draft. The user's Send press is the send, even when they asked the bot to "send it".
+- **Secure forms.** When a website needs the user to type something (a password, card or code), the app shows an in-chat form. It fills the page directly, and the bot never sees the values.
+- **Templates.** Exporting a bot packs chosen memories, skills, routines and plugins with names and private links taken out. It adds a "getting started" skill: the questions the bot asks its new owner.
+
+**From the owner's earlier attempt** (a Hermes-based rebuild, with live Featherless logs):
+- Featherless can accept a request, then send "*model* is temporarily at capacity" inside the stream. We now retry that like a 503.
+- Featherless reuses cached prompt prefixes heavily (94–100% of prompt tokens in those logs). Keeping the start of each request stable, as the runtime does, pays off.
+- Featherless reported 131,072 tokens of context for a model whose base supports 262,144. Whether a request longer than the listed window is accepted is untested here.
